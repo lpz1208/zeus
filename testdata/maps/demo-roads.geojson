@@ -1,0 +1,22 @@
+{
+  "type": "FeatureCollection",
+  "name": "demo_roads",
+  "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "ROAD_ID": "A", "ONEWAY": "both", "SPEED": 50, "CLASS": "primary", "LEVEL": 0 },
+      "geometry": { "type": "LineString", "coordinates": [[116.385, 39.907], [116.397, 39.907]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "ROAD_ID": "B", "ONEWAY": "forward", "SPEED": 30, "CLASS": "secondary", "LEVEL": 0 },
+      "geometry": { "type": "LineString", "coordinates": [[116.391, 39.902], [116.391, 39.912]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "ROAD_ID": "C", "ONEWAY": "both", "SPEED": 40, "CLASS": "local", "LEVEL": 0 },
+      "geometry": { "type": "LineString", "coordinates": [[116.397002, 39.907], [116.403, 39.91]] }
+    }
+  ]
+}

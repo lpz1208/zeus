@@ -1,0 +1,21 @@
+# Zeus Shapefile road-field mapping example.
+# Replace field names with the actual DBF columns in the source dataset.
+id_field=ROAD_ID
+oneway_field=ONEWAY
+speed_field=SPEED_KPH
+# Optional. This is the usable count per directed edge; omitted means 1.
+lanes_field=LANES
+road_class_field=ROAD_CLASS
+z_level_field=Z_LEVEL
+bridge_field=BRIDGE
+tunnel_field=TUNNEL
+
+# Leave target_crs empty to preserve a meter-based projected source CRS or
+# automatically select a local UTM CRS for geographic source data.
+target_crs=
+default_speed_kph=40
+snap_tolerance_m=0.5
+default_bidirectional=true
+
+# Optional turn rules may also be passed with:
+# zeus-map import ... --turn-restrictions testdata/maps/example.turns.csv

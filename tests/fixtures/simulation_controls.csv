@@ -1,0 +1,7 @@
+# time_s,scope,target_id,action,value
+0,vehicle,0,speed_factor,0.5
+10,vehicle,0,hold,1
+20,vehicle,0,release,1
+5,edge,0,capacity_factor,0.5
+15,junction,0,close,1
+25,junction,0,open,1

@@ -1,0 +1,26 @@
+{
+  "name": "zeus-map-workbench",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@fontsource-variable/ibm-plex-sans": "latest",
+    "@fontsource-variable/jetbrains-mono": "latest",
+    "lucide-react": "latest",
+    "maplibre-gl": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  }
+}

@@ -1,0 +1,3 @@
+# from_source_id,via_x,via_y,to_source_id,type[,penalty_s]
+# Coordinates use the source road dataset CRS. Types: no, only, penalty.
+A,116.391,39.907,B,no
