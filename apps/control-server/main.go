@@ -48,6 +48,9 @@ type Server struct {
 	// routeWorkers keeps one framed C++ process per recently used immutable
 	// map version, so HTTP routing reuses MapRuntime and RoutePlanner indexes.
 	routeWorkers *RouteWorkerManager
+	// decisions coordinates active Agent decision barriers. It owns only
+	// pending waits; authoritative simulation state remains in the C++ worker.
+	decisions *DecisionCoordinator
 }
 
 type APIError struct {
@@ -240,37 +243,45 @@ type RouteMatch struct {
 }
 
 type RouteResponse struct {
-	OK            bool            `json:"ok"`
-	Algorithm     string          `json:"algorithm"`
-	Reason        string          `json:"reason,omitempty"`
-	Message       string          `json:"message,omitempty"`
-	Origin        RouteMatch      `json:"origin"`
-	Destination   RouteMatch      `json:"destination"`
-	Edges         int             `json:"edges"`
-	LengthM       float64         `json:"lengthM"`
-	TimeS         float64         `json:"timeS"`
-	ExpandedNodes int64           `json:"expandedNodes"`
-	ComputeMs     float64         `json:"computeMs"`
-	GeoJSON       json.RawMessage `json:"geojson,omitempty"`
+	OK        bool   `json:"ok"`
+	Algorithm string `json:"algorithm"`
+	// EffectiveAlgorithm is what actually ran; bidirectional selections
+	// downgrade to the forward search on turn-restricted maps.
+	EffectiveAlgorithm string          `json:"effectiveAlgorithm"`
+	Reason             string          `json:"reason,omitempty"`
+	Message            string          `json:"message,omitempty"`
+	Origin             RouteMatch      `json:"origin"`
+	Destination        RouteMatch      `json:"destination"`
+	Edges              int             `json:"edges"`
+	LengthM            float64         `json:"lengthM"`
+	TimeS              float64         `json:"timeS"`
+	ExpandedNodes      int64           `json:"expandedNodes"`
+	ComputeMs          float64         `json:"computeMs"`
+	GeoJSON            json.RawMessage `json:"geojson,omitempty"`
 }
 
 var routeMatchPattern = regexp.MustCompile(
 	`^(origin|dest)\.edge=([^ ]+) road_id=([^ ]+) source=([^ ]+) offset_s=([^ ]+) distance=([^ ]+) confidence=([^ ]+)$`)
 
 type SimulateRequest struct {
-	FromLon               *float64                    `json:"fromLon"`
-	FromLat               *float64                    `json:"fromLat"`
-	ToLon                 *float64                    `json:"toLon"`
-	ToLat                 *float64                    `json:"toLat"`
-	Count                 int                         `json:"count"`
-	SpreadSeconds         float64                     `json:"spreadSeconds"`
-	DurationSeconds       float64                     `json:"durationSeconds"`
-	StepSeconds           float64                     `json:"stepSeconds"`
-	SampleIntervalSeconds float64                     `json:"sampleIntervalSeconds"`
-	Algorithm             string                      `json:"algorithm"`
-	VehicleControls       []VehicleSimulationControl  `json:"vehicleControls,omitempty"`
-	RoadControls          []RoadSimulationControl     `json:"roadControls,omitempty"`
-	JunctionControls      []JunctionSimulationControl `json:"junctionControls,omitempty"`
+	FromLon                *float64                    `json:"fromLon"`
+	FromLat                *float64                    `json:"fromLat"`
+	ToLon                  *float64                    `json:"toLon"`
+	ToLat                  *float64                    `json:"toLat"`
+	Count                  int                         `json:"count"`
+	SpreadSeconds          float64                     `json:"spreadSeconds"`
+	DurationSeconds        float64                     `json:"durationSeconds"`
+	StepSeconds            float64                     `json:"stepSeconds"`
+	SampleIntervalSeconds  float64                     `json:"sampleIntervalSeconds"`
+	ExitHeadwayFfSeconds   float64                     `json:"exitHeadwayFfSeconds"`
+	ExitHeadwayJamSeconds  float64                     `json:"exitHeadwayJamSeconds"`
+	RerouteIntervalSeconds float64                     `json:"rerouteIntervalSeconds"`
+	RerouteCostRatio       float64                     `json:"rerouteCostRatio"`
+	Algorithm              string                      `json:"algorithm"`
+	VehicleControls        []VehicleSimulationControl  `json:"vehicleControls,omitempty"`
+	RoadControls           []RoadSimulationControl     `json:"roadControls,omitempty"`
+	JunctionControls       []JunctionSimulationControl `json:"junctionControls,omitempty"`
+	SignalPlans            []JunctionSignalPlan        `json:"signalPlans,omitempty"`
 }
 
 type VehicleSimulationControl struct {
@@ -293,30 +304,60 @@ type JunctionSimulationControl struct {
 	Action      string  `json:"action"`
 }
 
+type SignalMovement struct {
+	FromEdgeID uint32 `json:"fromEdgeId"`
+	ToEdgeID   uint32 `json:"toEdgeId"`
+}
+
+type SignalPhase struct {
+	GreenSeconds      float64          `json:"greenSeconds"`
+	SaturationFlowVPH float64          `json:"saturationFlowVph"`
+	Movements         []SignalMovement `json:"movements"`
+}
+
+type JunctionSignalPlan struct {
+	NodeID        uint32        `json:"nodeId"`
+	OffsetSeconds float64       `json:"offsetSeconds"`
+	YellowSeconds float64       `json:"yellowSeconds"`
+	AllRedSeconds float64       `json:"allRedSeconds"`
+	Phases        []SignalPhase `json:"phases"`
+}
+
 type SimulateResponse struct {
-	OK               bool            `json:"ok"`
-	Reason           string          `json:"reason,omitempty"`
-	Message          string          `json:"message,omitempty"`
-	Vehicles         int64           `json:"vehicles"`
-	Arrived          int64           `json:"arrived"`
-	Unroutable       int64           `json:"unroutable"`
-	WaitingAtEnd     int64           `json:"waitingAtEnd"`
-	DrivingAtEnd     int64           `json:"drivingAtEnd"`
-	Ticks            int64           `json:"ticks"`
-	RoutePlans       int64           `json:"routePlans"`
-	Samples          int64           `json:"samples"`
-	AvgTravelS       float64         `json:"avgTravelS"`
-	MinTravelS       float64         `json:"minTravelS"`
-	MaxTravelS       float64         `json:"maxTravelS"`
-	TotalDistanceM   float64         `json:"totalDistanceM"`
-	Deadlock         bool            `json:"deadlock"`
-	ComputeMs        float64         `json:"computeMs"`
-	ControlEvents    int64           `json:"controlEvents"`
-	VehicleControls  int64           `json:"vehicleControls"`
-	RoadControls     int64           `json:"roadControls"`
-	JunctionControls int64           `json:"junctionControls"`
-	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
-	Playback         json.RawMessage `json:"playback,omitempty"`
+	OK                         bool            `json:"ok"`
+	Reason                     string          `json:"reason,omitempty"`
+	Message                    string          `json:"message,omitempty"`
+	Vehicles                   int64           `json:"vehicles"`
+	Arrived                    int64           `json:"arrived"`
+	Unroutable                 int64           `json:"unroutable"`
+	WaitingAtEnd               int64           `json:"waitingAtEnd"`
+	DrivingAtEnd               int64           `json:"drivingAtEnd"`
+	Ticks                      int64           `json:"ticks"`
+	RoutePlans                 int64           `json:"routePlans"`
+	Samples                    int64           `json:"samples"`
+	AvgTravelS                 float64         `json:"avgTravelS"`
+	MinTravelS                 float64         `json:"minTravelS"`
+	MaxTravelS                 float64         `json:"maxTravelS"`
+	TotalDistanceM             float64         `json:"totalDistanceM"`
+	Deadlock                   bool            `json:"deadlock"`
+	Cancelled                  bool            `json:"cancelled"`
+	BarrierWaitMs              float64         `json:"barrierWaitMs"`
+	ComputeMs                  float64         `json:"computeMs"`
+	ControlEvents              int64           `json:"controlEvents"`
+	VehicleControls            int64           `json:"vehicleControls"`
+	RoadControls               int64           `json:"roadControls"`
+	JunctionControls           int64           `json:"junctionControls"`
+	RerouteAttempts            int64           `json:"rerouteAttempts"`
+	RerouteSucceeded           int64           `json:"rerouteSucceeded"`
+	RerouteFailed              int64           `json:"rerouteFailed"`
+	SignalPlans                int64           `json:"signalPlans"`
+	SignalPhases               int64           `json:"signalPhases"`
+	SignalWaitEvents           int64           `json:"signalWaitEvents"`
+	SignalRedWaitEvents        int64           `json:"signalRedWaitEvents"`
+	SignalSaturationWaitEvents int64           `json:"signalSaturationWaitEvents"`
+	SignalMovementsPassed      int64           `json:"signalMovementsPassed"`
+	GeoJSON                    json.RawMessage `json:"geojson,omitempty"`
+	Playback                   json.RawMessage `json:"playback,omitempty"`
 }
 
 func main() {
@@ -379,10 +420,14 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 		jobs:         NewJobManager(config.ImportWorkers),
 		simSlots:     make(chan struct{}, simSlots),
 		routeWorkers: NewRouteWorkerManager(config.ZeusMap, config.CmdLimit, config.RouteWorkerMaps),
+		decisions:    NewDecisionCoordinator(),
 	}
 }
 
 func (s *Server) Close() {
+	if s.decisions != nil {
+		s.decisions.Close()
+	}
 	if s.routeWorkers != nil {
 		s.routeWorkers.Close()
 	}
@@ -1517,6 +1562,32 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 		defer os.Remove(controlPath)
 		args = append(args, "--controls", controlPath)
 	}
+	signalFileContent, err := buildSignalPlans(request, record.Summary)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if signalFileContent != "" {
+		signalFile, createErr := os.CreateTemp("", "zeus-sim-signals-*.csv")
+		if createErr != nil {
+			writeError(w, http.StatusInternalServerError, "create signal plans: "+createErr.Error())
+			return
+		}
+		signalPath := signalFile.Name()
+		if _, writeErr := signalFile.WriteString(signalFileContent); writeErr != nil {
+			signalFile.Close()
+			os.Remove(signalPath)
+			writeError(w, http.StatusInternalServerError, "write signal plans: "+writeErr.Error())
+			return
+		}
+		if closeErr := signalFile.Close(); closeErr != nil {
+			os.Remove(signalPath)
+			writeError(w, http.StatusInternalServerError, "close signal plans: "+closeErr.Error())
+			return
+		}
+		defer os.Remove(signalPath)
+		args = append(args, "--signals", signalPath)
+	}
 
 	trajectoryFile, err := os.CreateTemp("", "zeus-sim-*.geojson")
 	if err != nil {
@@ -1585,7 +1656,9 @@ func buildSimulateArgs(request SimulateRequest) ([]string, error) {
 	for _, value := range []float64{
 		*request.FromLon, *request.FromLat, *request.ToLon, *request.ToLat,
 		request.SpreadSeconds, request.DurationSeconds, request.StepSeconds,
-		request.SampleIntervalSeconds,
+		request.SampleIntervalSeconds, request.ExitHeadwayFfSeconds,
+		request.ExitHeadwayJamSeconds, request.RerouteIntervalSeconds,
+		request.RerouteCostRatio,
 	} {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return nil, errors.New("simulation coordinates and timing values must be finite")
@@ -1624,6 +1697,28 @@ func buildSimulateArgs(request SimulateRequest) ([]string, error) {
 	if request.SpreadSeconds < 0 || request.SpreadSeconds > duration {
 		return nil, errors.New("spreadSeconds must be between 0 and durationSeconds")
 	}
+	if request.ExitHeadwayFfSeconds < 0 || request.ExitHeadwayFfSeconds > 60 {
+		return nil, errors.New("exitHeadwayFfSeconds must be between 0 and 60")
+	}
+	if request.ExitHeadwayJamSeconds < 0 || request.ExitHeadwayJamSeconds > 60 {
+		return nil, errors.New("exitHeadwayJamSeconds must be between 0 and 60")
+	}
+	if request.ExitHeadwayJamSeconds > 0 &&
+		request.ExitHeadwayJamSeconds < request.ExitHeadwayFfSeconds {
+		return nil, errors.New(
+			"exitHeadwayJamSeconds must be zero or at least exitHeadwayFfSeconds")
+	}
+	if request.RerouteIntervalSeconds < 0 || request.RerouteIntervalSeconds > 3600 {
+		return nil, errors.New("rerouteIntervalSeconds must be between 0 and 3600")
+	}
+	if request.RerouteIntervalSeconds > 0 && request.RerouteIntervalSeconds < step {
+		return nil, errors.New(
+			"rerouteIntervalSeconds must be zero or at least stepSeconds")
+	}
+	if request.RerouteCostRatio != 0 &&
+		(request.RerouteCostRatio < 1.01 || request.RerouteCostRatio > 10) {
+		return nil, errors.New("rerouteCostRatio must be zero or between 1.01 and 10")
+	}
 	sampleInterval := request.SampleIntervalSeconds
 	if sampleInterval == 0 {
 		sampleInterval = 15
@@ -1650,6 +1745,18 @@ func buildSimulateArgs(request SimulateRequest) ([]string, error) {
 	}
 	if request.SpreadSeconds > 0 {
 		args = append(args, "--spread", formatFloat(request.SpreadSeconds))
+	}
+	if request.ExitHeadwayFfSeconds > 0 {
+		args = append(args, "--exit-headway-ff", formatFloat(request.ExitHeadwayFfSeconds))
+	}
+	if request.ExitHeadwayJamSeconds > 0 {
+		args = append(args, "--exit-headway-jam", formatFloat(request.ExitHeadwayJamSeconds))
+	}
+	if request.RerouteIntervalSeconds > 0 {
+		args = append(args, "--reroute-interval", formatFloat(request.RerouteIntervalSeconds))
+	}
+	if request.RerouteCostRatio > 0 {
+		args = append(args, "--reroute-cost-ratio", formatFloat(request.RerouteCostRatio))
 	}
 	return args, nil
 }
@@ -1761,6 +1868,82 @@ func buildSimulationControls(request SimulateRequest, summary ValidationSummary)
 	return output.String(), nil
 }
 
+// buildSignalPlans validates the nested API representation and writes one row
+// per allowed movement. The C++ engine performs the final topology check.
+func buildSignalPlans(request SimulateRequest, summary ValidationSummary) (string, error) {
+	if len(request.SignalPlans) == 0 {
+		return "", nil
+	}
+	if len(request.SignalPlans) > 1000 {
+		return "", errors.New("signal plan budget exceeded: at most 1000 junctions")
+	}
+	finiteInRange := func(value, minimum, maximum float64) bool {
+		return !math.IsNaN(value) && !math.IsInf(value, 0) &&
+			value >= minimum && value <= maximum
+	}
+	seenNodes := make(map[uint32]struct{}, len(request.SignalPlans))
+	movementCount := 0
+	var output strings.Builder
+	output.WriteString("# node_id,phase,green_s,yellow_s,all_red_s,offset_s,from_edge,to_edge,saturation_flow_vph\n")
+	for planIndex, plan := range request.SignalPlans {
+		if summary.Nodes > 0 && uint64(plan.NodeID) >= uint64(summary.Nodes) {
+			return "", fmt.Errorf("signalPlans[%d].nodeId %d is outside map node range [0, %d)", planIndex, plan.NodeID, summary.Nodes)
+		}
+		if _, duplicate := seenNodes[plan.NodeID]; duplicate {
+			return "", fmt.Errorf("signalPlans[%d].nodeId duplicates junction %d", planIndex, plan.NodeID)
+		}
+		seenNodes[plan.NodeID] = struct{}{}
+		if !finiteInRange(plan.OffsetSeconds, 0, 86400) {
+			return "", fmt.Errorf("signalPlans[%d].offsetSeconds must be between 0 and 86400", planIndex)
+		}
+		if !finiteInRange(plan.YellowSeconds, 0, 60) ||
+			!finiteInRange(plan.AllRedSeconds, 0, 60) {
+			return "", fmt.Errorf("signalPlans[%d] clearance times must be between 0 and 60", planIndex)
+		}
+		if len(plan.Phases) == 0 || len(plan.Phases) > 32 {
+			return "", fmt.Errorf("signalPlans[%d].phases must contain between 1 and 32 phases", planIndex)
+		}
+		for phaseIndex, phase := range plan.Phases {
+			if !finiteInRange(phase.GreenSeconds, 0.1, 600) {
+				return "", fmt.Errorf("signalPlans[%d].phases[%d].greenSeconds must be between 0.1 and 600", planIndex, phaseIndex)
+			}
+			if len(phase.Movements) == 0 {
+				return "", fmt.Errorf("signalPlans[%d].phases[%d].movements must not be empty", planIndex, phaseIndex)
+			}
+			saturationFlowVPH := phase.SaturationFlowVPH
+			if saturationFlowVPH == 0 {
+				saturationFlowVPH = 1800
+			}
+			if !finiteInRange(saturationFlowVPH, 60, 7200) {
+				return "", fmt.Errorf("signalPlans[%d].phases[%d].saturationFlowVph must be zero or between 60 and 7200", planIndex, phaseIndex)
+			}
+			seenMovements := make(map[[2]uint32]struct{}, len(phase.Movements))
+			for movementIndex, movement := range phase.Movements {
+				if summary.DirectedEdges > 0 &&
+					(uint64(movement.FromEdgeID) >= uint64(summary.DirectedEdges) ||
+						uint64(movement.ToEdgeID) >= uint64(summary.DirectedEdges)) {
+					return "", fmt.Errorf("signalPlans[%d].phases[%d].movements[%d] contains an edge outside map range [0, %d)", planIndex, phaseIndex, movementIndex, summary.DirectedEdges)
+				}
+				key := [2]uint32{movement.FromEdgeID, movement.ToEdgeID}
+				if _, duplicate := seenMovements[key]; duplicate {
+					continue
+				}
+				seenMovements[key] = struct{}{}
+				movementCount++
+				if movementCount > 10000 {
+					return "", errors.New("signal movement budget exceeded: at most 10000 movements")
+				}
+				fmt.Fprintf(&output, "%d,%d,%s,%s,%s,%s,%d,%d,%s\n",
+					plan.NodeID, phaseIndex, formatFloat(phase.GreenSeconds),
+					formatFloat(plan.YellowSeconds), formatFloat(plan.AllRedSeconds),
+					formatFloat(plan.OffsetSeconds), movement.FromEdgeID, movement.ToEdgeID,
+					formatFloat(saturationFlowVPH))
+			}
+		}
+	}
+	return output.String(), nil
+}
+
 func parseSimulate(output string) SimulateResponse {
 	response := SimulateResponse{}
 	for _, line := range strings.Split(output, "\n") {
@@ -1801,6 +1984,10 @@ func parseSimulate(output string) SimulateResponse {
 			response.TotalDistanceM, _ = strconv.ParseFloat(value, 64)
 		case "deadlock":
 			response.Deadlock = value == "1"
+		case "cancelled":
+			response.Cancelled = value == "1"
+		case "barrier_wait_ms":
+			response.BarrierWaitMs, _ = strconv.ParseFloat(value, 64)
 		case "compute_ms":
 			response.ComputeMs, _ = strconv.ParseFloat(value, 64)
 		case "control_events":
@@ -1811,6 +1998,24 @@ func parseSimulate(output string) SimulateResponse {
 			response.RoadControls, _ = strconv.ParseInt(value, 10, 64)
 		case "junction_controls":
 			response.JunctionControls, _ = strconv.ParseInt(value, 10, 64)
+		case "reroute_attempts":
+			response.RerouteAttempts, _ = strconv.ParseInt(value, 10, 64)
+		case "reroute_succeeded":
+			response.RerouteSucceeded, _ = strconv.ParseInt(value, 10, 64)
+		case "reroute_failed":
+			response.RerouteFailed, _ = strconv.ParseInt(value, 10, 64)
+		case "signal_plans":
+			response.SignalPlans, _ = strconv.ParseInt(value, 10, 64)
+		case "signal_phases":
+			response.SignalPhases, _ = strconv.ParseInt(value, 10, 64)
+		case "signal_wait_events":
+			response.SignalWaitEvents, _ = strconv.ParseInt(value, 10, 64)
+		case "signal_red_wait_events":
+			response.SignalRedWaitEvents, _ = strconv.ParseInt(value, 10, 64)
+		case "signal_saturation_wait_events":
+			response.SignalSaturationWaitEvents, _ = strconv.ParseInt(value, 10, 64)
+		case "signal_movements_passed":
+			response.SignalMovementsPassed, _ = strconv.ParseInt(value, 10, 64)
 		}
 	}
 	return response
@@ -1828,6 +2033,8 @@ func parseRoute(output string) RouteResponse {
 			response.OK = value == "ok"
 		case "algorithm":
 			response.Algorithm = value
+		case "effective_algorithm":
+			response.EffectiveAlgorithm = value
 		case "reason":
 			response.Reason = value
 		case "message":

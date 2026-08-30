@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -30,12 +32,39 @@ inline constexpr double kMinSpeedMps = 0.1;
     return edge.length_m / std::max(kMinSpeedMps, static_cast<double>(edge.speed_limit_mps));
 }
 
+// Per-request dynamic routing view. Empty spans mean that every edge is
+// enabled and has its static map cost. The caller owns the backing arrays for
+// the duration of RoutePlanner::plan().
+struct RoutingOverlay {
+    std::span<const std::uint8_t> edge_enabled;
+    std::span<const double> edge_cost_factors;
+
+    [[nodiscard]] bool edgeEnabled(zeus::map::EdgeIndex edge) const {
+        return edge_enabled.empty() || edge_enabled[edge] != 0;
+    }
+
+    [[nodiscard]] double edgeCostFactor(zeus::map::EdgeIndex edge) const {
+        return edge_cost_factors.empty() ? 1.0 : edge_cost_factors[edge];
+    }
+};
+
+struct RoutePosition {
+    zeus::map::EdgeIndex edge = zeus::map::kInvalidEdge;
+    double offset_s = 0.0;
+};
+
 struct RouteRequest {
     zeus::map::Point2d origin;
     zeus::map::Point2d destination;
     Algorithm algorithm = Algorithm::kDijkstra;
     double max_snap_distance_m = 100.0;
     std::size_t max_match_candidates = 8;
+    // Exact directed positions bypass map matching. Dynamic simulation
+    // rerouting uses origin_position so a vehicle cannot jump to a nearby or
+    // reverse edge when its route changes.
+    std::optional<RoutePosition> origin_position;
+    std::optional<RoutePosition> destination_position;
+    const RoutingOverlay* overlay = nullptr;
 };
 
 struct RouteEndpointMatch {
@@ -72,7 +101,10 @@ struct RouteResult {
     bool ok = false;
     RouteFailure failure = RouteFailure::kNone;
     std::string message;
-    Algorithm algorithm = Algorithm::kDijkstra;
+    Algorithm algorithm = Algorithm::kDijkstra;            // requested
+    // What actually ran: bidirectional selections downgrade to the forward
+    // edge-state search on maps that carry turn transitions.
+    Algorithm effective_algorithm = Algorithm::kDijkstra;
     RouteEndpointMatch origin;
     RouteEndpointMatch destination;
     RoutePath path;

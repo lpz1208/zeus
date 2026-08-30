@@ -179,6 +179,13 @@ void PlaybackExporter::save(
            << ",\n"
            << "  \"step_s\": " << result.config.step_seconds << ",\n"
            << "  \"sample_interval_s\": " << result.config.sample_interval_seconds << ",\n"
+           << "  \"reroute_interval_s\": "
+           << result.config.reroute_interval_seconds << ",\n"
+           << "  \"reroute_cost_ratio\": " << result.config.reroute_cost_ratio << ",\n"
+           << "  \"cancelled\": "
+           << (result.stats.cancelled ? "true" : "false") << ",\n"
+           << "  \"barrier_wait_ms\": " << result.stats.barrier_wait_ms << ",\n"
+           << "  \"compute_ms\": " << result.stats.compute_ms << ",\n"
            << "  \"controls\": [";
     for (std::size_t i = 0; i < result.applied_controls.size(); ++i) {
         const AppliedControlEvent& control = result.applied_controls[i];
@@ -192,6 +199,53 @@ void PlaybackExporter::save(
                << "\", \"target_id\": " << control.target_id
                << ", \"action\": \"" << controlActionName(control.action)
                << "\", \"value\": " << control.value << '}';
+    }
+    output << "],\n"
+           << "  \"reroutes\": [";
+    for (std::size_t i = 0; i < result.reroutes.size(); ++i) {
+        const VehicleRerouteRecord& reroute = result.reroutes[i];
+        if (i > 0) {
+            output << ", ";
+        }
+        output << "{\"time_s\": " << std::setprecision(3) << reroute.time_s
+               << ", \"vehicle_id\": " << reroute.vehicle_id
+               << ", \"old_route_id\": " << reroute.old_route_id
+               << ", \"new_route_id\": " << reroute.new_route_id
+               << ", \"success\": " << (reroute.success ? "true" : "false")
+               << '}';
+    }
+    output << "],\n"
+           << "  \"signal_plans\": [";
+    for (std::size_t plan_index = 0; plan_index < result.signal_plans.size(); ++plan_index) {
+        const JunctionSignalPlan& plan = result.signal_plans[plan_index];
+        if (plan_index > 0) {
+            output << ", ";
+        }
+        output << "{\"node_id\": " << plan.node
+               << ", \"offset_s\": " << std::setprecision(3) << plan.offset_seconds
+               << ", \"yellow_s\": " << plan.yellow_seconds
+               << ", \"all_red_s\": " << plan.all_red_seconds
+               << ", \"phases\": [";
+        for (std::size_t phase_index = 0; phase_index < plan.phases.size(); ++phase_index) {
+            const SignalPhase& phase = plan.phases[phase_index];
+            if (phase_index > 0) {
+                output << ", ";
+            }
+            output << "{\"green_s\": " << phase.green_seconds
+                   << ", \"saturation_flow_vph\": "
+                   << phase.saturation_flow_vph
+                   << ", \"movements\": [";
+            for (std::size_t movement_index = 0;
+                 movement_index < phase.movements.size(); ++movement_index) {
+                const SignalMovement& movement = phase.movements[movement_index];
+                if (movement_index > 0) {
+                    output << ", ";
+                }
+                output << "[" << movement.from_edge << ", " << movement.to_edge << "]";
+            }
+            output << "]}";
+        }
+        output << "]}";
     }
     output << "],\n"
            << "  \"vehicles\": [\n";

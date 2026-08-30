@@ -519,11 +519,22 @@ func TestParseSimulate(t *testing.T) {
 			"total_distance_m=617881.984",
 			"samples=10192",
 			"deadlock=0",
+			"cancelled=1",
+			"barrier_wait_ms=1250.5",
 			"compute_ms=36.229",
 			"control_events=5",
 			"vehicle_controls=2",
 			"edge_controls=2",
 			"junction_controls=1",
+			"reroute_attempts=4",
+			"reroute_succeeded=3",
+			"reroute_failed=1",
+			"signal_plans=2",
+			"signal_phases=5",
+			"signal_wait_events=17",
+			"signal_red_wait_events=11",
+			"signal_saturation_wait_events=6",
+			"signal_movements_passed=23",
 		}, "\n")
 
 		result := parseSimulate(output)
@@ -531,7 +542,8 @@ func TestParseSimulate(t *testing.T) {
 			result.DrivingAtEnd != 85 || result.Ticks != 900 {
 			t.Fatalf("unexpected simulation result: %#v", result)
 		}
-		if result.RoutePlans != 1 || result.Deadlock {
+		if result.RoutePlans != 1 || result.Deadlock || !result.Cancelled ||
+			result.BarrierWaitMs != 1250.5 {
 			t.Fatalf("unexpected plan pooling: %#v", result)
 		}
 		if result.Samples != 10192 {
@@ -540,6 +552,16 @@ func TestParseSimulate(t *testing.T) {
 		if result.ControlEvents != 5 || result.VehicleControls != 2 ||
 			result.RoadControls != 2 || result.JunctionControls != 1 {
 			t.Fatalf("unexpected control statistics: %#v", result)
+		}
+		if result.RerouteAttempts != 4 || result.RerouteSucceeded != 3 ||
+			result.RerouteFailed != 1 {
+			t.Fatalf("unexpected reroute statistics: %#v", result)
+		}
+		if result.SignalPlans != 2 || result.SignalPhases != 5 ||
+			result.SignalWaitEvents != 17 || result.SignalRedWaitEvents != 11 ||
+			result.SignalSaturationWaitEvents != 6 ||
+			result.SignalMovementsPassed != 23 {
+			t.Fatalf("unexpected signal statistics: %#v", result)
 		}
 		if result.AvgTravelS != 799.142 || result.MaxTravelS != 811.016 ||
 			result.TotalDistanceM != 617881.984 || result.ComputeMs != 36.229 {
@@ -562,6 +584,8 @@ func TestBuildSimulateArgs(t *testing.T) {
 		FromLon: &lon, FromLat: &lat, ToLon: &lon, ToLat: &lat,
 		Count: 100, SpreadSeconds: 600, DurationSeconds: 900,
 		StepSeconds: 1, SampleIntervalSeconds: 15, Algorithm: "biastar",
+		ExitHeadwayFfSeconds: 0.5, ExitHeadwayJamSeconds: 1.5,
+		RerouteIntervalSeconds: 30, RerouteCostRatio: 1.5,
 	}
 
 	args, err := buildSimulateArgs(valid)
@@ -569,7 +593,11 @@ func TestBuildSimulateArgs(t *testing.T) {
 		t.Fatalf("valid request rejected: %v", err)
 	}
 	joined := strings.Join(args, " ")
-	for _, wanted := range []string{"--algorithm biastar", "--count 100", "--spread", "--duration"} {
+	for _, wanted := range []string{
+		"--algorithm biastar", "--count 100", "--spread", "--duration",
+		"--exit-headway-ff 0.5", "--exit-headway-jam 1.5",
+		"--reroute-interval 30", "--reroute-cost-ratio 1.5",
+	} {
 		if !strings.Contains(joined, wanted) {
 			t.Fatalf("args missing %q: %v", wanted, args)
 		}
@@ -613,6 +641,30 @@ func TestBuildSimulateArgs(t *testing.T) {
 		FromLon: &nonFinite, FromLat: &lat, ToLon: &lon, ToLat: &lat,
 	}); err == nil {
 		t.Fatal("non-finite coordinates should fail")
+	}
+	if _, err := buildSimulateArgs(SimulateRequest{
+		FromLon: &lon, FromLat: &lat, ToLon: &lon, ToLat: &lat,
+		ExitHeadwayFfSeconds: 2, ExitHeadwayJamSeconds: 1,
+	}); err == nil {
+		t.Fatal("jam headway below the free-flow headway should fail")
+	}
+	if _, err := buildSimulateArgs(SimulateRequest{
+		FromLon: &lon, FromLat: &lat, ToLon: &lon, ToLat: &lat,
+		ExitHeadwayJamSeconds: math.Inf(1),
+	}); err == nil {
+		t.Fatal("non-finite exit headway should fail")
+	}
+	if _, err := buildSimulateArgs(SimulateRequest{
+		FromLon: &lon, FromLat: &lat, ToLon: &lon, ToLat: &lat,
+		StepSeconds: 2, RerouteIntervalSeconds: 1,
+	}); err == nil {
+		t.Fatal("reroute interval below the tick should fail")
+	}
+	if _, err := buildSimulateArgs(SimulateRequest{
+		FromLon: &lon, FromLat: &lat, ToLon: &lon, ToLat: &lat,
+		RerouteCostRatio: 1,
+	}); err == nil {
+		t.Fatal("reroute cost ratio below 1.01 should fail")
 	}
 }
 
@@ -674,6 +726,59 @@ func TestBuildSimulationControls(t *testing.T) {
 	}
 }
 
+func TestBuildSignalPlans(t *testing.T) {
+	request := SimulateRequest{SignalPlans: []JunctionSignalPlan{{
+		NodeID: 4, OffsetSeconds: 2, YellowSeconds: 3, AllRedSeconds: 1,
+		Phases: []SignalPhase{
+			{GreenSeconds: 20, Movements: []SignalMovement{{FromEdgeID: 7, ToEdgeID: 8}, {FromEdgeID: 7, ToEdgeID: 8}}},
+			{GreenSeconds: 15, SaturationFlowVPH: 900, Movements: []SignalMovement{{FromEdgeID: 9, ToEdgeID: 10}}},
+		},
+	}}}
+	content, err := buildSignalPlans(request, ValidationSummary{Nodes: 10, DirectedEdges: 20})
+	if err != nil {
+		t.Fatalf("valid signal plan rejected: %v", err)
+	}
+	for _, wanted := range []string{
+		"4,0,20,3,1,2,7,8,1800",
+		"4,1,15,3,1,2,9,10,900",
+	} {
+		if !strings.Contains(content, wanted) {
+			t.Errorf("signal file missing %q:\n%s", wanted, content)
+		}
+	}
+	if strings.Count(content, "4,0,20,3,1,2,7,8,1800") != 1 {
+		t.Fatalf("duplicate signal movement was not removed:\n%s", content)
+	}
+
+	tests := []struct {
+		name string
+		plan JunctionSignalPlan
+	}{
+		{"node range", JunctionSignalPlan{NodeID: 10, Phases: []SignalPhase{{GreenSeconds: 1, Movements: []SignalMovement{{}}}}}},
+		{"empty phases", JunctionSignalPlan{NodeID: 1}},
+		{"invalid clearance", JunctionSignalPlan{NodeID: 1, YellowSeconds: -1, Phases: []SignalPhase{{GreenSeconds: 1, Movements: []SignalMovement{{}}}}}},
+		{"invalid green", JunctionSignalPlan{NodeID: 1, Phases: []SignalPhase{{GreenSeconds: 0, Movements: []SignalMovement{{}}}}}},
+		{"empty movements", JunctionSignalPlan{NodeID: 1, Phases: []SignalPhase{{GreenSeconds: 10}}}},
+		{"edge range", JunctionSignalPlan{NodeID: 1, Phases: []SignalPhase{{GreenSeconds: 10, Movements: []SignalMovement{{FromEdgeID: 20}}}}}},
+		{"saturation flow", JunctionSignalPlan{NodeID: 1, Phases: []SignalPhase{{GreenSeconds: 10, SaturationFlowVPH: 10, Movements: []SignalMovement{{FromEdgeID: 1, ToEdgeID: 2}}}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := buildSignalPlans(
+				SimulateRequest{SignalPlans: []JunctionSignalPlan{test.plan}},
+				ValidationSummary{Nodes: 10, DirectedEdges: 20}); err == nil {
+				t.Fatal("invalid signal plan should fail")
+			}
+		})
+	}
+	duplicate := request.SignalPlans[0]
+	if _, err := buildSignalPlans(
+		SimulateRequest{SignalPlans: []JunctionSignalPlan{request.SignalPlans[0], duplicate}},
+		ValidationSummary{Nodes: 10, DirectedEdges: 20}); err == nil {
+		t.Fatal("duplicate signal junction should fail")
+	}
+}
+
 func TestSimulateEndpointSuccess(t *testing.T) {
 	server := newSimulationTestServer(t, `#!/bin/sh
 trajectory=""
@@ -687,7 +792,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s' '{"type":"FeatureCollection","features":[]}' > "$trajectory"
 printf '%s' '{"duration_s":900,"step_s":1,"sample_interval_s":15,"vehicles":[]}' > "$playback"
-printf '%s\n' 'simulate=ok' 'vehicles=2' 'arrived=1' 'driving_at_end=1' 'ticks=900' 'route_plans=1' 'samples=12' 'compute_ms=3.5'
+printf '%s\n' 'simulate=ok' 'vehicles=2' 'arrived=1' 'driving_at_end=1' 'ticks=900' 'route_plans=2' 'reroute_attempts=1' 'reroute_succeeded=1' 'reroute_failed=0' 'samples=12' 'compute_ms=3.5'
 `, 2)
 
 	payload := []byte(`{"fromLon":114.26,"fromLat":30.47,"toLon":114.31,"toLat":30.52,"count":2,"durationSeconds":900,"stepSeconds":1,"sampleIntervalSeconds":15,"algorithm":"biastar"}`)
@@ -705,7 +810,9 @@ printf '%s\n' 'simulate=ok' 'vehicles=2' 'arrived=1' 'driving_at_end=1' 'ticks=9
 		t.Fatal(err)
 	}
 	if !result.OK || result.Vehicles != 2 || result.Arrived != 1 ||
-		result.Samples != 12 || result.ComputeMs != 3.5 {
+		result.Samples != 12 || result.ComputeMs != 3.5 ||
+		result.RerouteAttempts != 1 || result.RerouteSucceeded != 1 ||
+		result.RerouteFailed != 0 {
 		t.Fatalf("unexpected simulation response: %#v", result)
 	}
 	if len(result.GeoJSON) == 0 || len(result.Playback) == 0 ||
@@ -719,11 +826,13 @@ func TestSimulateEndpointPassesValidatedControls(t *testing.T) {
 trajectory=""
 playback=""
 controls=""
+signals=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) trajectory="$2"; shift 2 ;;
     --playback) playback="$2"; shift 2 ;;
     --controls) controls="$2"; shift 2 ;;
+    --signals) signals="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -731,9 +840,11 @@ test -f "$controls" || exit 10
 grep -q '10,vehicle,1,hold,1' "$controls" || exit 11
 grep -q '20,edge,7,capacity_factor,0.5' "$controls" || exit 12
 grep -q '30,junction,4,close,1' "$controls" || exit 13
+test -f "$signals" || exit 14
+grep -q '4,0,20,3,1,2,7,8,1800' "$signals" || exit 15
 printf '%s' '{"type":"FeatureCollection","features":[]}' > "$trajectory"
 printf '%s' '{"duration_s":60,"step_s":1,"sample_interval_s":5,"controls":[],"vehicles":[]}' > "$playback"
-printf '%s\n' 'simulate=ok' 'vehicles=2' 'control_events=3' 'vehicle_controls=1' 'edge_controls=1' 'junction_controls=1'
+printf '%s\n' 'simulate=ok' 'vehicles=2' 'control_events=3' 'vehicle_controls=1' 'edge_controls=1' 'junction_controls=1' 'signal_plans=1' 'signal_phases=1' 'signal_wait_events=4' 'signal_red_wait_events=3' 'signal_saturation_wait_events=1' 'signal_movements_passed=8'
 `, 2)
 
 	payload := []byte(`{
@@ -741,7 +852,8 @@ printf '%s\n' 'simulate=ok' 'vehicles=2' 'control_events=3' 'vehicle_controls=1'
 		"count":2,"durationSeconds":60,"stepSeconds":1,"sampleIntervalSeconds":5,
 		"vehicleControls":[{"timeSeconds":10,"vehicleId":1,"action":"hold"}],
 		"roadControls":[{"timeSeconds":20,"edgeIds":[7],"action":"capacityFactor","value":0.5}],
-		"junctionControls":[{"timeSeconds":30,"nodeId":4,"action":"close"}]
+		"junctionControls":[{"timeSeconds":30,"nodeId":4,"action":"close"}],
+		"signalPlans":[{"nodeId":4,"offsetSeconds":2,"yellowSeconds":3,"allRedSeconds":1,"phases":[{"greenSeconds":20,"saturationFlowVph":1800,"movements":[{"fromEdgeId":7,"toEdgeId":8}]}]}]
 	}`)
 	request := httptest.NewRequest(
 		http.MethodPost, "/api/maps/map_sim_test/simulate", bytes.NewReader(payload))
@@ -757,7 +869,11 @@ printf '%s\n' 'simulate=ok' 'vehicles=2' 'control_events=3' 'vehicle_controls=1'
 		t.Fatal(err)
 	}
 	if !result.OK || result.ControlEvents != 3 || result.VehicleControls != 1 ||
-		result.RoadControls != 1 || result.JunctionControls != 1 {
+		result.RoadControls != 1 || result.JunctionControls != 1 ||
+		result.SignalPlans != 1 || result.SignalPhases != 1 ||
+		result.SignalWaitEvents != 4 || result.SignalRedWaitEvents != 3 ||
+		result.SignalSaturationWaitEvents != 1 ||
+		result.SignalMovementsPassed != 8 {
 		t.Fatalf("unexpected control response: %#v", result)
 	}
 }

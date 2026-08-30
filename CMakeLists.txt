@@ -58,6 +58,7 @@ endif()
 add_library(zeus_simulation_core
     cpp/simulation-core/src/playback_exporter.cc
     cpp/simulation-core/src/simulation_engine.cc
+    cpp/simulation-core/src/simulation_session.cc
 )
 
 target_include_directories(zeus_simulation_core

@@ -638,6 +638,45 @@ select:focus-visible {
 .control-editor__note { margin: 0; padding: 7px 9px; border-top: 1px solid #e2e8f0; color: #64748b; background: #f8fafc; font-size: 7px; line-height: 1.55; }
 .sim-control-summary { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-top: 1px solid #f0d59e; color: #92400e; background: #fffbeb; font-size: 7px; }
 .sim-control-summary small { color: #a16207; font-family: var(--mono); font-size: 6px; }
+.signal-editor { margin: 12px 0; overflow: hidden; border: 1px solid #cfd9e6; border-radius: 8px; background: #f7fafc; }
+.signal-editor__head { display: flex; width: 100%; height: 36px; align-items: center; justify-content: space-between; padding: 0 10px; border: 0; color: #334155; background: linear-gradient(90deg, #f8fafc, #eef6f5); cursor: pointer; }
+.signal-editor__head > div { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 700; }
+.signal-editor__head svg { color: #0f8f78; }
+.signal-editor__head small { color: #64748b; font-family: var(--mono); font-size: 7px; letter-spacing: .06em; }
+.signal-editor.is-expanded .signal-editor__head { border-bottom: 1px solid #dbe5eb; color: #0f766e; background: #f0fdfa; }
+.signal-editor__timing { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; padding: 9px; }
+.signal-editor__timing label,
+.signal-phase label { display: grid; min-width: 0; gap: 4px; color: #334155; font-size: 8px; font-weight: 650; }
+.signal-editor__timing label > span,
+.signal-phase label > span { display: flex; align-items: baseline; justify-content: space-between; }
+.signal-editor__timing small,
+.signal-phase small { color: #94a3b8; font-family: var(--mono); font-size: 6px; font-weight: 500; }
+.signal-editor__timing input,
+.signal-phase input { width: 100%; min-width: 0; height: 29px; padding: 0 8px; border: 1px solid #cbd5e1; border-radius: 5px; outline: 0; color: #172033; background: #fff; font-family: var(--mono); font-size: 8px; }
+.signal-editor__timing input:focus,
+.signal-phase input:focus { border-color: #0f9f83; box-shadow: 0 0 0 2px rgba(15,159,131,.11); }
+.signal-phases { display: grid; gap: 6px; padding: 0 9px 8px; }
+.signal-phase { position: relative; display: grid; grid-template-columns: 32px 62px 78px minmax(0, 1fr) 22px; align-items: end; gap: 6px; padding: 7px; border: 1px solid #dbe5eb; border-radius: 6px; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,.03); }
+.signal-phase__index { align-self: stretch; display: grid; align-content: center; justify-items: center; gap: 4px; border-right: 1px solid #e7edf2; color: #0f766e; font-family: var(--mono); font-size: 7px; font-weight: 800; }
+.signal-phase__index i { width: 7px; height: 7px; border: 2px solid #ccfbf1; border-radius: 50%; background: #14b8a6; box-shadow: 0 0 0 1px #5eead4; }
+.signal-phase > button { display: grid; width: 22px; height: 29px; place-items: center; border: 0; border-radius: 4px; color: #94a3b8; background: transparent; cursor: pointer; }
+.signal-phase > button:hover { color: #dc2626; background: #fef2f2; }
+.signal-phase-add { display: flex; height: 27px; align-items: center; justify-content: center; gap: 5px; border: 1px dashed #94a3b8; border-radius: 5px; color: #475569; background: transparent; font-size: 7px; cursor: pointer; }
+.signal-phase-add:hover { color: #0f766e; border-color: #2dd4bf; background: #f0fdfa; }
+.signal-save { display: flex; width: calc(100% - 18px); height: 30px; align-items: center; justify-content: center; gap: 6px; margin: 4px 9px 9px; border: 1px solid #99f6e4; border-radius: 5px; color: #0f766e; background: #ecfdf5; font-size: 8px; font-weight: 750; cursor: pointer; }
+.signal-save:hover { color: #fff; border-color: #0f9f83; background: #0f9f83; }
+.signal-plan-list { padding: 2px 9px 7px; border-top: 1px solid #e2e8f0; background: #fff; }
+.signal-plan-list > div { display: grid; grid-template-columns: minmax(0, 1fr) auto 22px; min-height: 34px; align-items: center; gap: 7px; border-bottom: 1px solid #edf1f5; }
+.signal-plan-list > div:last-child { border-bottom: 0; }
+.signal-plan-list span { display: flex; align-items: center; gap: 5px; color: #334155; font-family: var(--mono); font-size: 7px; font-weight: 700; }
+.signal-plan-list span i { width: 6px; height: 6px; border-radius: 50%; background: #14b8a6; }
+.signal-plan-list small { color: #64748b; font-family: var(--mono); font-size: 6px; }
+.signal-plan-list button { display: grid; width: 22px; height: 22px; place-items: center; border: 0; border-radius: 4px; color: #94a3b8; background: transparent; cursor: pointer; }
+.signal-plan-list button:hover { color: #dc2626; background: #fef2f2; }
+.sim-signal-summary { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-top: 1px solid #99f6e4; color: #0f766e; background: #f0fdfa; font-size: 7px; }
+.sim-signal-summary small { color: #0f8f78; font-family: var(--mono); font-size: 6px; }
+.sim-reroute-summary { display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-top: 1px solid #bae6fd; color: #075985; background: #f0f9ff; font-size: 7px; }
+.sim-reroute-summary small { color: #0369a1; font-family: var(--mono); font-size: 6px; }
 .sim-readiness { display: flex; align-items: center; margin: 4px 0 9px; padding: 7px 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--quiet); background: var(--soft); font-size: 8px; gap: 6px; }
 .sim-readiness i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--quiet); }
 .sim-readiness.is-ready { color: #9a6700; border-color: #f6d796; background: #fffbeb; }
@@ -650,6 +689,7 @@ select:focus-visible {
 .sim-parameter-grid label small { color: var(--quiet); font-family: var(--mono); font-size: 6px; letter-spacing: .04em; }
 .sim-parameter-grid input { width: 54px; height: 27px; padding: 0 5px; border: 1px solid var(--line-strong); border-radius: 5px; color: var(--ink); background: #fff; font-family: var(--mono); font-size: 9px; }
 .sim-parameter-grid input:focus { border-color: #f59e0b; outline: 2px solid #fef3c7; }
+.sim-flow-note { margin: 0; padding: 6px 8px 0; color: var(--quiet); font-size: 7px; line-height: 1.5; }
 .sim-run { display: grid; width: 100%; height: 38px; grid-template-columns: 18px 1fr auto; align-items: center; margin-top: 9px; padding: 0 11px; border: 1px solid #d97706; border-radius: 8px; color: #fff; background: #d97706; cursor: pointer; text-align: left; gap: 6px; transition: transform 140ms ease, background 140ms ease; }
 .sim-run:hover:not(:disabled) { background: #b45309; transform: translateY(-1px); }
 .sim-run:disabled { cursor: not-allowed; opacity: .45; }

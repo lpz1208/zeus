@@ -284,28 +284,96 @@ void buildTurnTransitions(BuildResult& result, const ImportedRoads& imported) {
         }
     };
 
+    // Resolution indexes, built once: without them every restriction would
+    // linearly rescan all nodes and all edges (O(N) + 2x O(E) each).
     const double tolerance = std::max(0.01, imported.metadata.snap_tolerance_m * 2.0);
-    for (const SourceTurnTransition& source : imported.turn_transitions) {
-        NodeIndex via = kInvalidNode;
+
+    // Uniform grid over topology nodes for nearest-via lookup.
+    const auto cellOf = [](Point2d point, double cell_size) {
+        return std::pair<std::int64_t, std::int64_t>(
+            static_cast<std::int64_t>(std::floor(point.x / cell_size)),
+            static_cast<std::int64_t>(std::floor(point.y / cell_size)));
+    };
+    struct CellHash {
+        std::size_t operator()(
+            const std::pair<std::int64_t, std::int64_t>& cell) const noexcept {
+            const std::uint64_t x = static_cast<std::uint64_t>(cell.first);
+            const std::uint64_t y = static_cast<std::uint64_t>(cell.second);
+            return static_cast<std::size_t>(
+                (x * 0x9e3779b185ebca87ULL) ^ (y + 0x9e3779b97f4a7c15ULL));
+        }
+    };
+    std::unordered_map<std::pair<std::int64_t, std::int64_t>,
+                       std::vector<NodeIndex>, CellHash>
+        node_cells;
+    for (std::size_t i = 0; i < result.map.nodes.size(); ++i) {
+        node_cells[cellOf(result.map.nodes[i].point, tolerance)]
+            .push_back(static_cast<NodeIndex>(i));
+    }
+    const auto nearestNode = [&](Point2d point) {
+        NodeIndex best = kInvalidNode;
         double best_distance = tolerance;
-        for (std::size_t i = 0; i < result.map.nodes.size(); ++i) {
-            const double candidate = distance(result.map.nodes[i].point, source.via_point);
-            if (candidate <= best_distance) {
-                best_distance = candidate;
-                via = static_cast<NodeIndex>(i);
+        const auto center = cellOf(point, tolerance);
+        for (std::int64_t dx = -1; dx <= 1; ++dx) {
+            for (std::int64_t dy = -1; dy <= 1; ++dy) {
+                const auto found =
+                    node_cells.find({center.first + dx, center.second + dy});
+                if (found == node_cells.end()) {
+                    continue;
+                }
+                for (const NodeIndex candidate : found->second) {
+                    const double candidate_distance =
+                        distance(result.map.nodes[candidate].point, point);
+                    if (candidate_distance <= best_distance) {
+                        best = candidate;
+                        best_distance = candidate_distance;
+                    }
+                }
             }
         }
+        return best;
+    };
+
+    // Edges grouped by base source id ("way#partN" folds onto "way") so the
+    // sourceMatches prefix rule becomes a hash lookup.
+    std::unordered_map<std::string, std::vector<EdgeIndex>> edges_by_base_source;
+    for (std::size_t i = 0; i < result.map.edges.size(); ++i) {
+        const std::string& source_id = result.map.edges[i].source_id;
+        const std::size_t split = source_id.find("#part");
+        edges_by_base_source[source_id.substr(0, split)]
+            .push_back(static_cast<EdgeIndex>(i));
+    }
+
+    // Outgoing edges per node, for only_* expansion.
+    std::vector<std::vector<EdgeIndex>> outgoing_by_node(result.map.nodes.size());
+    for (std::size_t i = 0; i < result.map.edges.size(); ++i) {
+        const DirectedEdge& edge = result.map.edges[i];
+        if (edge.from < outgoing_by_node.size()) {
+            outgoing_by_node[edge.from].push_back(static_cast<EdgeIndex>(i));
+        }
+    }
+
+    for (const SourceTurnTransition& source : imported.turn_transitions) {
+        const NodeIndex via = nearestNode(source.via_point);
 
         std::vector<EdgeIndex> from_edges;
         std::vector<EdgeIndex> to_edges;
         if (via != kInvalidNode) {
-            for (std::size_t i = 0; i < result.map.edges.size(); ++i) {
-                const DirectedEdge& edge = result.map.edges[i];
-                if (edge.to == via && sourceMatches(edge.source_id, source.from_source_id)) {
-                    from_edges.push_back(static_cast<EdgeIndex>(i));
+            const auto from_bucket =
+                edges_by_base_source.find(source.from_source_id);
+            if (from_bucket != edges_by_base_source.end()) {
+                for (const EdgeIndex edge_index : from_bucket->second) {
+                    if (result.map.edges[edge_index].to == via) {
+                        from_edges.push_back(edge_index);
+                    }
                 }
-                if (edge.from == via && sourceMatches(edge.source_id, source.to_source_id)) {
-                    to_edges.push_back(static_cast<EdgeIndex>(i));
+            }
+            const auto to_bucket = edges_by_base_source.find(source.to_source_id);
+            if (to_bucket != edges_by_base_source.end()) {
+                for (const EdgeIndex edge_index : to_bucket->second) {
+                    if (result.map.edges[edge_index].from == via) {
+                        to_edges.push_back(edge_index);
+                    }
                 }
             }
         }
@@ -323,11 +391,10 @@ void buildTurnTransitions(BuildResult& result, const ImportedRoads& imported) {
 
         for (const EdgeIndex from : from_edges) {
             if (source.kind == SourceTurnKind::kOnly) {
-                for (std::size_t i = 0; i < result.map.edges.size(); ++i) {
-                    const DirectedEdge& outgoing = result.map.edges[i];
-                    if (outgoing.from == via &&
-                        !sourceMatches(outgoing.source_id, source.to_source_id)) {
-                        addTransition(from, static_cast<EdgeIndex>(i), true, 0.0F);
+                for (const EdgeIndex outgoing : outgoing_by_node[via]) {
+                    if (!sourceMatches(result.map.edges[outgoing].source_id,
+                                       source.to_source_id)) {
+                        addTransition(from, outgoing, true, 0.0F);
                     }
                 }
                 continue;

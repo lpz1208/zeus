@@ -20,6 +20,7 @@
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
 #include "zeus/simulation/simulation_engine.h"
+#include "zeus/simulation/simulation_session.h"
 
 namespace {
 
@@ -95,6 +96,100 @@ zeus::simulation::SimulationConfig quickConfig(double duration, double step = 1.
     config.step_seconds = step;
     config.sample_interval_seconds = sample_interval;
     return config;
+}
+
+void runStatefulSessionStepTest() {
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(1000.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);
+
+    SimSetup setup(fixture.data);
+    const zeus::simulation::SimulationConfig config = quickConfig(200.0, 1.0, 10.0);
+    const std::vector<zeus::simulation::VehicleDemand> demands = {
+        demand(0.0, 0.5, 1000.0, 0.5),
+    };
+    const zeus::simulation::SimulationResult direct =
+        setup.engine->run(config, demands);
+
+    zeus::simulation::SimulationSession session(*setup.engine, config, demands);
+    const zeus::simulation::SimulationSessionState initial = session.reset();
+    require(initial.ready && initial.paused && !initial.finished,
+            "stateful session resets at a paused tick-zero barrier");
+    require(initial.tick == 0 && near(initial.simulation_time_s, 0.0) &&
+                initial.state_version > 0,
+            "initial session observation exposes tick, time and version");
+    require(!session.hasResult(), "paused session has no final result");
+
+    const zeus::simulation::SimulationSessionState after_two = session.step(2);
+    require(after_two.ready && after_two.paused && !after_two.finished,
+            "step pauses again at the requested committed boundary");
+    require(after_two.tick == 2 && near(after_two.simulation_time_s, 2.0),
+            "two steps advance exactly two seconds of simulation time");
+    require(after_two.state_version == initial.state_version + 2,
+            "every committed tick advances the state version");
+    const zeus::simulation::SimulationSessionState observed = session.observe();
+    require(observed.tick == after_two.tick &&
+                observed.state_version == after_two.state_version,
+            "observe is stable while the session is paused");
+
+    const zeus::simulation::SimulationSessionState finished = session.runToEnd();
+    require(finished.finished && finished.paused && !finished.cancelled,
+            "runToEnd reaches a normal terminal state");
+    require(session.hasResult(), "finished session exposes its result");
+    const zeus::simulation::SimulationResult stepped = session.result();
+    require(stepped.ok && !stepped.stats.cancelled && stepped.stats.arrived == 1,
+            "stateful execution preserves successful arrival");
+    require(stepped.stats.ticks_executed == direct.stats.ticks_executed &&
+                near(stepped.vehicles.front().arrive_s,
+                     direct.vehicles.front().arrive_s) &&
+                near(stepped.vehicles.front().traveled_m,
+                     direct.vehicles.front().traveled_m),
+            "stepped and one-shot executions are equivalent");
+
+    const std::uint64_t completed_version = finished.state_version;
+    const zeus::simulation::SimulationSessionState reset_again = session.reset();
+    require(reset_again.tick == 0 && reset_again.state_version > completed_version,
+            "reset invalidates every state version from the previous run");
+    session.close();
+}
+
+void runStatefulSessionCancellationTest() {
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(1000.0, 0.0);
+    fixture.addEdge(n0, n1, 1.0);
+
+    SimSetup setup(fixture.data);
+    const std::vector<zeus::simulation::VehicleDemand> demands = {
+        demand(0.0, 0.5, 1000.0, 0.5),
+    };
+    zeus::simulation::SimulationSession session(
+        *setup.engine, quickConfig(2000.0), demands);
+    const zeus::simulation::SimulationSessionState initial = session.reset();
+    const zeus::simulation::SimulationSessionState after_one = session.step();
+    require(after_one.tick == 1 &&
+                after_one.state_version == initial.state_version + 1,
+            "single-step session reaches its first committed boundary");
+    const zeus::simulation::SimulationSessionState restarted = session.reset();
+    require(restarted.tick == 0 && restarted.paused && !restarted.finished &&
+                restarted.state_version > after_one.state_version,
+            "reset safely replaces a paused worker and invalidates its version");
+    static_cast<void>(session.step());
+    session.close();
+    const zeus::simulation::SimulationSessionState closed = session.observe();
+    require(closed.finished && closed.cancelled && closed.paused,
+            "closing a paused session cancels and joins its worker");
+    require(session.hasResult() && session.result().stats.cancelled,
+            "cancelled session preserves a partial auditable result");
+
+    bool rejected = false;
+    try {
+        static_cast<void>(session.step());
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    require(rejected, "closed session rejects further stepping");
 }
 
 void runSingleVehicleArrivalTest() {
@@ -231,6 +326,185 @@ void runSpillbackTest() {
             "the bottleneck delays the last vehicles beyond free flow");
     require(result.stats.max_travel_s > result.stats.min_travel_s,
             "earlier vehicles travel faster than the queued ones");
+}
+
+void runExitHeadwayTest() {
+    // Two vehicles drive in lockstep on one wide edge and would arrive at the
+    // same moment; the exit headway gate must stagger their arrivals.
+    const auto runPair = [](double headway_ff) {
+        Fixture fixture;
+        const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+        const zeus::map::NodeIndex n1 = fixture.addNode(100.0, 0.0);
+        fixture.addEdge(n0, n1, 10.0);
+        SimSetup setup(fixture.data);
+        zeus::simulation::SimulationConfig config = quickConfig(600.0);
+        config.exit_headway_ff_s = headway_ff;
+        config.exit_headway_jam_s = headway_ff;
+        return setup.engine->run(config, identicalFleet(2, 10.0, 0.5, 90.0, 0.5));
+    };
+
+    const zeus::simulation::SimulationResult unthrottled = runPair(0.0);
+    require(unthrottled.ok && unthrottled.stats.arrived == 2,
+            "unthrottled pair arrives");
+    require(unthrottled.vehicles[0].arrive_s > 8.0 - 1e-9 &&
+                unthrottled.vehicles[0].arrive_s < 10.0,
+            "unthrottled travel stays near the free-flow time");
+    require(near(unthrottled.vehicles[0].arrive_s, unthrottled.vehicles[1].arrive_s),
+            "unthrottled lockstep pair arrives together");
+
+    const zeus::simulation::SimulationResult throttled = runPair(2.0);
+    require(throttled.ok && throttled.stats.arrived == 2,
+            "throttled pair arrives");
+    require(throttled.vehicles[1].arrive_s >=
+                throttled.vehicles[0].arrive_s + 2.0 - 1e-9,
+            "the second discharge waits for the headway");
+    require(throttled.stats.max_travel_s > throttled.stats.min_travel_s,
+            "the headway gate staggers the fleet");
+}
+
+void runClosureRerouteTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(100.0, 0.0);
+    const auto n2 = fixture.addNode(200.0, 0.0);
+    const auto n3 = fixture.addNode(100.0, 100.0);
+    const auto n4 = fixture.addNode(300.0, 0.0);
+    const auto first = fixture.addEdge(n0, n1, 10.0);
+    const auto blocked = fixture.addEdge(n1, n2, 10.0);
+    const auto detour_a = fixture.addEdge(n1, n3, 10.0);
+    const auto detour_b = fixture.addEdge(n3, n2, 10.0);
+    const auto goal = fixture.addEdge(n2, n4, 10.0);
+
+    SimSetup setup(fixture.data);
+    const std::vector<zeus::simulation::SimulationControlEvent> controls = {
+        {1.0, zeus::simulation::ControlScope::kEdge, blocked,
+         zeus::simulation::ControlAction::kClose, 1.0},
+    };
+    const auto result = setup.engine->run(
+        quickConfig(120.0, 1.0, 5.0),
+        {demand(10.0, 0.5, 290.0, 0.5)}, controls);
+
+    require(result.ok && result.stats.arrived == 1,
+            "vehicle arrives after a future edge closes");
+    require(result.stats.reroute_attempts == 1 &&
+                result.stats.reroute_succeeded == 1 &&
+                result.stats.reroute_failed == 0,
+            "closure reroute statistics record one success");
+    require(result.reroutes.size() == 1 && result.reroutes[0].success &&
+                near(result.reroutes[0].time_s, 1.0),
+            "closure reroute record preserves event time and outcome");
+    require(result.vehicles[0].route_id == result.reroutes[0].new_route_id &&
+                result.vehicles[0].route_id != result.reroutes[0].old_route_id,
+            "vehicle switches to the newly planned route");
+    const auto& route = result.routes[result.vehicles[0].route_id];
+    require(route.edges == std::vector<zeus::map::EdgeIndex>{
+                               first, detour_a, detour_b, goal},
+            "new route avoids the closed edge without leaving the current edge");
+}
+
+void runClosureRerouteFailureTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(100.0, 0.0);
+    const auto n2 = fixture.addNode(200.0, 0.0);
+    const auto first = fixture.addEdge(n0, n1, 10.0);
+    const auto blocked = fixture.addEdge(n1, n2, 10.0);
+
+    SimSetup setup(fixture.data);
+    const std::vector<zeus::simulation::SimulationControlEvent> controls = {
+        {1.0, zeus::simulation::ControlScope::kEdge, blocked,
+         zeus::simulation::ControlAction::kClose, 1.0},
+    };
+    auto config = quickConfig(8.0, 1.0, 2.0);
+    config.deadlock_probe_ticks = 20;
+    const auto result = setup.engine->run(
+        config, {demand(10.0, 0.5, 190.0, 0.5)}, controls);
+
+    require(result.ok && result.stats.arrived == 0 &&
+                result.stats.driving_at_end == 1,
+            "vehicle remains on its current route when no detour exists");
+    require(result.stats.reroute_attempts == 1 &&
+                result.stats.reroute_succeeded == 0 &&
+                result.stats.reroute_failed == 1,
+            "closure reroute statistics record one failure");
+    require(result.reroutes.size() == 1 && !result.reroutes[0].success &&
+                result.reroutes[0].old_route_id == result.reroutes[0].new_route_id,
+            "failed reroute record retains the original route");
+    require(result.routes[result.vehicles[0].route_id].edges ==
+                std::vector<zeus::map::EdgeIndex>{first, blocked},
+            "failed reroute does not mutate the original route");
+}
+
+void runDynamicWeightControlRerouteTest() {
+    const auto run = [](zeus::simulation::ControlAction action) {
+        Fixture fixture;
+        const auto n0 = fixture.addNode(0.0, 0.0);
+        const auto n1 = fixture.addNode(100.0, 0.0);
+        const auto n2 = fixture.addNode(200.0, 0.0);
+        const auto n3 = fixture.addNode(100.0, 100.0);
+        const auto n4 = fixture.addNode(300.0, 0.0);
+        const auto first = fixture.addEdge(n0, n1, 10.0);
+        const auto penalized = fixture.addEdge(n1, n2, 10.0);
+        const auto detour_a = fixture.addEdge(n1, n3, 10.0);
+        const auto detour_b = fixture.addEdge(n3, n2, 10.0);
+        const auto goal = fixture.addEdge(n2, n4, 10.0);
+
+        SimSetup setup(fixture.data);
+        const std::vector<zeus::simulation::SimulationControlEvent> controls = {
+            {1.0, zeus::simulation::ControlScope::kEdge, penalized, action, 0.2},
+        };
+        const auto result = setup.engine->run(
+            quickConfig(120.0, 1.0, 5.0),
+            {demand(10.0, 0.5, 290.0, 0.5)}, controls);
+
+        require(result.ok && result.stats.arrived == 1,
+                "vehicle arrives after a dynamic edge cost event");
+        require(result.stats.reroute_attempts == 1 &&
+                    result.stats.reroute_succeeded == 1,
+                "dynamic edge cost event triggers one successful reroute");
+        const auto& route = result.routes[result.vehicles[0].route_id];
+        require(route.edges == std::vector<zeus::map::EdgeIndex>{
+                                   first, detour_a, detour_b, goal},
+                "dynamic edge cost route uses the cheaper detour");
+    };
+
+    run(zeus::simulation::ControlAction::kSetSpeedFactor);
+    run(zeus::simulation::ControlAction::kSetCapacityFactor);
+}
+
+void runPeriodicCongestionRerouteTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(70.0, 0.0);
+    const auto n2 = fixture.addNode(140.0, 0.0);
+    const auto n3 = fixture.addNode(70.0, 140.0);
+    const auto n4 = fixture.addNode(210.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);  // capacity 10
+    const auto congested = fixture.addEdge(n1, n2, 10.0);  // capacity 10
+    const auto detour_a = fixture.addEdge(n1, n3, 10.0);
+    const auto detour_b = fixture.addEdge(n3, n2, 10.0);
+    const auto goal = fixture.addEdge(n2, n4, 10.0);
+
+    SimSetup setup(fixture.data);
+    auto config = quickConfig(180.0, 1.0, 5.0);
+    config.reroute_interval_seconds = 1.0;
+    config.reroute_cost_ratio = 1.25;
+    const auto result = setup.engine->run(
+        config, identicalFleet(11, 0.0, 0.5, 210.0, 0.5));
+
+    require(result.ok && result.stats.arrived == 11,
+            "periodic congestion scenario completes");
+    require(result.stats.reroute_succeeded >= 1,
+            "a material live occupancy change triggers a reroute");
+    const auto& last_route = result.routes[result.vehicles.back().route_id];
+    require(std::find(last_route.edges.begin(), last_route.edges.end(), congested) ==
+                last_route.edges.end() &&
+                std::find(last_route.edges.begin(), last_route.edges.end(), detour_a) !=
+                    last_route.edges.end() &&
+                std::find(last_route.edges.begin(), last_route.edges.end(), detour_b) !=
+                    last_route.edges.end() &&
+                last_route.edges.back() == goal,
+            "the queued vehicle avoids the live congested branch");
 }
 
 void runDeterminismTest() {
@@ -379,6 +653,131 @@ void runJunctionControlTest() {
             "junction control application is recorded");
 }
 
+void runTurnSignalPlanTest() {
+    Fixture fixture;
+    const auto west = fixture.addNode(-100.0, 0.0);
+    const auto junction = fixture.addNode(0.0, 0.0);
+    const auto east = fixture.addNode(100.0, 0.0);
+    const auto south = fixture.addNode(0.0, -100.0);
+    const auto north = fixture.addNode(0.0, 100.0);
+    const auto west_in = fixture.addEdge(west, junction, 10.0);
+    const auto east_out = fixture.addEdge(junction, east, 10.0);
+    const auto south_in = fixture.addEdge(south, junction, 10.0);
+    const auto north_out = fixture.addEdge(junction, north, 10.0);
+
+    zeus::simulation::JunctionSignalPlan signal;
+    signal.node = junction;
+    signal.yellow_seconds = 2.0;
+    signal.all_red_seconds = 1.0;
+    signal.phases = {
+        {5.0, {{west_in, east_out}}},
+        {5.0, {{south_in, north_out}}},
+    };
+
+    SimSetup setup(fixture.data);
+    const std::vector<zeus::simulation::VehicleDemand> demands = {
+        demand(-100.0, 0.5, 100.0, 0.5),
+        demand(0.5, -100.0, 0.5, 100.0),
+    };
+    const std::vector<zeus::simulation::SimulationControlEvent> controls;
+    const std::vector<zeus::simulation::JunctionSignalPlan> signals = {signal};
+    const auto result = setup.engine->run(
+        quickConfig(60.0, 1.0, 2.0), demands, controls, signals);
+
+    require(result.ok && result.stats.arrived == 2,
+            "both signal-controlled movements eventually arrive");
+    require(near(result.vehicles[1].arrive_s, 20.0),
+            "the northbound movement crosses during its green phase");
+    require(near(result.vehicles[0].arrive_s, 26.0),
+            "the eastbound movement waits through the other phase and clearance");
+    require(result.stats.signal_plans == 1 && result.stats.signal_phases == 2 &&
+                result.stats.signal_wait_events > 0,
+            "signal plan structure and red-phase waits are counted");
+    require(result.stats.signal_red_wait_events == result.stats.signal_wait_events &&
+                result.stats.signal_saturation_wait_events == 0 &&
+                result.stats.signal_movements_passed == 2,
+            "phase test classifies waits as red and counts successful crossings");
+    require(result.signal_plans.size() == 1 &&
+                result.signal_plans[0].phases.size() == 2,
+            "effective signal plan is retained for playback export");
+
+    auto invalid_signal = signal;
+    invalid_signal.node = west;
+    bool rejected = false;
+    try {
+        static_cast<void>(setup.engine->run(
+            quickConfig(60.0), demands, controls,
+            std::vector<zeus::simulation::JunctionSignalPlan>{invalid_signal}));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected,
+            "signal movements that do not traverse the configured node are rejected");
+}
+
+void runSignalSaturationFlowTest() {
+    Fixture fixture;
+    const auto west = fixture.addNode(-100.0, 0.0);
+    const auto junction = fixture.addNode(0.0, 0.0);
+    const auto east = fixture.addNode(100.0, 0.0);
+    const auto incoming = fixture.addEdge(west, junction, 10.0, 4);
+    const auto outgoing = fixture.addEdge(junction, east, 10.0, 4);
+
+    zeus::simulation::SignalPhase phase;
+    phase.green_seconds = 100.0;
+    phase.movements = {{incoming, outgoing}};
+    phase.saturation_flow_vph = 1800.0;  // one vehicle every two seconds
+    zeus::simulation::JunctionSignalPlan signal;
+    signal.node = junction;
+    signal.yellow_seconds = 0.0;
+    signal.all_red_seconds = 0.0;
+    signal.phases = {phase};
+
+    SimSetup setup(fixture.data);
+    const auto demands = identicalFleet(2, -100.0, 0.5, 100.0, 0.5);
+    const std::vector<zeus::simulation::SimulationControlEvent> controls;
+    const auto result = setup.engine->run(
+        quickConfig(60.0, 1.0, 2.0), demands, controls,
+        std::vector<zeus::simulation::JunctionSignalPlan>{signal});
+
+    require(result.ok && result.stats.arrived == 2,
+            "movement saturation scenario completes");
+    double first_crossing = -1.0;
+    double second_crossing = -1.0;
+    for (const auto& sample : result.vehicles[0].samples) {
+        if (sample.edge == outgoing && near(sample.offset_s, 0.0)) {
+            first_crossing = sample.t;
+            break;
+        }
+    }
+    for (const auto& sample : result.vehicles[1].samples) {
+        if (sample.edge == outgoing && near(sample.offset_s, 0.0)) {
+            second_crossing = sample.t;
+            break;
+        }
+    }
+    require(first_crossing >= 0.0 &&
+                second_crossing >= first_crossing + 2.0 - 1e-9,
+            "1800 veh/h saturation flow enforces a two-second movement headway");
+    require(result.stats.signal_red_wait_events == 0 &&
+                result.stats.signal_saturation_wait_events > 0 &&
+                result.stats.signal_wait_events ==
+                    result.stats.signal_saturation_wait_events &&
+                result.stats.signal_movements_passed == 2,
+            "saturation waits are separated from red-phase waits");
+
+    signal.phases[0].saturation_flow_vph = 10.0;
+    bool rejected = false;
+    try {
+        static_cast<void>(setup.engine->run(
+            quickConfig(60.0), demands, controls,
+            std::vector<zeus::simulation::JunctionSignalPlan>{signal}));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "out-of-range movement saturation flow is rejected");
+}
+
 void runNonIntegralSamplingTest() {
     Fixture fixture;
     const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
@@ -484,8 +883,12 @@ void runExportTest() {
         }
 
         const std::filesystem::path playback = directory / "playback.json";
+        zeus::simulation::SimulationResult playback_result = result;
+        playback_result.reroutes.push_back({12.0, 3, 0, 1, true});
+        playback_result.signal_plans.push_back({
+            0, 2.0, 3.0, 1.0, {{20.0, {{0, 0}}}}});
         zeus::simulation::PlaybackExporter::save(
-            *setup.runtime, result, playback.string());
+            *setup.runtime, playback_result, playback.string());
         std::ifstream input(playback);
         std::string content((std::istreambuf_iterator<char>(input)),
                             std::istreambuf_iterator<char>());
@@ -496,6 +899,24 @@ void runExportTest() {
         require(content.find("\"controls\"") != std::string::npos &&
                     content.find("\"action\": \"speed_factor\"") != std::string::npos,
                 "playback document lists applied controls");
+        require(content.find("\"reroutes\"") != std::string::npos &&
+                    content.find("\"vehicle_id\": 3") != std::string::npos &&
+                    content.find("\"success\": true") != std::string::npos,
+                "playback document lists vehicle reroutes");
+        require(content.find("\"reroute_interval_s\": 0.000") != std::string::npos &&
+                    content.find("\"reroute_cost_ratio\": 1.250") != std::string::npos,
+                "playback document preserves dynamic routing configuration");
+        require(content.find("\"cancelled\": false") != std::string::npos &&
+                    content.find("\"barrier_wait_ms\": 0.000") !=
+                        std::string::npos &&
+                    content.find("\"compute_ms\":") != std::string::npos,
+                "playback separates barrier wait from simulation compute time");
+        require(content.find("\"signal_plans\"") != std::string::npos &&
+                    content.find("\"node_id\": 0") != std::string::npos &&
+                    content.find("\"saturation_flow_vph\": 1800.000") !=
+                        std::string::npos &&
+                    content.find("\"movements\": [[0, 0]]") != std::string::npos,
+                "playback document preserves turn-level signal plans");
         require(content.find("nan") == std::string::npos,
                 "playback document contains no NaN values");
         int depth = 0;
@@ -518,6 +939,8 @@ void runExportTest() {
 
 int main() {
     try {
+        runStatefulSessionStepTest();
+        runStatefulSessionCancellationTest();
         runSingleVehicleArrivalTest();
         runMultiEdgeTickTest();
         runCongestionSlowdownTest();
@@ -530,9 +953,16 @@ int main() {
         runVehicleControlTest();
         runEdgeControlTest();
         runJunctionControlTest();
+        runTurnSignalPlanTest();
+        runSignalSaturationFlowTest();
         runNonIntegralSamplingTest();
         runUnroutableDemandTest();
         runExportTest();
+        runExitHeadwayTest();
+        runClosureRerouteTest();
+        runClosureRerouteFailureTest();
+        runDynamicWeightControlRerouteTest();
+        runPeriodicCongestionRerouteTest();
         std::cout << "all simulation tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -11,6 +11,18 @@ namespace {
 
 constexpr double kInfinity = std::numeric_limits<double>::infinity();
 
+bool edgeEnabled(const SearchQuery& query, zeus::map::EdgeIndex edge) {
+    return query.overlay == nullptr || query.overlay->edgeEnabled(edge);
+}
+
+double edgeCost(const SearchQuery& query, zeus::map::EdgeIndex edge_index,
+                const zeus::map::DirectedEdge& edge) {
+    const double factor = query.overlay == nullptr
+                              ? 1.0
+                              : query.overlay->edgeCostFactor(edge_index);
+    return edgeCostSeconds(edge) * factor;
+}
+
 }  // namespace
 
 SearchOutput runShortestPathSearch(
@@ -113,11 +125,14 @@ SearchOutput runShortestPathSearch(
         }
 
         for (const zeus::map::EdgeIndex edge_index : runtime.outgoingEdges(node)) {
+            if (!edgeEnabled(query, edge_index)) {
+                continue;
+            }
             const zeus::map::DirectedEdge& edge = runtime.edge(edge_index);
             if (edge.to >= node_count) {
                 continue;
             }
-            const double candidate = dist[node] + edgeCostSeconds(edge);
+            const double candidate = dist[node] + edgeCost(query, edge_index, edge);
             if (candidate >= best_total || candidate >= dist[edge.to]) {
                 continue;
             }
@@ -238,12 +253,15 @@ SearchOutput runTurnAwareSearch(
         }
 
         for (const zeus::map::EdgeIndex next : runtime.outgoingEdges(node)) {
+            if (!edgeEnabled(query, next)) {
+                continue;
+            }
             const zeus::map::DirectedEdge& edge = runtime.edge(next);
             const double turn = runtime.turnPenaltySeconds(incoming_edge, next);
             if (!std::isfinite(turn)) {
                 continue;
             }
-            const double candidate = dist[incoming_edge] + turn + edgeCostSeconds(edge);
+            const double candidate = dist[incoming_edge] + turn + edgeCost(query, next, edge);
             if (candidate >= best_total || candidate >= dist[next]) {
                 continue;
             }
@@ -387,7 +405,7 @@ SearchOutput runBidirectionalSearch(
     const auto reduced = [&](zeus::map::EdgeIndex edge_index) {
         const zeus::map::DirectedEdge& edge = runtime.edge(edge_index);
         const double weight =
-            edgeCostSeconds(edge) + potential(edge.to) - potential(edge.from);
+            edgeCost(query, edge_index, edge) + potential(edge.to) - potential(edge.from);
         return weight > 0.0 ? weight : 0.0;
     };
 
@@ -464,6 +482,9 @@ SearchOutput runBidirectionalSearch(
                 updateBest(dist_f[node] + dist_b[node], zeus::map::kInvalidEdge, node, node);
             }
             for (const zeus::map::EdgeIndex edge_index : runtime.outgoingEdges(node)) {
+                if (!edgeEnabled(query, edge_index)) {
+                    continue;
+                }
                 const zeus::map::DirectedEdge& edge = runtime.edge(edge_index);
                 if (edge.to >= node_count) {
                     continue;
@@ -491,6 +512,9 @@ SearchOutput runBidirectionalSearch(
             }
             for (std::uint32_t k = incoming.offsets[node]; k < incoming.offsets[node + 1]; ++k) {
                 const zeus::map::EdgeIndex edge_index = incoming.edges[k];
+                if (!edgeEnabled(query, edge_index)) {
+                    continue;
+                }
                 const zeus::map::DirectedEdge& edge = runtime.edge(edge_index);
                 if (edge.from >= node_count) {
                     continue;

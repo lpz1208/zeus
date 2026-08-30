@@ -24,6 +24,7 @@ struct SearchQuery {
     std::vector<SearchEndpoint> starts;
     std::vector<SearchEndpoint> goals;
     Algorithm algorithm = Algorithm::kDijkstra;
+    const RoutingOverlay* overlay = nullptr;
 };
 
 struct SearchOutput {

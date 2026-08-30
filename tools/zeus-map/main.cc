@@ -88,7 +88,12 @@ void printUsage() {
         << "  --duration SECONDS         simulation horizon (default 3600)\n"
         << "  --step SECONDS             tick length (default 1)\n"
         << "  --sample-interval SECONDS  trajectory sampling (default 30)\n"
+        << "  --exit-headway-ff SECONDS   discharge headway at free flow (default 0=off)\n"
+        << "  --exit-headway-jam SECONDS  discharge headway under jam (default 0=off)\n"
+        << "  --reroute-interval SECONDS  live congestion scan interval (default 0=off)\n"
+        << "  --reroute-cost-ratio RATIO  material edge-cost change threshold (default 1.25)\n"
         << "  --controls FILE            time,scope,target,action[,value] rows\n"
+        << "  --signals FILE             node,phase,green,yellow,all_red,offset,from,to[,flow_vph] rows\n"
         << "  --output FILE              write per-vehicle WGS84 trajectory GeoJSON\n"
         << "  --playback FILE            write the web playback document\n";
 }
@@ -282,6 +287,8 @@ int executeRoute(
     if (!result.ok) {
         output << "route=failed\n"
                << "algorithm=" << zeus::routing::algorithmName(result.algorithm) << '\n'
+               << "effective_algorithm="
+               << zeus::routing::algorithmName(result.effective_algorithm) << '\n'
                << "reason=" << zeus::routing::routeFailureName(result.failure) << '\n'
                << "message=" << result.message << '\n';
         return 3;
@@ -299,7 +306,9 @@ int executeRoute(
                << " confidence=" << match.confidence << '\n';
     };
     output << "route=ok\n"
-           << "algorithm=" << zeus::routing::algorithmName(result.algorithm) << '\n';
+           << "algorithm=" << zeus::routing::algorithmName(result.algorithm) << '\n'
+           << "effective_algorithm="
+           << zeus::routing::algorithmName(result.effective_algorithm) << '\n';
     print_match("origin", result.origin);
     print_match("dest", result.destination);
     output << "edges=" << result.path.edges.size() << '\n'
@@ -440,6 +449,100 @@ std::vector<zeus::simulation::SimulationControlEvent> parseSimulationControls(
         controls.push_back(control);
     }
     return controls;
+}
+
+std::vector<zeus::simulation::JunctionSignalPlan> parseSignalPlans(
+    const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("cannot open signal plans file: " + path);
+    }
+    std::vector<zeus::simulation::JunctionSignalPlan> plans;
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        line = trim(line);
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        std::vector<std::string> fields;
+        std::size_t begin = 0;
+        while (true) {
+            const std::size_t comma = line.find(',', begin);
+            if (comma == std::string::npos) {
+                fields.push_back(trim(line.substr(begin)));
+                break;
+            }
+            fields.push_back(trim(line.substr(begin, comma - begin)));
+            begin = comma + 1;
+        }
+        if (fields.size() < 8 || fields.size() > 9) {
+            throw std::runtime_error(
+                "invalid signal line " + std::to_string(line_number) +
+                ": expected node_id,phase,green_s,yellow_s,all_red_s,offset_s,from_edge,to_edge[,saturation_flow_vph]");
+        }
+        const auto checkedId = [&](const std::string& value, const char* name) {
+            const unsigned long long parsed = std::stoull(value);
+            if (parsed > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("signal ") + name + " exceeds uint32 range on line " +
+                    std::to_string(line_number));
+            }
+            return static_cast<std::uint32_t>(parsed);
+        };
+        const auto node = static_cast<zeus::map::NodeIndex>(checkedId(fields[0], "node ID"));
+        const std::uint32_t phase_index = checkedId(fields[1], "phase index");
+        if (phase_index >= 1024) {
+            throw std::runtime_error("signal phase index is too large on line " +
+                                     std::to_string(line_number));
+        }
+        const double green = std::stod(fields[2]);
+        const double yellow = std::stod(fields[3]);
+        const double all_red = std::stod(fields[4]);
+        const double offset = std::stod(fields[5]);
+        const auto from_edge = static_cast<zeus::map::EdgeIndex>(
+            checkedId(fields[6], "from edge"));
+        const auto to_edge = static_cast<zeus::map::EdgeIndex>(
+            checkedId(fields[7], "to edge"));
+        const double saturation_flow_vph =
+            fields.size() == 9 ? std::stod(fields[8]) : 1800.0;
+
+        auto found = std::find_if(
+            plans.begin(), plans.end(),
+            [node](const zeus::simulation::JunctionSignalPlan& plan) {
+                return plan.node == node;
+            });
+        if (found == plans.end()) {
+            plans.push_back({node, offset, yellow, all_red, {}});
+            found = std::prev(plans.end());
+        } else if (std::abs(found->offset_seconds - offset) > 1e-9 ||
+                   std::abs(found->yellow_seconds - yellow) > 1e-9 ||
+                   std::abs(found->all_red_seconds - all_red) > 1e-9) {
+            throw std::runtime_error(
+                "inconsistent signal plan timing on line " +
+                std::to_string(line_number));
+        }
+        if (found->phases.size() <= phase_index) {
+            found->phases.resize(static_cast<std::size_t>(phase_index) + 1);
+        }
+        zeus::simulation::SignalPhase& phase = found->phases[phase_index];
+        if (phase.movements.empty()) {
+            phase.green_seconds = green;
+            phase.saturation_flow_vph = saturation_flow_vph;
+        } else if (std::abs(phase.green_seconds - green) > 1e-9) {
+            throw std::runtime_error(
+                "inconsistent signal phase green time on line " +
+                std::to_string(line_number));
+        } else if (std::abs(
+                       phase.saturation_flow_vph - saturation_flow_vph) > 1e-9) {
+            throw std::runtime_error(
+                "inconsistent signal phase saturation flow on line " +
+                std::to_string(line_number));
+        }
+        phase.movements.push_back({from_edge, to_edge});
+    }
+    return plans;
 }
 
 int run(int argc, char** argv) {
@@ -721,9 +824,25 @@ int run(int argc, char** argv) {
         if (const auto found = options.find("sample-interval"); found != options.end()) {
             config.sample_interval_seconds = std::stod(found->second);
         }
+        if (const auto found = options.find("exit-headway-ff"); found != options.end()) {
+            config.exit_headway_ff_s = std::stod(found->second);
+        }
+        if (const auto found = options.find("exit-headway-jam"); found != options.end()) {
+            config.exit_headway_jam_s = std::stod(found->second);
+        }
+        if (const auto found = options.find("reroute-interval"); found != options.end()) {
+            config.reroute_interval_seconds = std::stod(found->second);
+        }
+        if (const auto found = options.find("reroute-cost-ratio"); found != options.end()) {
+            config.reroute_cost_ratio = std::stod(found->second);
+        }
         std::vector<zeus::simulation::SimulationControlEvent> controls;
         if (const auto found = options.find("controls"); found != options.end()) {
             controls = parseSimulationControls(found->second);
+        }
+        std::vector<zeus::simulation::JunctionSignalPlan> signal_plans;
+        if (const auto found = options.find("signals"); found != options.end()) {
+            signal_plans = parseSignalPlans(found->second);
         }
 
         // Convert every demand point in one batch through a shared transform.
@@ -759,7 +878,7 @@ int run(int argc, char** argv) {
         const zeus::routing::RoutePlanner planner(runtime);
         const zeus::simulation::SimulationEngine engine(runtime, planner);
         const zeus::simulation::SimulationResult result =
-            engine.run(config, demands, controls);
+            engine.run(config, demands, controls, signal_plans);
 
         std::cout << std::fixed << std::setprecision(3);
         if (!result.ok) {
@@ -780,12 +899,26 @@ int run(int argc, char** argv) {
                   << "vehicle_controls=" << result.stats.vehicle_control_events << '\n'
                   << "edge_controls=" << result.stats.edge_control_events << '\n'
                   << "junction_controls=" << result.stats.junction_control_events << '\n'
+                  << "reroute_attempts=" << result.stats.reroute_attempts << '\n'
+                  << "reroute_succeeded=" << result.stats.reroute_succeeded << '\n'
+                  << "reroute_failed=" << result.stats.reroute_failed << '\n'
+                  << "signal_plans=" << result.stats.signal_plans << '\n'
+                  << "signal_phases=" << result.stats.signal_phases << '\n'
+                  << "signal_wait_events=" << result.stats.signal_wait_events << '\n'
+                  << "signal_red_wait_events="
+                  << result.stats.signal_red_wait_events << '\n'
+                  << "signal_saturation_wait_events="
+                  << result.stats.signal_saturation_wait_events << '\n'
+                  << "signal_movements_passed="
+                  << result.stats.signal_movements_passed << '\n'
                   << "avg_travel_s=" << result.stats.average_travel_s << '\n'
                   << "min_travel_s=" << result.stats.min_travel_s << '\n'
                   << "max_travel_s=" << result.stats.max_travel_s << '\n'
                   << "total_distance_m=" << result.stats.total_distance_m << '\n'
                   << "samples=" << result.stats.sample_count << '\n'
                   << "deadlock=" << (result.stats.deadlock ? 1 : 0) << '\n'
+                  << "cancelled=" << (result.stats.cancelled ? 1 : 0) << '\n'
+                  << "barrier_wait_ms=" << result.stats.barrier_wait_ms << '\n'
                   << "compute_ms=" << result.stats.compute_ms << '\n';
         if (const auto found_output = options.find("output");
             found_output != options.end()) {

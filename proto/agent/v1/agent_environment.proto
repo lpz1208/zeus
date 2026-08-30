@@ -1,0 +1,204 @@
+syntax = "proto3";
+
+package zeus.agent.v1;
+
+option go_package = "github.com/lpz1208/zeus/gen/agent/v1;agentv1";
+
+// DecisionMode defines how simulation time advances while an agent decision
+// is pending. Wall-clock model latency is always recorded independently.
+enum DecisionMode {
+  DECISION_MODE_UNSPECIFIED = 0;
+  DECISION_MODE_BARRIER = 1;
+  DECISION_MODE_LATENCY_SIMULATION = 2;
+  DECISION_MODE_ASYNC_THROUGHPUT = 3;
+}
+
+enum DecisionTrigger {
+  DECISION_TRIGGER_UNSPECIFIED = 0;
+  DECISION_TRIGGER_INITIAL_ROUTE = 1;
+  DECISION_TRIGGER_ROUTE_INVALIDATED = 2;
+  DECISION_TRIGGER_INCIDENT = 3;
+  DECISION_TRIGGER_CONGESTION = 4;
+  DECISION_TRIGGER_PERIODIC = 5;
+  DECISION_TRIGGER_COORDINATION = 6;
+}
+
+enum NavigationActionType {
+  NAVIGATION_ACTION_TYPE_UNSPECIFIED = 0;
+  NAVIGATION_ACTION_TYPE_KEEP_ROUTE = 1;
+  NAVIGATION_ACTION_TYPE_SELECT_ALGORITHM = 2;
+  NAVIGATION_ACTION_TYPE_COMMIT_ROUTE = 3;
+  NAVIGATION_ACTION_TYPE_DEFER = 4;
+  NAVIGATION_ACTION_TYPE_FALLBACK = 5;
+}
+
+enum DecisionStatus {
+  DECISION_STATUS_UNSPECIFIED = 0;
+  DECISION_STATUS_APPLIED = 1;
+  DECISION_STATUS_REVALIDATED = 2;
+  DECISION_STATUS_REJECTED_STALE = 3;
+  DECISION_STATUS_REJECTED_INVALID = 4;
+  DECISION_STATUS_TIMED_OUT = 5;
+  DECISION_STATUS_CANCELLED = 6;
+  DECISION_STATUS_FALLBACK = 7;
+}
+
+message Position {
+  uint32 edge_id = 1;
+  double offset_m = 2;
+}
+
+message Destination {
+  double x = 1;
+  double y = 2;
+}
+
+message ActiveEvent {
+  string event_id = 1;
+  string event_type = 2;
+  string severity = 3;
+  repeated uint32 affected_edge_ids = 4;
+  double effective_simulation_time_s = 5;
+  double expires_simulation_time_s = 6;
+}
+
+message RoadSummary {
+  uint32 edge_id = 1;
+  double speed_mps = 2;
+  double free_flow_speed_mps = 3;
+  double occupancy_ratio = 4;
+  double estimated_travel_time_s = 5;
+  bool closed = 6;
+}
+
+message AlgorithmCapability {
+  string algorithm_id = 1;
+  string algorithm_version = 2;
+  bool supports_dynamic_weights = 3;
+  bool supports_incremental_repair = 4;
+  bool supports_k_candidates = 5;
+  bool supports_time_dependency = 6;
+  bool deterministic = 7;
+}
+
+// NavigationObservation is an immutable snapshot. An action based on this
+// snapshot may only be committed while state_version and validity constraints
+// still pass the environment Action Guard.
+message NavigationObservation {
+  string run_id = 1;
+  string session_id = 2;
+  string decision_id = 3;
+  string agent_id = 4;
+  uint64 tick = 5;
+  double simulation_time_s = 6;
+  uint64 state_version = 7;
+  double valid_until_simulation_time_s = 8;
+  DecisionMode decision_mode = 9;
+  repeated DecisionTrigger triggers = 10;
+  Position current_position = 11;
+  Destination destination = 12;
+  string current_algorithm_id = 13;
+  repeated uint32 current_route_edge_ids = 14;
+  double remaining_eta_s = 15;
+  double current_delay_s = 16;
+  repeated ActiveEvent active_events = 17;
+  repeated RoadSummary nearby_roads = 18;
+  repeated AlgorithmCapability available_algorithms = 19;
+  string bounded_memory_summary = 20;
+}
+
+message NavigationAction {
+  string decision_id = 1;
+  string agent_id = 2;
+  uint64 based_on_state_version = 3;
+  double valid_until_simulation_time_s = 4;
+  NavigationActionType action_type = 5;
+  string algorithm_id = 6;
+  string candidate_id = 7;
+  map<string, string> constraints = 8;
+  string reason_code = 9;
+}
+
+message DecisionTrace {
+  string run_id = 1;
+  string session_id = 2;
+  string decision_id = 3;
+  string agent_id = 4;
+  uint64 observed_tick = 5;
+  double observed_simulation_time_s = 6;
+  uint64 observed_state_version = 7;
+  uint64 committed_state_version = 8;
+  DecisionStatus status = 9;
+  string status_reason = 10;
+  NavigationAction action = 11;
+  int64 opened_wall_time_unix_ms = 12;
+  int64 resolved_wall_time_unix_ms = 13;
+  int64 wall_latency_ms = 14;
+  bool used_fallback = 15;
+}
+
+message SessionState {
+  string session_id = 1;
+  uint64 tick = 2;
+  double simulation_time_s = 3;
+  uint64 state_version = 4;
+  bool decision_barrier_open = 5;
+  bool finished = 6;
+}
+
+message CreateSessionRequest {
+  string run_id = 1;
+  string map_version = 2;
+  string scenario_version = 3;
+  DecisionMode decision_mode = 4;
+}
+
+message CreateSessionResponse {
+  SessionState state = 1;
+}
+
+message ObserveRequest {
+  string session_id = 1;
+  string agent_id = 2;
+}
+
+message ObserveResponse {
+  NavigationObservation observation = 1;
+}
+
+message SubmitActionRequest {
+  string session_id = 1;
+  NavigationAction action = 2;
+}
+
+message SubmitActionResponse {
+  DecisionTrace trace = 1;
+  SessionState state = 2;
+}
+
+message StepSessionRequest {
+  string session_id = 1;
+  uint64 steps = 2;
+  bool until_decision_event = 3;
+}
+
+message StepSessionResponse {
+  SessionState state = 1;
+  repeated NavigationObservation observations = 2;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+}
+
+message CloseSessionResponse {}
+
+// This service is the target Environment boundary. The first implementation
+// may run in-process; the protocol remains the stable Python-to-C++ boundary.
+service SimulationEnvironment {
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc Observe(ObserveRequest) returns (ObserveResponse);
+  rpc SubmitAction(SubmitActionRequest) returns (SubmitActionResponse);
+  rpc StepSession(StepSessionRequest) returns (StepSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+}

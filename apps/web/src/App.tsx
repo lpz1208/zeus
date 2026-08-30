@@ -39,6 +39,7 @@ import { demoNetwork } from './demo'
 import { MapCanvas } from './MapCanvas'
 import { buildVehicleFrame } from './playback'
 import { SimulationControlPanel } from './SimulationControlPanel'
+import { SignalPlanPanel } from './SignalPlanPanel'
 import type {
   ImportJob,
   InspectResult,
@@ -88,6 +89,7 @@ const emptySimulationControls: SimulationControls = {
   vehicleControls: [],
   roadControls: [],
   junctionControls: [],
+  signalPlans: [],
 }
 const defaultReferenceStyle: ReferenceLayerStyle = { color: '#55c7b2', opacity: 0.24 }
 const defaultOSMPreprocess: OSMPreprocessOptions = {
@@ -246,6 +248,10 @@ export function App() {
     durationSeconds: 900,
     stepSeconds: 1,
     sampleIntervalSeconds: 15,
+    exitHeadwayFfSeconds: 0,
+    exitHeadwayJamSeconds: 0,
+    rerouteIntervalSeconds: 0,
+    rerouteCostRatio: 1.25,
   })
   const [simResult, setSimResult] = useState<SimulateResponse | null>(null)
   const [simBusy, setSimBusy] = useState(false)
@@ -1215,7 +1221,14 @@ export function App() {
                       <article><span>扩展节点</span><strong>{formatNumber(routeResult.expandedNodes)}</strong></article>
                       <article><span>计算耗时</span><strong>{routeResult.computeMs.toFixed(1)}<small>ms</small></strong></article>
                       <article><span>途经边</span><strong>{formatNumber(routeResult.edges)}</strong></article>
-                      <article><span>算法</span><strong>{routeResult.algorithm.toUpperCase()}</strong></article>
+                      <article>
+                        <span>算法</span>
+                        <strong title={routeResult.effectiveAlgorithm && routeResult.effectiveAlgorithm !== routeResult.algorithm ? '该地图含转向限制，双向算法退化为前向搜索' : undefined}>
+                          {routeResult.effectiveAlgorithm && routeResult.effectiveAlgorithm !== routeResult.algorithm
+                            ? `${routeResult.algorithm.toUpperCase()} → ${routeResult.effectiveAlgorithm.toUpperCase()}`
+                            : routeResult.algorithm.toUpperCase()}
+                        </strong>
+                      </article>
                     </div>
                     <div className="route-matches">
                       <div className="route-endpoint">
@@ -1260,7 +1273,12 @@ export function App() {
                 <label><span>发车分布<small>SECONDS</small></span><input type="number" min="0" max={simConfig.durationSeconds} value={simConfig.spreadSeconds} onChange={(event) => setSimConfig({ ...simConfig, spreadSeconds: Number(event.target.value) })} /></label>
                 <label><span>仿真时长<small>SECONDS</small></span><input type="number" min="60" max="28800" value={simConfig.durationSeconds} onChange={(event) => setSimConfig({ ...simConfig, durationSeconds: Number(event.target.value) })} /></label>
                 <label><span>采样间隔<small>SECONDS</small></span><input type="number" min={Math.max(1, simConfig.stepSeconds)} value={simConfig.sampleIntervalSeconds} onChange={(event) => setSimConfig({ ...simConfig, sampleIntervalSeconds: Number(event.target.value) })} /></label>
+                <label title="同一路段车辆在自由流状态下连续驶出的最小时间间隔；0 表示关闭出口门控。"><span>自由流出车<small>HEADWAY · S</small></span><input type="number" min="0" max="60" step="0.1" value={simConfig.exitHeadwayFfSeconds} onChange={(event) => { const value = Number(event.target.value); setSimConfig({ ...simConfig, exitHeadwayFfSeconds: value, exitHeadwayJamSeconds: simConfig.exitHeadwayJamSeconds === 0 ? 0 : Math.max(value, simConfig.exitHeadwayJamSeconds) }) }} /></label>
+                <label title="路段拥堵时连续车辆驶出的最小时间间隔；0 表示沿用自由流值。"><span>拥堵出车<small>HEADWAY · S</small></span><input type="number" min={simConfig.exitHeadwayFfSeconds} max="60" step="0.1" value={simConfig.exitHeadwayJamSeconds} onChange={(event) => { const value = Number(event.target.value); setSimConfig({ ...simConfig, exitHeadwayJamSeconds: value === 0 ? 0 : Math.max(value, simConfig.exitHeadwayFfSeconds) }) }} /></label>
+                <label title="按此仿真时间间隔从实时路段占用率重建路由权重；0 表示关闭周期扫描。"><span>拥堵扫描<small>REROUTE · S</small></span><input type="number" min="0" max="3600" step="1" value={simConfig.rerouteIntervalSeconds} onChange={(event) => { const value = Number(event.target.value); setSimConfig({ ...simConfig, rerouteIntervalSeconds: value === 0 ? 0 : Math.max(value, simConfig.stepSeconds) }) }} /></label>
+                <label title="路段动态代价相对上次发布值达到该倍率时，才触发受影响车辆重规划。"><span>权重阈值<small>COST RATIO</small></span><input type="number" min="1.01" max="10" step="0.05" value={simConfig.rerouteCostRatio} onChange={(event) => setSimConfig({ ...simConfig, rerouteCostRatio: Math.max(1.01, Number(event.target.value)) })} /></label>
               </div>
+              <p className="sim-flow-note">出口间隔限制路段放行率；拥堵扫描按占用率生成动态权重。两项扫描间隔为 0 时关闭周期重规划，显式封路、限速和降容仍会立即评估。</p>
               <SimulationControlPanel
                 controls={simControls}
                 durationSeconds={simConfig.durationSeconds}
@@ -1274,6 +1292,21 @@ export function App() {
                 }}
                 onChange={(controls) => {
                   setSimControls(controls)
+                  setSimResult(null)
+                  setPlaying(false)
+                  setPlaybackTime(0)
+                }}
+              />
+              <SignalPlanPanel
+                plans={simControls.signalPlans}
+                selectedNodeId={selectedControlNodeId}
+                pickingJunction={junctionPickMode}
+                onPickingJunctionChange={(active) => {
+                  setJunctionPickMode(active)
+                  if (active) setRouteMode(false)
+                }}
+                onChange={(signalPlans) => {
+                  setSimControls({ ...simControls, signalPlans })
                   setSimResult(null)
                   setPlaying(false)
                   setPlaybackTime(0)
@@ -1303,6 +1336,18 @@ export function App() {
                       <small>车辆 {simResult.vehicleControls} · 道路 {simResult.roadControls} · 路口 {simResult.junctionControls}</small>
                     </div>
                   )}
+                  {simResult.rerouteAttempts > 0 && (
+                    <div className="sim-reroute-summary">
+                      <span>动态重规划 {simResult.rerouteAttempts} 次</span>
+                      <small>成功 {simResult.rerouteSucceeded} · 失败 {simResult.rerouteFailed}</small>
+                    </div>
+                  )}
+                  {simResult.signalPlans > 0 && (
+                    <div className="sim-signal-summary">
+                      <span>信号控制 {simResult.signalPlans} 个路口</span>
+                      <small>{simResult.signalPhases} 相位 · 红灯 {simResult.signalRedWaitEvents} · 饱和 {simResult.signalSaturationWaitEvents} · 放行 {simResult.signalMovementsPassed}</small>
+                    </div>
+                  )}
                   {(simResult.waitingAtEnd > 0 || simResult.drivingAtEnd > 0 || simResult.unroutable > 0) && (
                     <div className="sim-result__residual">
                       <span>等待 {simResult.waitingAtEnd}</span>
@@ -1325,7 +1370,7 @@ export function App() {
                         {[1, 10, 30].map((speed) => (
                           <button type="button" className={playbackSpeed === speed ? 'is-active' : ''} key={speed} onClick={() => setPlaybackSpeed(speed)}>{speed}×</button>
                         ))}
-                        <span>{vehicleFrame.features.length} ACTIVE</span>
+                        <span title="当前时刻已发生的重规划次数">{(simResult.playback.reroutes ?? []).filter((reroute) => reroute.time_s <= playbackTime).length} REROUTE · {vehicleFrame.features.length} ACTIVE</span>
                       </div>
                     </div>
                   )}

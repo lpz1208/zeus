@@ -187,6 +187,7 @@ export interface RouteRequest {
 export interface RouteResponse {
   ok: boolean
   algorithm: string
+  effectiveAlgorithm?: string
   reason?: string
   message?: string
   origin: RouteMatch
@@ -219,10 +220,15 @@ export interface SimulateRequest {
   durationSeconds: number
   stepSeconds: number
   sampleIntervalSeconds: number
+  exitHeadwayFfSeconds: number
+  exitHeadwayJamSeconds: number
+  rerouteIntervalSeconds: number
+  rerouteCostRatio: number
   algorithm: RouteAlgorithm
   vehicleControls: VehicleSimulationControl[]
   roadControls: RoadSimulationControl[]
   junctionControls: JunctionSimulationControl[]
+  signalPlans: JunctionSignalPlan[]
 }
 
 export type VehicleControlAction = 'hold' | 'release' | 'speedFactor'
@@ -249,10 +255,30 @@ export interface JunctionSimulationControl {
   action: JunctionControlAction
 }
 
+export interface SignalMovement {
+  fromEdgeId: number
+  toEdgeId: number
+}
+
+export interface SignalPhase {
+  greenSeconds: number
+  saturationFlowVph: number
+  movements: SignalMovement[]
+}
+
+export interface JunctionSignalPlan {
+  nodeId: number
+  offsetSeconds: number
+  yellowSeconds: number
+  allRedSeconds: number
+  phases: SignalPhase[]
+}
+
 export interface SimulationControls {
   vehicleControls: VehicleSimulationControl[]
   roadControls: RoadSimulationControl[]
   junctionControls: JunctionSimulationControl[]
+  signalPlans: JunctionSignalPlan[]
 }
 
 export interface SimulateResponse {
@@ -277,6 +303,15 @@ export interface SimulateResponse {
   vehicleControls: number
   roadControls: number
   junctionControls: number
+  rerouteAttempts: number
+  rerouteSucceeded: number
+  rerouteFailed: number
+  signalPlans: number
+  signalPhases: number
+  signalWaitEvents: number
+  signalRedWaitEvents: number
+  signalSaturationWaitEvents: number
+  signalMovementsPassed: number
   geojson?: TrajectoryGeoJSON
   playback?: PlaybackData
 }
@@ -305,8 +340,32 @@ export interface PlaybackData {
   duration_s: number
   step_s: number
   sample_interval_s: number
+  reroute_interval_s?: number
+  reroute_cost_ratio?: number
   controls: PlaybackControl[]
+  reroutes?: PlaybackReroute[]
+  signal_plans?: PlaybackSignalPlan[]
   vehicles: PlaybackVehicle[]
+}
+
+export interface PlaybackSignalPlan {
+  node_id: number
+  offset_s: number
+  yellow_s: number
+  all_red_s: number
+  phases: Array<{
+    green_s: number
+    saturation_flow_vph: number
+    movements: [number, number][]
+  }>
+}
+
+export interface PlaybackReroute {
+  time_s: number
+  vehicle_id: number
+  old_route_id: number
+  new_route_id: number
+  success: boolean
 }
 
 export interface PlaybackControl {

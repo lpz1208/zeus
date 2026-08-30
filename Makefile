@@ -1,4 +1,4 @@
-.PHONY: build build-map build-server build-web test run clean
+.PHONY: build build-map build-server build-web test test-proto run clean
 
 build: build-map build-server build-web
 
@@ -15,7 +15,11 @@ build-web:
 	npm --prefix apps/web install
 	npm --prefix apps/web run build
 
-test: build-map
+test-proto:
+	mkdir -p build
+	protoc --proto_path=. --descriptor_set_out=build/agent-environment.pb proto/agent/v1/agent_environment.proto
+
+test: build-map test-proto
 	ctest --test-dir build --output-on-failure
 	cd apps/control-server && GOCACHE=$(CURDIR)/.cache/go-build go test ./...
 	npm --prefix apps/web run typecheck

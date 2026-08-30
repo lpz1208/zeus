@@ -1,10 +1,12 @@
 # Zeus
 
-Zeus 是一个独立开发的网页端导航算法验证平台。当前仓库已完成地图引擎、四算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线，按车辆、道路和路口编排控制事件，运行多车仿真并通过时间滑块回放车辆轨迹。
+Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。当前仓库已完成作为 Agent Environment 基础的地图引擎、四算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线，按车辆、道路和路口编排控制事件，配置转向级信号相位与独立饱和放行率，运行多车仿真并通过时间滑块回放车辆轨迹。封路、限速、降容和可选的周期拥堵扫描会更新动态路由权重并重规划受影响车辆，路段还可配置密度插值的出口放行间隔。
+
+下一阶段将把同步仿真演进为有状态 Environment，让 Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A*、双向搜索以及后续 D* Lite、K 最短路和时间依赖路由作为 Tools 动态选择，并通过可校验的 Action 提交路线。LLM 不替代路径算法，也不进入逐 tick 热路径。
 
 ## 快速启动
 
-环境需要 C++20、CMake、GDAL/OGR、Boost、Go 和 Node.js。
+环境需要 C++20、CMake、GDAL/OGR、Boost、Go、Node.js 和 Protobuf 编译器。
 
 ```bash
 make run
@@ -29,15 +31,17 @@ make test
 
 - `cpp/map-engine`：C++ 地图导入、OSM 可行车清洗、拓扑、运行时索引和地图匹配。
 - `cpp/routing-core`：C++ Dijkstra、A*、双向 Dijkstra、双向 A*，含起终点吸附与路线导出。
-- `cpp/simulation-core`：C++ 确定性中观车辆推进、路线池、入口容量、回溢、车辆/道路/路口控制、采样和轨迹导出。
+- `cpp/simulation-core`：C++ 确定性中观车辆推进、路线池、入口容量、出口流率、回溢、转向信号相位、动态权重重规划、车辆/道路/路口控制、采样和轨迹导出；提供 tick 边界阻塞的 `SimulationSession`，支持 reset、step、observe、run-to-end 和 close。
 - `tools/zeus-map`：地图检查、导入、验证、GeoJSON 导出、位置查询、路径规划和仿真 CLI。
-- `apps/control-server`：Go 地图与仿真控制 API、按地图常驻的 C++ 路由 Worker、仿真进程并发门禁和静态 Web 托管；`cmd/zeus-osm-turns` 从 OSM PBF 提取机动车 via-node 转向限制。
+- `apps/control-server`：Go 地图与仿真控制 API、按地图常驻的 C++ 路由 Worker、仿真进程并发门禁、Agent 决策屏障协调器和静态 Web 托管；`cmd/zeus-osm-turns` 从 OSM PBF 提取机动车 via-node 转向限制。
+- `proto/agent/v1`：Agent Observation、Action、DecisionTrace 与 Stateful Environment 服务契约。
 - `apps/web`：React + MapLibre 地图工作台、路线规划、控制时间线和车辆回放。
-- `docs`：整体架构、地图引擎、路由内核和 Web 工作台设计。
+- `docs`：整体架构、Agent Environment、地图引擎、路由内核和 Web 工作台设计。
 
 详细说明：
 
 - [整体架构](docs/overall-architecture.md)
+- [地理空间导航智能体环境与实施计划](docs/geospatial-agent-environment.md)
 - [地图引擎](docs/map-engine-design.md)
 - [路由内核](docs/routing-core-design.md)
 - [中观仿真内核](docs/simulation-core-design.md)

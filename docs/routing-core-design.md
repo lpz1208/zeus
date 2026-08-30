@@ -1,7 +1,7 @@
 # Zeus 路由内核设计与当前实现
 
-> 状态：四种基准算法 + edge-to-edge 转向约束已实现  
-> 最后更新：2026-08-28  
+> 状态：四种基准算法 + edge-to-edge 转向约束 + 动态 overlay 已实现
+> 最后更新：2026-08-30
 > 上层方案：[overall-architecture.md](overall-architecture.md)
 
 ## 1. 当前目标
@@ -16,7 +16,7 @@
 → WGS84 GeoJSON + 距离 / 时长 / 扩展节点 / 计算耗时统计
 ```
 
-路由只消费只读 `MapRuntime`（出边 CSR + 入边 CSR + R-tree），不修改地图数据。K 条路径、动态权重和重规划属于后续阶段。
+路由只消费只读 `MapRuntime`（出边 CSR + 入边 CSR + R-tree），不修改地图数据。单次请求可附加不改动底图的 edge 可用性/代价 overlay，并可用精确 edge + offset 端点服务仿真重规划；仿真内核已经能从限速、容量和实时占用率生产该动态权重。K 条路径仍属于后续阶段。
 
 ## 2. 已实现能力
 
@@ -91,7 +91,13 @@ via 坐标使用道路源 CRS。`only` 会展开为该 incoming edge 到其他�
   --bbox min_lon,min_lat,max_lon,max_lat --output turns.csv
 ```
 
-### 2.6 失败语义
+### 2.6 动态 overlay 与精确端点
+
+`RouteRequest` 可选携带 `RoutingOverlay`：`edge_enabled` 在地图匹配和所有松弛方向统一屏蔽不可进入边，`edge_cost_factors` 将静态旅行时间乘以不小于 1 的逐边系数。空数组保持静态地图语义，非空数组必须与地图边数完全一致。
+
+仿真重规划还可用 `origin_position` / `destination_position` 直接指定有向 edge 与 offset，绕过坐标重新吸附。在途车辆允许驶完当前已进入的封闭边，但搜索不能再进入其他封闭边；终点固定为原路线精确位置，避免封路后吸附到邻路而改变目的地。overlay 对四种无转向算法和单向 turn-aware edge-state 搜索均有回归覆盖。
+
+### 2.7 失败语义
 
 吸附失败（起点/终点超距）、不可达（连通分量不同）、空图都是**一等计算结果**：CLI 退出码 3，HTTP 返回 200 + `{ok:false, reason}`；只有参数错误或进程异常才返回 4xx。
 
@@ -188,7 +194,11 @@ POST /api/maps/{id}/route
 
 ## 9. 下一步
 
-1. 支持 via-way、conditional restriction 和车型 AccessMask。
-2. restriction-safe 双向 edge-state 搜索，以及 ALT landmark 预处理。
-3. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。
-4. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。
+1. 将现有四种算法接入 Navigation Tool Registry，补齐能力元数据、统一候选路线结果、`candidate_id` 和算法版本；支持 Agent 只计算候选、由 Action Guard 独立提交路线。
+2. 增加 K Shortest Paths，并按动态重规划研究需要评估 D* Lite、LPA* 和时间依赖路由的实现顺序。
+3. 支持 via-way、conditional restriction 和车型 AccessMask。
+4. restriction-safe 双向 edge-state 搜索，以及 ALT landmark 预处理。
+5. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。
+6. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。
+
+算法作为 Agent Tools、动态切换边界和安全门设计见 [geospatial-agent-environment.md](geospatial-agent-environment.md)。

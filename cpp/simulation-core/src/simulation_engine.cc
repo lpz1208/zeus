@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "zeus/routing/route_types.h"
@@ -32,6 +33,45 @@ struct RouteKey {
                         other.destination_x_bits, other.destination_y_bits, other.algorithm);
     }
 };
+
+struct DynamicRouteKey {
+    std::uint32_t old_route_id = 0;
+    bool exact_origin = false;
+    zeus::map::EdgeIndex origin_edge = zeus::map::kInvalidEdge;
+    std::uint64_t origin_offset_bits = 0;
+    std::uint64_t origin_x_bits = 0;
+    std::uint64_t origin_y_bits = 0;
+    zeus::map::EdgeIndex destination_edge = zeus::map::kInvalidEdge;
+    std::uint64_t destination_offset_bits = 0;
+    zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
+
+    bool operator<(const DynamicRouteKey& other) const {
+        return std::tie(old_route_id, exact_origin, origin_edge, origin_offset_bits,
+                        origin_x_bits, origin_y_bits, destination_edge,
+                        destination_offset_bits, algorithm) <
+               std::tie(other.old_route_id, other.exact_origin, other.origin_edge,
+                        other.origin_offset_bits, other.origin_x_bits,
+                        other.origin_y_bits, other.destination_edge,
+                        other.destination_offset_bits, other.algorithm);
+    }
+};
+
+struct CompiledSignalPlan {
+    const JunctionSignalPlan* plan = nullptr;
+    double cycle_seconds = 0.0;
+};
+
+enum class SignalGate : std::uint8_t {
+    kOpen = 0,
+    kRed,
+    kSaturated,
+};
+
+std::uint64_t movementKey(
+    zeus::map::EdgeIndex from_edge, zeus::map::EdgeIndex to_edge) {
+    return (static_cast<std::uint64_t>(from_edge) << 32U) |
+           static_cast<std::uint64_t>(to_edge);
+}
 
 RouteKey routeKey(const VehicleDemand& demand) {
     return RouteKey{
@@ -93,7 +133,9 @@ SimulationEngine::SimulationEngine(
 SimulationResult SimulationEngine::run(
     const SimulationConfig& config,
     std::span<const VehicleDemand> demands,
-    std::span<const SimulationControlEvent> controls) const {
+    std::span<const SimulationControlEvent> controls,
+    std::span<const JunctionSignalPlan> signal_plans,
+    SimulationRunControl* run_control) const {
     const auto start_time = std::chrono::steady_clock::now();
 
     if (!std::isfinite(config.step_seconds) || config.step_seconds <= 0.0 ||
@@ -103,7 +145,15 @@ SimulationResult SimulationEngine::run(
         config.sample_interval_seconds <= 0.0 ||
         !std::isfinite(config.jam_spacing_m) || config.jam_spacing_m <= 0.0 ||
         !std::isfinite(config.min_speed_ratio) || config.min_speed_ratio < 0.0 ||
-        config.min_speed_ratio > 1.0 || config.deadlock_probe_ticks == 0) {
+        config.min_speed_ratio > 1.0 ||
+        !std::isfinite(config.exit_headway_ff_s) ||
+        config.exit_headway_ff_s < 0.0 ||
+        !std::isfinite(config.exit_headway_jam_s) ||
+        config.exit_headway_jam_s < 0.0 ||
+        !std::isfinite(config.reroute_interval_seconds) ||
+        config.reroute_interval_seconds < 0.0 ||
+        !std::isfinite(config.reroute_cost_ratio) ||
+        config.reroute_cost_ratio < 1.01 || config.deadlock_probe_ticks == 0) {
         throw std::invalid_argument("invalid simulation configuration");
     }
 
@@ -111,9 +161,57 @@ SimulationResult SimulationEngine::run(
     result.config = config;
     result.config.sample_interval_seconds =
         std::max(config.sample_interval_seconds, config.step_seconds);
+    result.config.exit_headway_jam_s =
+        std::max(config.exit_headway_ff_s, config.exit_headway_jam_s);
 
     const zeus::map::MapData& data = runtime_.data();
     const std::size_t edge_count = data.edges.size();
+
+    std::vector<CompiledSignalPlan> compiled_signal_plans;
+    compiled_signal_plans.reserve(signal_plans.size());
+    std::vector<std::int32_t> signal_plan_by_node(data.nodes.size(), -1);
+    result.signal_plans.assign(signal_plans.begin(), signal_plans.end());
+    for (std::size_t plan_index = 0; plan_index < result.signal_plans.size(); ++plan_index) {
+        const JunctionSignalPlan& plan = result.signal_plans[plan_index];
+        if (plan.node >= data.nodes.size() || plan.phases.empty() ||
+            !std::isfinite(plan.offset_seconds) || plan.offset_seconds < 0.0 ||
+            !std::isfinite(plan.yellow_seconds) || plan.yellow_seconds < 0.0 ||
+            !std::isfinite(plan.all_red_seconds) || plan.all_red_seconds < 0.0 ||
+            signal_plan_by_node[plan.node] >= 0) {
+            throw std::invalid_argument("invalid or duplicate junction signal plan");
+        }
+        double cycle_seconds = 0.0;
+        for (const SignalPhase& phase : plan.phases) {
+            if (!std::isfinite(phase.green_seconds) || phase.green_seconds <= 0.0 ||
+                phase.movements.empty() ||
+                !std::isfinite(phase.saturation_flow_vph) ||
+                phase.saturation_flow_vph < 60.0 ||
+                phase.saturation_flow_vph > 7200.0) {
+                throw std::invalid_argument(
+                    "signal phases require valid green time, movements and saturation flow");
+            }
+            cycle_seconds += phase.green_seconds + plan.yellow_seconds +
+                             plan.all_red_seconds;
+            for (const SignalMovement& movement : phase.movements) {
+                if (movement.from_edge >= edge_count || movement.to_edge >= edge_count ||
+                    data.edges[movement.from_edge].to != plan.node ||
+                    data.edges[movement.to_edge].from != plan.node ||
+                    !std::isfinite(runtime_.turnPenaltySeconds(
+                        movement.from_edge, movement.to_edge))) {
+                    throw std::invalid_argument(
+                        "signal movement must be a legal transition through its junction");
+                }
+            }
+        }
+        if (!std::isfinite(cycle_seconds) || cycle_seconds <= 0.0) {
+            throw std::invalid_argument("invalid signal cycle duration");
+        }
+        signal_plan_by_node[plan.node] =
+            static_cast<std::int32_t>(compiled_signal_plans.size());
+        compiled_signal_plans.push_back({&plan, cycle_seconds});
+        ++result.stats.signal_plans;
+        result.stats.signal_phases += plan.phases.size();
+    }
 
     std::vector<SimulationControlEvent> sorted_controls(controls.begin(), controls.end());
     for (const SimulationControlEvent& control : sorted_controls) {
@@ -218,14 +316,140 @@ SimulationResult SimulationEngine::run(
     std::vector<std::int32_t> delta_in(edge_count, 0);
     std::vector<std::int32_t> delta_out(edge_count, 0);
     std::vector<bool> edge_closed(edge_count, false);
+    std::vector<std::uint8_t> routing_edge_enabled(edge_count, 1);
     std::vector<double> edge_speed_factor(edge_count, 1.0);
     std::vector<double> edge_capacity_factor(edge_count, 1.0);
+    std::vector<double> routing_edge_cost_factors(edge_count, 1.0);
+    std::vector<double> published_edge_cost_factors(edge_count, 1.0);
+    std::vector<std::uint8_t> changed_routing_edges(edge_count, 0);
+    std::vector<std::uint8_t> explicit_cost_edges(edge_count, 0);
     std::vector<bool> junction_closed(data.nodes.size(), false);
+    double next_reroute_scan_s = result.config.reroute_interval_seconds > 0.0
+                                     ? result.config.reroute_interval_seconds
+                                     : std::numeric_limits<double>::infinity();
+
+    // Optional exit-headway gate: leaving an edge must respect the time since
+    // that edge's previous exit, so a bottleneck does not only "fill up" but
+    // also "flows" at a bounded discharge rate.
+    const double headway_ff_s = result.config.exit_headway_ff_s;
+    const double headway_jam_s = result.config.exit_headway_jam_s;
+    const bool exit_headway_enabled = headway_jam_s > 0.0;
+    std::vector<double> last_exit_s(
+        edge_count, -std::numeric_limits<double>::infinity());
+
+    // Per-tick activity counters: maintaining them incrementally keeps the
+    // loop head O(1) instead of rescanning every vehicle each tick.
+    std::uint64_t driving_count = 0;
+    std::uint64_t pending_entries = 0;
+    for (std::size_t i = 0; i < store.size(); ++i) {
+        if (store.states_[i] == VehicleState::kWaiting &&
+            store.requested_departs_[i] < duration - 1e-9) {
+            ++pending_entries;
+        }
+    }
 
     const auto effectiveCapacity = [&](zeus::map::EdgeIndex edge) {
         const double scaled = std::floor(
             static_cast<double>(capacity[edge]) * edge_capacity_factor[edge]);
         return static_cast<std::uint32_t>(std::max(1.0, scaled));
+    };
+
+    const auto dynamicRoutingCostFactor = [&](zeus::map::EdgeIndex edge) {
+        const double others = std::max(
+            0.0, static_cast<double>(occupancy[edge]) - 1.0);
+        const double density_ratio =
+            others / static_cast<double>(effectiveCapacity(edge));
+        const double congestion_speed_ratio = std::min(
+            1.0, std::max(result.config.min_speed_ratio, 1.0 - density_ratio));
+        const double speed_penalty =
+            1.0 / std::max(0.01, edge_speed_factor[edge]);
+        const double capacity_penalty =
+            1.0 / std::min(1.0, edge_capacity_factor[edge]);
+        return std::max(
+            1.0, speed_penalty * capacity_penalty / congestion_speed_ratio);
+    };
+
+    const auto refreshRoutingCosts = [&]() {
+        for (std::size_t edge = 0; edge < edge_count; ++edge) {
+            routing_edge_cost_factors[edge] = dynamicRoutingCostFactor(
+                static_cast<zeus::map::EdgeIndex>(edge));
+        }
+    };
+
+    const auto exitHeadway = [&](zeus::map::EdgeIndex edge) {
+        if (!exit_headway_enabled) {
+            return 0.0;
+        }
+        const double ratio = std::min(
+            1.0, static_cast<double>(occupancy[edge]) /
+                     static_cast<double>(effectiveCapacity(edge)));
+        return headway_ff_s + (headway_jam_s - headway_ff_s) * ratio;
+    };
+
+    const auto canExit = [&](zeus::map::EdgeIndex edge, double event_time) {
+        return !exit_headway_enabled ||
+               event_time - last_exit_s[edge] >= exitHeadway(edge) - 1e-9;
+    };
+
+    std::unordered_map<std::uint64_t, double> last_signal_pass_s;
+    last_signal_pass_s.reserve(signal_plans.size() * 8);
+
+    const auto signalGate = [&](zeus::map::NodeIndex node,
+                                zeus::map::EdgeIndex from_edge,
+                                zeus::map::EdgeIndex to_edge,
+                                double event_time) {
+        const std::int32_t signal_index = signal_plan_by_node[node];
+        if (signal_index < 0) {
+            return SignalGate::kOpen;
+        }
+        const CompiledSignalPlan& compiled =
+            compiled_signal_plans[static_cast<std::size_t>(signal_index)];
+        const JunctionSignalPlan& plan = *compiled.plan;
+        double cycle_position = std::fmod(
+            event_time + plan.offset_seconds, compiled.cycle_seconds);
+        if (cycle_position < 0.0) {
+            cycle_position += compiled.cycle_seconds;
+        }
+        for (const SignalPhase& phase : plan.phases) {
+            if (cycle_position < phase.green_seconds - 1e-9) {
+                const bool allowed = std::any_of(
+                    phase.movements.begin(), phase.movements.end(),
+                    [&](const SignalMovement& movement) {
+                        return movement.from_edge == from_edge &&
+                               movement.to_edge == to_edge;
+                    });
+                if (!allowed) {
+                    return SignalGate::kRed;
+                }
+                const auto last = last_signal_pass_s.find(
+                    movementKey(from_edge, to_edge));
+                const double last_pass = last == last_signal_pass_s.end()
+                                             ? -std::numeric_limits<double>::infinity()
+                                             : last->second;
+                const double headway_s = 3600.0 / phase.saturation_flow_vph;
+                return event_time - last_pass >= headway_s - 1e-9
+                           ? SignalGate::kOpen
+                           : SignalGate::kSaturated;
+            }
+            cycle_position -= phase.green_seconds;
+            const double clearance = plan.yellow_seconds + plan.all_red_seconds;
+            if (cycle_position < clearance - 1e-9) {
+                return SignalGate::kRed;
+            }
+            cycle_position -= clearance;
+        }
+        return SignalGate::kRed;
+    };
+
+    const auto recordSignalPass = [&](zeus::map::NodeIndex node,
+                                      zeus::map::EdgeIndex from_edge,
+                                      zeus::map::EdgeIndex to_edge,
+                                      double event_time) {
+        if (signal_plan_by_node[node] < 0) {
+            return;
+        }
+        last_signal_pass_s[movementKey(from_edge, to_edge)] = event_time;
+        ++result.stats.signal_movements_passed;
     };
 
     const auto recordSample = [&](std::size_t i, double t, zeus::map::EdgeIndex edge,
@@ -238,13 +462,175 @@ SimulationResult SimulationEngine::run(
         ++result.stats.sample_count;
     };
 
+    const auto remainingRouteTime = [&](
+        const zeus::routing::RoutePath& route, std::size_t first_index,
+        double first_offset) {
+        double total = 0.0;
+        for (std::size_t route_index = first_index;
+             route_index < route.edges.size(); ++route_index) {
+            const zeus::map::EdgeIndex edge_index = route.edges[route_index];
+            if (routing_edge_enabled[edge_index] == 0) {
+                return std::numeric_limits<double>::infinity();
+            }
+            if (route_index > first_index) {
+                const double turn = runtime_.turnPenaltySeconds(
+                    route.edges[route_index - 1], edge_index);
+                if (!std::isfinite(turn)) {
+                    return std::numeric_limits<double>::infinity();
+                }
+                total += turn;
+            }
+            const zeus::map::DirectedEdge& edge = runtime_.edge(edge_index);
+            const double begin = route_index == first_index ? first_offset : 0.0;
+            const double end = route_index + 1 == route.edges.size()
+                                   ? route.end_offset_m
+                                   : edge.length_m;
+            total += std::max(0.0, end - begin) /
+                     freeSpeedMps(edge) * routing_edge_cost_factors[edge_index];
+        }
+        return total;
+    };
+
+    const auto rerouteAffectedVehicles = [&](double now) {
+        const zeus::routing::RoutingOverlay overlay{
+            routing_edge_enabled, routing_edge_cost_factors};
+        struct CachedRoute {
+            std::int32_t route_id = -2;
+        };
+        std::map<DynamicRouteKey, CachedRoute> cache;
+        bool switched_any = false;
+        for (std::size_t i = 0; i < store.size(); ++i) {
+            if (store.states_[i] != VehicleState::kWaiting &&
+                store.states_[i] != VehicleState::kDriving) {
+                continue;
+            }
+            const zeus::routing::RoutePath& old_route = result.routes[store.route_ids_[i]];
+            const std::size_t first_future = store.states_[i] == VehicleState::kDriving
+                                                 ? store.route_indices_[i] + 1
+                                                 : 0;
+            bool topology_affected = false;
+            bool cost_affected = false;
+            for (std::size_t route_index = first_future;
+                 route_index < old_route.edges.size(); ++route_index) {
+                if (routing_edge_enabled[old_route.edges[route_index]] == 0) {
+                    topology_affected = true;
+                }
+                if (changed_routing_edges[old_route.edges[route_index]] != 0) {
+                    cost_affected = true;
+                }
+            }
+            if (!topology_affected && !cost_affected) {
+                continue;
+            }
+
+            ++result.stats.reroute_attempts;
+            const VehicleDemand& demand = demands[i];
+            DynamicRouteKey key;
+            key.old_route_id = store.route_ids_[i];
+            key.exact_origin = store.states_[i] == VehicleState::kDriving;
+            if (key.exact_origin) {
+                key.origin_edge = old_route.edges[store.route_indices_[i]];
+                key.origin_offset_bits = std::bit_cast<std::uint64_t>(store.offsets_[i]);
+            } else {
+                key.origin_x_bits = std::bit_cast<std::uint64_t>(demand.origin.x);
+                key.origin_y_bits = std::bit_cast<std::uint64_t>(demand.origin.y);
+            }
+            key.destination_edge = old_route.edges.back();
+            key.destination_offset_bits =
+                std::bit_cast<std::uint64_t>(old_route.end_offset_m);
+            key.algorithm = demand.algorithm;
+
+            auto [cached, inserted] = cache.try_emplace(key);
+            if (inserted) {
+                if (routing_edge_enabled[key.destination_edge] == 0) {
+                    cached->second.route_id = -1;
+                } else {
+                    zeus::routing::RouteRequest request;
+                    request.origin = demand.origin;
+                    request.destination = demand.destination;
+                    request.algorithm = demand.algorithm;
+                    request.overlay = &overlay;
+                    request.destination_position = zeus::routing::RoutePosition{
+                        key.destination_edge, old_route.end_offset_m};
+                    if (key.exact_origin) {
+                        request.origin_position = zeus::routing::RoutePosition{
+                            key.origin_edge, store.offsets_[i]};
+                    }
+                    const zeus::routing::RouteResult planned = planner_.plan(request);
+                    ++result.stats.route_plans;
+                    if (planned.ok) {
+                        const std::size_t current_index = key.exact_origin
+                                                              ? store.route_indices_[i]
+                                                              : 0;
+                        const double current_offset = key.exact_origin
+                                                          ? store.offsets_[i]
+                                                          : old_route.start_offset_m;
+                        const double current_time = remainingRouteTime(
+                            old_route, current_index, current_offset);
+                        const bool same_path =
+                            planned.path.edges.size() ==
+                                old_route.edges.size() - current_index &&
+                            std::equal(
+                                planned.path.edges.begin(), planned.path.edges.end(),
+                                old_route.edges.begin() +
+                                    static_cast<std::ptrdiff_t>(current_index)) &&
+                            std::abs(planned.path.start_offset_m - current_offset) <= 1e-9 &&
+                            std::abs(planned.path.end_offset_m - old_route.end_offset_m) <= 1e-9;
+                        const bool beneficial = topology_affected ||
+                            (!same_path && planned.stats.time_s + 1e-9 < current_time);
+                        if (beneficial) {
+                            result.routes.push_back(planned.path);
+                            cached->second.route_id = static_cast<std::int32_t>(
+                                result.routes.size() - 1);
+                        } else {
+                            cached->second.route_id = -1;
+                        }
+                    } else {
+                        cached->second.route_id = -1;
+                    }
+                }
+            }
+
+            const std::uint32_t old_route_id = store.route_ids_[i];
+            if (cached->second.route_id < 0) {
+                ++result.stats.reroute_failed;
+                result.reroutes.push_back({
+                    now, store.ids_[i], old_route_id, old_route_id, false});
+                continue;
+            }
+            const std::uint32_t new_route_id =
+                static_cast<std::uint32_t>(cached->second.route_id);
+            store.route_ids_[i] = new_route_id;
+            store.route_indices_[i] = 0;
+            result.vehicles[i].route_id = new_route_id;
+            ++result.stats.reroute_succeeded;
+            switched_any = true;
+            result.reroutes.push_back({
+                now, store.ids_[i], old_route_id, new_route_id, true});
+        }
+        return switched_any;
+    };
+
     std::uint64_t stalled_ticks = 0;
     std::uint64_t tick = 0;
     std::size_t control_cursor = 0;
+    std::chrono::steady_clock::duration barrier_wait{};
     for (; tick < total_ticks; ++tick) {
         const double now = tick * step;
+        if (run_control != nullptr) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            const bool continue_run = run_control->waitForTick(tick, now);
+            barrier_wait += std::chrono::steady_clock::now() - wait_start;
+            if (!continue_run) {
+                result.stats.cancelled = true;
+                break;
+            }
+        }
 
         bool control_activity = false;
+        bool topology_restricted = false;
+        std::fill(changed_routing_edges.begin(), changed_routing_edges.end(), 0);
+        std::fill(explicit_cost_edges.begin(), explicit_cost_edges.end(), 0);
         while (control_cursor < sorted_controls.size() &&
                sorted_controls[control_cursor].time_s <= now + 1e-9) {
             const SimulationControlEvent& control = sorted_controls[control_cursor++];
@@ -261,19 +647,34 @@ SimulationResult SimulationEngine::run(
                     break;
                 case ControlScope::kEdge:
                     if (control.action == ControlAction::kClose) {
+                        topology_restricted = topology_restricted ||
+                                              !edge_closed[control.target_id];
                         edge_closed[control.target_id] = true;
+                        routing_edge_enabled[control.target_id] = 0;
                     } else if (control.action == ControlAction::kOpen) {
                         edge_closed[control.target_id] = false;
+                        routing_edge_enabled[control.target_id] =
+                            junction_closed[data.edges[control.target_id].from] ? 0 : 1;
                     } else if (control.action == ControlAction::kSetSpeedFactor) {
                         edge_speed_factor[control.target_id] = control.value;
+                        explicit_cost_edges[control.target_id] = 1;
                     } else {
                         edge_capacity_factor[control.target_id] = control.value;
+                        explicit_cost_edges[control.target_id] = 1;
                     }
                     ++result.stats.edge_control_events;
                     break;
                 case ControlScope::kJunction:
+                    topology_restricted = topology_restricted ||
+                                          (control.action == ControlAction::kClose &&
+                                           !junction_closed[control.target_id]);
                     junction_closed[control.target_id] =
                         control.action == ControlAction::kClose;
+                    for (const zeus::map::EdgeIndex edge :
+                         runtime_.outgoingEdges(control.target_id)) {
+                        routing_edge_enabled[edge] =
+                            junction_closed[control.target_id] || edge_closed[edge] ? 0 : 1;
+                    }
                     ++result.stats.junction_control_events;
                     break;
             }
@@ -285,16 +686,39 @@ SimulationResult SimulationEngine::run(
             control_activity = true;
         }
 
-        bool active = false;
-        for (std::size_t i = 0; i < store.size(); ++i) {
-            if (store.states_[i] == VehicleState::kDriving ||
-                (store.states_[i] == VehicleState::kWaiting &&
-                 store.requested_departs_[i] < duration - 1e-9)) {
-                active = true;
-                break;
+        const bool has_explicit_cost_event = std::any_of(
+            explicit_cost_edges.begin(), explicit_cost_edges.end(),
+            [](std::uint8_t value) { return value != 0; });
+        const bool periodic_cost_scan = now + 1e-9 >= next_reroute_scan_s;
+        if (topology_restricted || has_explicit_cost_event || periodic_cost_scan) {
+            refreshRoutingCosts();
+            for (std::size_t edge = 0; edge < edge_count; ++edge) {
+                const double old_factor = published_edge_cost_factors[edge];
+                const double new_factor = routing_edge_cost_factors[edge];
+                const double ratio = std::max(
+                    new_factor / old_factor, old_factor / new_factor);
+                if ((explicit_cost_edges[edge] != 0 &&
+                     std::abs(new_factor - old_factor) > 1e-9) ||
+                    (periodic_cost_scan &&
+                     ratio + 1e-9 >= result.config.reroute_cost_ratio)) {
+                    changed_routing_edges[edge] = 1;
+                    published_edge_cost_factors[edge] = new_factor;
+                }
+            }
+            if (periodic_cost_scan) {
+                do {
+                    next_reroute_scan_s += result.config.reroute_interval_seconds;
+                } while (next_reroute_scan_s <= now + 1e-9);
+            }
+            const bool has_changed_route_cost = std::any_of(
+                changed_routing_edges.begin(), changed_routing_edges.end(),
+                [](std::uint8_t value) { return value != 0; });
+            if (topology_restricted || has_changed_route_cost) {
+                control_activity = rerouteAffectedVehicles(now) || control_activity;
             }
         }
-        if (!active) {
+
+        if (driving_count == 0 && pending_entries == 0) {
             break;
         }
 
@@ -320,6 +744,8 @@ SimulationResult SimulationEngine::run(
             }
             delta_in[first] += 1;
             store.states_[i] = VehicleState::kDriving;
+            --pending_entries;
+            ++driving_count;
             store.route_indices_[i] = 0;
             store.offsets_[i] = route.start_offset_m;
             store.actual_departs_[i] = now;
@@ -368,15 +794,39 @@ SimulationResult SimulationEngine::run(
                 if (distance <= 1e-9) {
                     if (at_last_edge) {
                         const double event_time = now + (step - remaining);
+                        if (!canExit(edge_index, event_time)) {
+                            remaining = 0.0;  // wait for the discharge headway
+                            break;
+                        }
                         store.states_[i] = VehicleState::kArrived;
+                        --driving_count;
                         delta_out[edge_index] -= 1;
                         store.arrives_[i] = event_time;
                         result.vehicles[i].arrive_s = event_time;
+                        last_exit_s[edge_index] = event_time;
                         recordSample(i, event_time, edge_index, edge_end);
                         moved = true;
                         break;
                     }
+                    const double event_time = now + (step - remaining);
+                    if (!canExit(edge_index, event_time)) {
+                        remaining = 0.0;  // wait for the discharge headway
+                        break;
+                    }
                     const zeus::map::EdgeIndex next = route.edges[route_index + 1];
+                    const SignalGate signal_gate =
+                        signalGate(edge.to, edge_index, next, event_time);
+                    if (signal_gate != SignalGate::kOpen) {
+                        ++result.stats.signal_wait_events;
+                        if (signal_gate == SignalGate::kRed) {
+                            ++result.stats.signal_red_wait_events;
+                        } else {
+                            ++result.stats.signal_saturation_wait_events;
+                        }
+                        control_activity = true;
+                        remaining = 0.0;  // wait for green or discharge headway
+                        break;
+                    }
                     if (edge_closed[next] || junction_closed[edge.to] ||
                         occupancy[next] + delta_in[next] >= effectiveCapacity(next)) {
                         remaining = 0.0;  // queue at the boundary
@@ -384,9 +834,11 @@ SimulationResult SimulationEngine::run(
                     }
                     delta_out[edge_index] -= 1;
                     delta_in[next] += 1;
+                    last_exit_s[edge_index] = event_time;
+                    recordSignalPass(edge.to, edge_index, next, event_time);
                     store.route_indices_[i] = route_index + 1;
                     store.offsets_[i] = 0.0;
-                    recordSample(i, now + (step - remaining), next, 0.0);
+                    recordSample(i, event_time, next, 0.0);
                     moved = true;
                     continue;
                 }
@@ -405,14 +857,37 @@ SimulationResult SimulationEngine::run(
                     const double event_time = now + (step - remaining);
                     moved = true;
                     if (at_last_edge) {
+                        if (!canExit(edge_index, event_time)) {
+                            remaining = 0.0;  // wait for the discharge headway
+                            break;
+                        }
                         store.states_[i] = VehicleState::kArrived;
+                        --driving_count;
                         delta_out[edge_index] -= 1;
                         store.arrives_[i] = event_time;
                         result.vehicles[i].arrive_s = event_time;
+                        last_exit_s[edge_index] = event_time;
                         recordSample(i, event_time, edge_index, edge_end);
                         break;
                     }
+                    if (!canExit(edge_index, event_time)) {
+                        remaining = 0.0;  // wait for the discharge headway
+                        break;
+                    }
                     const zeus::map::EdgeIndex next = route.edges[route_index + 1];
+                    const SignalGate signal_gate =
+                        signalGate(edge.to, edge_index, next, event_time);
+                    if (signal_gate != SignalGate::kOpen) {
+                        ++result.stats.signal_wait_events;
+                        if (signal_gate == SignalGate::kRed) {
+                            ++result.stats.signal_red_wait_events;
+                        } else {
+                            ++result.stats.signal_saturation_wait_events;
+                        }
+                        control_activity = true;
+                        remaining = 0.0;  // wait for green or discharge headway
+                        break;
+                    }
                     if (edge_closed[next] || junction_closed[edge.to] ||
                         occupancy[next] + delta_in[next] >= effectiveCapacity(next)) {
                         remaining = 0.0;  // queue at the boundary
@@ -420,6 +895,8 @@ SimulationResult SimulationEngine::run(
                     }
                     delta_out[edge_index] -= 1;
                     delta_in[next] += 1;
+                    last_exit_s[edge_index] = event_time;
+                    recordSignalPass(edge.to, edge_index, next, event_time);
                     store.route_indices_[i] = route_index + 1;
                     store.offsets_[i] = 0.0;
                     recordSample(i, event_time, next, 0.0);
@@ -506,8 +983,12 @@ SimulationResult SimulationEngine::run(
     result.ok = true;
 
     const auto end_time = std::chrono::steady_clock::now();
-    result.stats.compute_ms =
-        std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    result.stats.barrier_wait_ms =
+        std::chrono::duration<double, std::milli>(barrier_wait).count();
+    result.stats.compute_ms = std::max(
+        0.0,
+        std::chrono::duration<double, std::milli>(
+            end_time - start_time - barrier_wait).count());
     return result;
 }
 

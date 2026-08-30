@@ -123,6 +123,58 @@ void runShortStraightRouteTest() {
     require(result.stats.expanded_nodes == 0, "direct combination skips the node search");
 }
 
+void runRoutingOverlayTest() {
+    const auto run = [](bool turn_aware) {
+        Fixture fixture;
+        const auto n0 = fixture.addNode(0.0, 0.0);
+        const auto n1 = fixture.addNode(100.0, 0.0);
+        const auto n2 = fixture.addNode(200.0, 0.0);
+        const auto n3 = fixture.addNode(100.0, 100.0);
+        const auto n4 = fixture.addNode(300.0, 0.0);
+        const auto e0 = fixture.addEdge(n0, n1, 20.0);
+        const auto blocked = fixture.addEdge(n1, n2, 20.0);
+        const auto detour_a = fixture.addEdge(n1, n3, 20.0);
+        const auto detour_b = fixture.addEdge(n3, n2, 20.0);
+        const auto goal = fixture.addEdge(n2, n4, 20.0);
+        if (turn_aware) {
+            fixture.addTurn(e0, blocked, false, 0.1F);
+        }
+
+        PlanSetup setup(fixture.data);
+        std::vector<std::uint8_t> enabled(fixture.data.edges.size(), 1);
+        enabled[e0] = 0;       // An exact origin may finish its current closed edge.
+        enabled[blocked] = 0;  // It may not enter another closed edge.
+        std::vector<double> factors(fixture.data.edges.size(), 1.0);
+        const zeus::routing::RoutingOverlay overlay{enabled, factors};
+
+        const std::vector<zeus::routing::Algorithm> algorithms = turn_aware
+            ? std::vector<zeus::routing::Algorithm>{
+                  zeus::routing::Algorithm::kDijkstra,
+                  zeus::routing::Algorithm::kAStar}
+            : std::vector<zeus::routing::Algorithm>{
+                  zeus::routing::Algorithm::kDijkstra,
+                  zeus::routing::Algorithm::kAStar,
+                  zeus::routing::Algorithm::kBidirectionalDijkstra,
+                  zeus::routing::Algorithm::kBidirectionalAStar};
+        for (const auto algorithm : algorithms) {
+            auto request = makeRequest({0.0, 0.0}, {0.0, 0.0}, algorithm);
+            request.origin_position = zeus::routing::RoutePosition{e0, 50.0};
+            request.destination_position = zeus::routing::RoutePosition{goal, 90.0};
+            request.overlay = &overlay;
+            const auto result = setup.planner->plan(request);
+            require(result.ok, "dynamic overlay finds a legal detour");
+            require(result.path.edges ==
+                        std::vector<zeus::map::EdgeIndex>{e0, detour_a, detour_b, goal},
+                    "dynamic overlay excludes closed edges without jumping off current edge");
+            require(near(result.path.start_offset_m, 50.0) &&
+                        near(result.path.end_offset_m, 90.0),
+                    "exact route positions preserve offsets during dynamic routing");
+        }
+    };
+    run(false);
+    run(true);
+}
+
 // Fast detour versus slow shortcut: e1 is short but slow; e2+e3 is longer and
 // fast. Time-optimal routing must prefer the detour.
 Fixture makeDetourFixture(double slow_speed) {
@@ -552,6 +604,7 @@ void runTurnPenaltyTest() {
 int main() {
     try {
         runShortStraightRouteTest();
+        runRoutingOverlayTest();
         runTimeVersusDistanceTest();
         runUnreachableTest();
         runLoopSameEdgeBehindTest();

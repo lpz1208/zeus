@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -103,6 +104,9 @@ struct MapMatchOptions {
     bool has_heading = false;
     double heading_rad = 0.0;
     double heading_weight = 5.0;
+    // Optional per-directed-edge mask. This is applied before ranking, so a
+    // cluster of closed roads cannot consume the candidate limit.
+    std::span<const std::uint8_t> edge_enabled;
 };
 
 struct MapMatchCandidate {

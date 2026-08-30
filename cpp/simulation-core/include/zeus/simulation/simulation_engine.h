@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <span>
 #include <vector>
 
@@ -9,6 +10,18 @@
 #include "zeus/simulation/simulation_types.h"
 
 namespace zeus::simulation {
+
+// Optional control point used by SimulationSession. It is called before each
+// tick mutates state, so blocking here freezes simulation time at a committed
+// boundary while wall-clock time may continue advancing.
+class SimulationRunControl {
+public:
+    [[nodiscard]] virtual bool waitForTick(
+        std::uint64_t next_tick,
+        double simulation_time_s) = 0;
+
+    virtual ~SimulationRunControl() = default;
+};
 
 // Deterministic mesoscopic simulation over a read-only runtime map. Vehicles
 // are routed through the RoutePlanner (identical OD and algorithm share one
@@ -23,7 +36,9 @@ public:
     [[nodiscard]] SimulationResult run(
         const SimulationConfig& config,
         std::span<const VehicleDemand> demands,
-        std::span<const SimulationControlEvent> controls = {}) const;
+        std::span<const SimulationControlEvent> controls = {},
+        std::span<const JunctionSignalPlan> signal_plans = {},
+        SimulationRunControl* run_control = nullptr) const;
 
     [[nodiscard]] SimulationResult run(
         const SimulationConfig& config,
@@ -37,6 +52,16 @@ public:
         const std::vector<SimulationControlEvent>& controls) const {
         return run(config, std::span<const VehicleDemand>(demands),
                    std::span<const SimulationControlEvent>(controls));
+    }
+
+    [[nodiscard]] SimulationResult run(
+        const SimulationConfig& config,
+        const std::vector<VehicleDemand>& demands,
+        const std::vector<SimulationControlEvent>& controls,
+        const std::vector<JunctionSignalPlan>& signal_plans) const {
+        return run(config, std::span<const VehicleDemand>(demands),
+                   std::span<const SimulationControlEvent>(controls),
+                   std::span<const JunctionSignalPlan>(signal_plans));
     }
 
 private:

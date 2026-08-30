@@ -239,6 +239,11 @@ std::vector<MapMatchCandidate> MapRuntime::matchPoint(
     result.reserve(nearby.size());
     for (const IndexValue& value : nearby) {
         const EdgeIndex edge_index = value.second;
+        if (!options.edge_enabled.empty() &&
+            (edge_index >= options.edge_enabled.size() ||
+             options.edge_enabled[edge_index] == 0)) {
+            continue;
+        }
         MapMatchCandidate best;
         best.score = std::numeric_limits<double>::infinity();
         for (std::uint32_t i = impl_->edge_segment_offsets[edge_index];
