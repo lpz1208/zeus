@@ -185,7 +185,9 @@ void runEndToEndTest() {
         zeus::map::BuildResult build = zeus::map::MapBuilder().build(imported);
         require(build.map.nodes.size() == 6, "intersection and endpoint snapping produce six nodes");
         require(build.map.edges.size() == 8, "directions and intersection splitting produce eight edges");
-        require(build.map.turn_transitions.size() == 2,
+        // Two sidecar entries plus six generated U-turn penalties (two at the
+        // interior junction, one at each of the four dead-end endpoints).
+        require(build.map.turn_transitions.size() == 8,
                 "source-CRS turn sidecar resolves both directed approaches");
 
         const zeus::map::ValidationReport report =
@@ -262,7 +264,7 @@ void runEndToEndTest() {
         require(loaded.nodes.size() == build.map.nodes.size(), "round-trip node count");
         require(loaded.edges.size() == build.map.edges.size(), "round-trip edge count");
         require(loaded.edges.front().lane_count == 3, "round-trip directed lane count");
-        require(loaded.turn_transitions.size() == 2 &&
+        require(loaded.turn_transitions.size() == 8 &&
                     std::abs(loaded.turn_transitions.front().penalty_s - 2.5F) < 1e-6,
                 "round-trip turn transition");
 
@@ -552,11 +554,130 @@ void runOsmPreprocessorTest() {
     std::filesystem::remove_all(directory);
 }
 
+zeus::map::EdgeIndex findEdge(
+    const zeus::map::MapData& map,
+    double from_x,
+    double from_y,
+    double to_x,
+    double to_y,
+    const std::string& source_id) {
+    for (std::size_t i = 0; i < map.edges.size(); ++i) {
+        const zeus::map::DirectedEdge& edge = map.edges[i];
+        const zeus::map::Point2d from = map.nodes[edge.from].point;
+        const zeus::map::Point2d to = map.nodes[edge.to].point;
+        if (edge.source_id == source_id && std::abs(from.x - from_x) < 1e-6 &&
+            std::abs(from.y - from_y) < 1e-6 && std::abs(to.x - to_x) < 1e-6 &&
+            std::abs(to.y - to_y) < 1e-6) {
+            return static_cast<zeus::map::EdgeIndex>(i);
+        }
+    }
+    return zeus::map::kInvalidEdge;
+}
+
+const zeus::map::TurnTransition* findTransition(
+    const zeus::map::MapData& map,
+    zeus::map::EdgeIndex from,
+    zeus::map::EdgeIndex to) {
+    for (const zeus::map::TurnTransition& transition : map.turn_transitions) {
+        if (transition.from_edge == from && transition.to_edge == to) {
+            return &transition;
+        }
+    }
+    return nullptr;
+}
+
+// Asymmetric crossroads: a north-south primary road, an east-west residential
+// road, and a one-way residential diagonal leaving at 135 degrees.
+zeus::map::ImportedRoads penaltyFixtureRoads() {
+    zeus::map::ImportedRoads imported;
+    imported.metadata.snap_tolerance_m = 0.5;
+    const auto road = [](std::string id, std::string road_class,
+                         std::vector<zeus::map::Point2d> points,
+                         zeus::map::Direction direction) {
+        zeus::map::SourceRoad source;
+        source.source_id = std::move(id);
+        source.road_class = std::move(road_class);
+        source.direction = direction;
+        source.speed_limit_mps = 20.0;
+        source.points = std::move(points);
+        return source;
+    };
+    imported.roads.push_back(road(
+        "maj", "primary", {{0.0, -100.0}, {0.0, 100.0}}, zeus::map::Direction::kBoth));
+    imported.roads.push_back(road(
+        "min", "residential", {{-100.0, 0.0}, {100.0, 0.0}}, zeus::map::Direction::kBoth));
+    imported.roads.push_back(road(
+        "diag", "residential", {{0.0, 0.0}, {-70.0, 70.0}}, zeus::map::Direction::kForward));
+    return imported;
+}
+
+void runDefaultTurnPenaltyTest() {
+    const zeus::map::BuildResult build = zeus::map::MapBuilder().build(penaltyFixtureRoads());
+
+    const zeus::map::EdgeIndex east_in = findEdge(build.map, -100, 0, 0, 0, "min");
+    const zeus::map::EdgeIndex north_in = findEdge(build.map, 0, -100, 0, 0, "maj");
+    const zeus::map::EdgeIndex east_out = findEdge(build.map, 0, 0, 100, 0, "min");
+    const zeus::map::EdgeIndex west_out = findEdge(build.map, 0, 0, -100, 0, "min");
+    const zeus::map::EdgeIndex north_out = findEdge(build.map, 0, 0, 0, 100, "maj");
+    const zeus::map::EdgeIndex diag_out = findEdge(build.map, 0, 0, -70, 70, "diag");
+    require(east_in != zeus::map::kInvalidEdge && north_in != zeus::map::kInvalidEdge &&
+                east_out != zeus::map::kInvalidEdge && west_out != zeus::map::kInvalidEdge &&
+                north_out != zeus::map::kInvalidEdge && diag_out != zeus::map::kInvalidEdge,
+            "penalty fixture edges resolve by endpoint and source");
+
+    const zeus::map::TurnTransition* uturn = findTransition(build.map, east_in, west_out);
+    require(uturn != nullptr && !uturn->prohibited &&
+                std::abs(uturn->penalty_s - 5.0F) < 1e-6,
+            "u-turn onto the opposite twin costs the turnaround penalty");
+
+    const zeus::map::TurnTransition* to_major = findTransition(build.map, east_in, north_out);
+    require(to_major != nullptr && std::abs(to_major->penalty_s - 3.0F) < 1e-6,
+            "minor-to-major approach costs the merge penalty");
+
+    const zeus::map::TurnTransition* sharp_left = findTransition(build.map, east_in, diag_out);
+    require(sharp_left != nullptr && std::abs(sharp_left->penalty_s - 2.0F) < 1e-6,
+            "sharp left turn costs the crossing penalty");
+
+    require(findTransition(build.map, north_in, west_out) == nullptr,
+            "plain 90-degree left stays below the sharp-turn threshold");
+    require(findTransition(build.map, north_in, east_out) == nullptr,
+            "right turn stays free");
+    require(findTransition(build.map, east_in, east_out) == nullptr,
+            "straight movement stays free");
+}
+
+void runTurnPenaltyMergeWithSidecarTest() {
+    zeus::map::ImportedRoads lower = penaltyFixtureRoads();
+    lower.turn_transitions.push_back(
+        {"min", {0.0, 0.0}, "maj", zeus::map::SourceTurnKind::kPenalty, 2.5F});
+    const zeus::map::BuildResult lower_build = zeus::map::MapBuilder().build(lower);
+    const zeus::map::EdgeIndex east_in = findEdge(lower_build.map, -100, 0, 0, 0, "min");
+    const zeus::map::EdgeIndex north_out = findEdge(lower_build.map, 0, 0, 0, 100, "maj");
+    const zeus::map::TurnTransition* merged = findTransition(
+        lower_build.map, east_in, north_out);
+    require(merged != nullptr && std::abs(merged->penalty_s - 3.0F) < 1e-6,
+            "sidecar penalty below the generated value merges to the maximum");
+
+    zeus::map::ImportedRoads higher = penaltyFixtureRoads();
+    higher.turn_transitions.push_back(
+        {"min", {0.0, 0.0}, "maj", zeus::map::SourceTurnKind::kPenalty, 7.0F});
+    const zeus::map::BuildResult higher_build = zeus::map::MapBuilder().build(higher);
+    const zeus::map::EdgeIndex east_in_high = findEdge(higher_build.map, -100, 0, 0, 0, "min");
+    const zeus::map::EdgeIndex north_out_high =
+        findEdge(higher_build.map, 0, 0, 0, 100, "maj");
+    const zeus::map::TurnTransition* overridden = findTransition(
+        higher_build.map, east_in_high, north_out_high);
+    require(overridden != nullptr && std::abs(overridden->penalty_s - 7.0F) < 1e-6,
+            "sidecar penalty above the generated value wins the merge");
+}
+
 }  // namespace
 
 int main() {
     try {
         runEndToEndTest();
+        runDefaultTurnPenaltyTest();
+        runTurnPenaltyMergeWithSidecarTest();
         runGradeSeparatedCrossingTest();
         runCollapsedPieceDoesNotLeaveOrphanTest();
         runMixedGeometryGeoJsonTest();

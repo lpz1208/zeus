@@ -19,15 +19,17 @@ struct SimulationConfig {
     double sample_interval_seconds = 30.0;
     // Per-edge capacity = max(1, floor(length_m / jam_spacing_m) * lane_count).
     double jam_spacing_m = 7.0;
-    // Speed floor as a ratio of the free-flow speed under jamming.
-    double min_speed_ratio = 0.15;
+    // Speed floor as a ratio of the free-flow speed under jamming. The zero
+    // default lets a saturated edge actually stop traffic; the engine keeps a
+    // numerical 0.01 m/s crawl floor so time steps stay finite.
+    double min_speed_ratio = 0.0;
     // Exit headway (SUMO meso style tau): leaving an edge requires this many
     // seconds since the edge's previous exit, interpolated by density between
-    // the free-flow and jam values. Both zero disables the gate, which keeps
-    // the default MVP behaviour where only storage capacity limits a
-    // bottleneck.
-    double exit_headway_ff_s = 0.0;
-    double exit_headway_jam_s = 0.0;
+    // the free-flow and jam values. Arrivals at the destination are exempt:
+    // leaving the network consumes no downstream capacity. Both zero disables
+    // the gate entirely.
+    double exit_headway_ff_s = 1.4;
+    double exit_headway_jam_s = 2.0;
     // Periodically rebuild routing costs from live occupancy. Zero disables
     // congestion-driven scans; explicit edge controls still update weights
     // and evaluate affected routes immediately.
@@ -44,6 +46,9 @@ struct VehicleDemand {
     zeus::map::Point2d destination;
     double depart_time_s = 0.0;
     zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
+    // Agent-controlled vehicles are excluded from automatic rerouting: route
+    // changes go through the session's decision/commit path instead.
+    bool agent_controlled = false;
 };
 
 // A signal phase explicitly grants a set of edge-to-edge movements. Vehicles
@@ -171,12 +176,78 @@ struct SimulationStats {
     bool cancelled = false;
 };
 
+// Per-edge run summary. Only edges that carried at least one vehicle entry
+// are reported. mean_speed_mps integrates distance over the time vehicles
+// actually spent on the edge, so a queueing edge shows its crawl speed.
+struct EdgeKpi {
+    zeus::map::EdgeIndex edge = zeus::map::kInvalidEdge;
+    std::uint64_t entries = 0;         // admissions and boundary crossings in
+    double vehicle_seconds = 0.0;      // time-integrated occupancy
+    double distance_m = 0.0;           // sum of per-tick advances on the edge
+    double mean_speed_mps = 0.0;
+};
+
+// Live per-edge state exposed through tick snapshots. Only "hot" edges are
+// listed: occupied, closed, or carrying non-default control factors.
+struct EdgeTickState {
+    zeus::map::EdgeIndex edge = zeus::map::kInvalidEdge;
+    std::uint32_t occupancy = 0;
+    std::uint32_t effective_capacity = 1;
+    bool closed = false;
+    double speed_factor = 1.0;
+    double routing_cost_factor = 1.0;
+    double mean_speed_mps = 0.0;
+};
+
+// Per-agent slice of the snapshot: enough for a NavigationObservation-style
+// view without exposing internal loop state.
+struct AgentVehicleState {
+    std::uint32_t vehicle_id = 0;
+    VehicleState state = VehicleState::kWaiting;
+    zeus::map::EdgeIndex edge = zeus::map::kInvalidEdge;  // current edge when driving
+    double offset_s = 0.0;
+    std::uint32_t route_id = 0;
+    zeus::map::EdgeIndex destination_edge = zeus::map::kInvalidEdge;
+    double route_end_offset_m = 0.0;
+    double remaining_eta_s = 0.0;
+    bool route_invalidated = false;
+    bool held = false;
+    std::vector<zeus::map::EdgeIndex> remaining_edges;
+};
+
+// Immutable state published at every committed tick boundary. The session
+// fills state_version from its own monotonic counter.
+struct TickSnapshot {
+    std::uint64_t tick = 0;             // committed boundaries
+    double simulation_time_s = 0.0;
+    std::uint64_t state_version = 0;
+    bool decision_due = false;
+    std::string decision_reason;        // "route_invalidated" | "periodic" | ""
+    std::vector<EdgeTickState> edges;   // hot edges only
+    std::vector<AgentVehicleState> agents;
+    std::uint64_t arrived = 0;
+    std::uint64_t driving = 0;
+    std::uint64_t waiting = 0;
+    std::uint64_t unroutable = 0;
+};
+
+// A committed agent action queued by the session and drained by the engine at
+// the next tick boundary. The route itself is re-planned deterministically
+// from the vehicle's live position; only the algorithm choice travels.
+struct RouteInjection {
+    std::uint32_t vehicle_id = 0;
+    zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
+    std::uint64_t based_on_state_version = 0;
+};
+
 struct SimulationResult {
     bool ok = false;
     std::string message;            // set when every demand failed to route
     SimulationConfig config;        // effective values actually used
     SimulationStats stats;
     std::vector<VehicleRecord> vehicles;
+    // Per-edge summaries for every edge that carried traffic.
+    std::vector<EdgeKpi> edge_kpis;
     // Route pool shared by vehicles with identical OD and algorithm.
     std::vector<zeus::routing::RoutePath> routes;
     std::vector<AppliedControlEvent> applied_controls;

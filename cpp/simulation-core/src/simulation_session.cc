@@ -46,6 +46,10 @@ public:
         pause_requested_ = false;
         allowed_until_tick_ = 0;
         command_active_ = false;
+        snapshot_.reset();
+        pending_injections_.clear();
+        step_until_event_ = false;
+        event_reached_ = false;
         result_.reset();
         worker_error_ = nullptr;
         started_ = true;
@@ -119,6 +123,58 @@ public:
         return state_;
     }
 
+    [[nodiscard]] SimulationSessionState resume() {
+        std::lock_guard lock(mutex_);
+        requireRunnableLocked();
+        if (state_.finished) {
+            return state_;
+        }
+        if (command_active_) {
+            throw std::logic_error("another simulation session command is active");
+        }
+        pause_requested_ = false;
+        run_to_end_ = true;
+        condition_.notify_all();
+        return state_;
+    }
+
+    [[nodiscard]] SimulationSessionState stepUntilEvent(std::uint64_t max_steps) {
+        if (max_steps == 0) {
+            throw std::invalid_argument(
+                "simulation session until-event step cap must be positive");
+        }
+        std::unique_lock lock(mutex_);
+        requireRunnableLocked();
+        if (state_.finished) {
+            return state_;
+        }
+        if (command_active_) {
+            throw std::logic_error("another simulation session command is active");
+        }
+        if (max_steps > std::numeric_limits<std::uint64_t>::max() - state_.tick) {
+            throw std::overflow_error("simulation session step target overflow");
+        }
+        const std::uint64_t target_tick = state_.tick + max_steps;
+        command_active_ = true;
+        step_until_event_ = true;
+        event_reached_ = false;
+        pause_requested_ = false;
+        run_to_end_ = false;
+        allowed_until_tick_ = target_tick;
+        condition_.notify_all();
+        condition_.wait(lock, [this, target_tick] {
+            return state_.finished || worker_error_ != nullptr ||
+                   event_reached_ ||
+                   (state_.paused && state_.tick >= target_tick);
+        });
+        step_until_event_ = false;
+        command_active_ = false;
+        if (worker_error_ != nullptr) {
+            std::rethrow_exception(worker_error_);
+        }
+        return state_;
+    }
+
     void pause() {
         std::lock_guard lock(mutex_);
         if (!started_ || state_.finished || closed_) {
@@ -137,6 +193,58 @@ public:
     [[nodiscard]] SimulationSessionState observe() const {
         std::lock_guard lock(mutex_);
         return state_;
+    }
+
+    [[nodiscard]] TickSnapshot snapshot() const {
+        std::lock_guard lock(mutex_);
+        return snapshot_.value_or(TickSnapshot{});
+    }
+
+    [[nodiscard]] CommitResult commitRoute(
+        std::uint32_t vehicle_id,
+        zeus::routing::Algorithm algorithm,
+        std::uint64_t expected_state_version) {
+        std::lock_guard lock(mutex_);
+        if (closed_ || !started_) {
+            return CommitResult::kRejectedClosed;
+        }
+        if (state_.state_version != expected_state_version) {
+            return CommitResult::kRejectedStaleVersion;
+        }
+        if (vehicle_id >= demands_.size()) {
+            return CommitResult::kRejectedUnknownVehicle;
+        }
+        if (!demands_[vehicle_id].agent_controlled) {
+            return CommitResult::kRejectedNotAgent;
+        }
+        RouteInjection injection;
+        injection.vehicle_id = vehicle_id;
+        injection.algorithm = algorithm;
+        injection.based_on_state_version = expected_state_version;
+        pending_injections_.push_back(injection);
+        return CommitResult::kApplied;
+    }
+
+    [[nodiscard]] CommitResult keepRoute(
+        std::uint32_t vehicle_id,
+        std::uint64_t expected_state_version) {
+        std::lock_guard lock(mutex_);
+        if (closed_ || !started_) {
+            return CommitResult::kRejectedClosed;
+        }
+        if (state_.state_version != expected_state_version) {
+            return CommitResult::kRejectedStaleVersion;
+        }
+        if (vehicle_id >= demands_.size()) {
+            return CommitResult::kRejectedUnknownVehicle;
+        }
+        if (!demands_[vehicle_id].agent_controlled) {
+            return CommitResult::kRejectedNotAgent;
+        }
+        std::erase_if(pending_injections_, [vehicle_id](const RouteInjection& injection) {
+            return injection.vehicle_id == vehicle_id;
+        });
+        return CommitResult::kApplied;
     }
 
     [[nodiscard]] bool hasResult() const {
@@ -173,6 +281,28 @@ public:
         state_.paused = false;
         condition_.notify_all();
         return true;
+    }
+
+    void publishTickState(const TickSnapshot& published) override {
+        // Same engine thread, immediately before the next waitForTick: a
+        // decision wake-up set here takes effect at that barrier.
+        std::lock_guard lock(mutex_);
+        snapshot_ = published;
+        snapshot_->state_version = version_base_ + published.tick;
+        if (step_until_event_ && snapshot_->decision_due) {
+            pause_requested_ = true;
+            run_to_end_ = false;
+            allowed_until_tick_ = state_.tick;
+            event_reached_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    [[nodiscard]] std::vector<RouteInjection> collectRouteInjections() override {
+        std::lock_guard lock(mutex_);
+        std::vector<RouteInjection> drained;
+        drained.swap(pending_injections_);
+        return drained;
     }
 
 private:
@@ -255,6 +385,8 @@ private:
     std::condition_variable condition_;
     std::thread worker_;
     SimulationSessionState state_;
+    std::optional<TickSnapshot> snapshot_;
+    std::vector<RouteInjection> pending_injections_;
     std::optional<SimulationResult> result_;
     std::exception_ptr worker_error_;
     std::uint64_t version_base_ = 0;
@@ -265,6 +397,8 @@ private:
     bool run_to_end_ = false;
     bool pause_requested_ = false;
     bool command_active_ = false;
+    bool step_until_event_ = false;
+    bool event_reached_ = false;
 };
 
 SimulationSession::SimulationSession(
@@ -290,6 +424,14 @@ SimulationSessionState SimulationSession::runToEnd() {
     return impl_->runToEnd();
 }
 
+SimulationSessionState SimulationSession::resume() {
+    return impl_->resume();
+}
+
+SimulationSessionState SimulationSession::stepUntilEvent(std::uint64_t max_steps) {
+    return impl_->stepUntilEvent(max_steps);
+}
+
 void SimulationSession::pause() {
     impl_->pause();
 }
@@ -300,6 +442,23 @@ void SimulationSession::close() {
 
 SimulationSessionState SimulationSession::observe() const {
     return impl_->observe();
+}
+
+TickSnapshot SimulationSession::snapshot() const {
+    return impl_->snapshot();
+}
+
+SimulationSession::CommitResult SimulationSession::commitRoute(
+    std::uint32_t vehicle_id,
+    zeus::routing::Algorithm algorithm,
+    std::uint64_t expected_state_version) {
+    return impl_->commitRoute(vehicle_id, algorithm, expected_state_version);
+}
+
+SimulationSession::CommitResult SimulationSession::keepRoute(
+    std::uint32_t vehicle_id,
+    std::uint64_t expected_state_version) {
+    return impl_->keepRoute(vehicle_id, expected_state_version);
 }
 
 bool SimulationSession::hasResult() const {

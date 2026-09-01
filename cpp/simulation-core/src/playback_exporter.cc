@@ -215,6 +215,30 @@ void PlaybackExporter::save(
                << '}';
     }
     output << "],\n"
+           << "  \"edge_kpis\": [";
+    for (std::size_t i = 0; i < result.edge_kpis.size(); ++i) {
+        const EdgeKpi& kpi = result.edge_kpis[i];
+        if (i > 0) {
+            output << ", ";
+        }
+        const auto writeKpiValue = [&output](double value) {
+            if (std::isfinite(value)) {
+                output << std::setprecision(3) << value;
+            } else {
+                output << '0';
+            }
+        };
+        output << "{\"edge_id\": " << kpi.edge
+               << ", \"entries\": " << kpi.entries
+               << ", \"vehicle_seconds_s\": ";
+        writeKpiValue(kpi.vehicle_seconds);
+        output << ", \"distance_m\": ";
+        writeKpiValue(kpi.distance_m);
+        output << ", \"mean_speed_mps\": ";
+        writeKpiValue(kpi.mean_speed_mps);
+        output << '}';
+    }
+    output << "],\n"
            << "  \"signal_plans\": [";
     for (std::size_t plan_index = 0; plan_index < result.signal_plans.size(); ++plan_index) {
         const JunctionSignalPlan& plan = result.signal_plans[plan_index];

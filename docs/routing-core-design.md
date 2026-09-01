@@ -194,11 +194,12 @@ POST /api/maps/{id}/route
 
 ## 9. 下一步
 
-1. 将现有四种算法接入 Navigation Tool Registry，补齐能力元数据、统一候选路线结果、`candidate_id` 和算法版本；支持 Agent 只计算候选、由 Action Guard 独立提交路线。
-2. 增加 K Shortest Paths，并按动态重规划研究需要评估 D* Lite、LPA* 和时间依赖路由的实现顺序。
-3. 支持 via-way、conditional restriction 和车型 AccessMask。
-4. restriction-safe 双向 edge-state 搜索，以及 ALT landmark 预处理。
-5. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。
-6. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。
+现有四算法已接入 `routing-tools-v1` Navigation Tool Registry：C++ 注册表统一声明算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性、精确性和启发式能力；Agent Session 的候选 ID 与独立 Action Guard 提交流程也已贯通。
+
+1. 增加 K Shortest Paths，并按动态重规划研究需要评估 D* Lite、LPA* 和时间依赖路由的实现顺序。
+2. 支持 via-way、conditional restriction 和车型 AccessMask。
+3. restriction-safe 双向 edge-state 搜索，以及 ALT landmark 预处理。
+4. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。
+5. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。
 
 算法作为 Agent Tools、动态切换边界和安全门设计见 [geospatial-agent-environment.md](geospatial-agent-environment.md)。

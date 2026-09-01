@@ -77,6 +77,98 @@ func TestDecisionCoordinatorAcceptsCurrentAction(t *testing.T) {
 	}
 }
 
+func TestDecisionCoordinatorEffectFailureLeavesBarrierOpen(t *testing.T) {
+	coordinator := NewDecisionCoordinator()
+	defer coordinator.Close()
+	observation, fallback := decisionFixture("decision-effect-retry")
+	pending, err := coordinator.Begin(observation, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := DecisionAction{
+		DecisionID:               observation.DecisionID,
+		AgentID:                  observation.AgentID,
+		BasedOnStateVersion:      observation.StateVersion,
+		ValidUntilSimulationTime: observation.ValidUntilSimulationTime,
+		Kind:                     NavigationActionCommitRoute,
+		CandidateID:              "candidate-1",
+	}
+	applyErr := errors.New("worker rejected candidate")
+	if err := coordinator.SubmitWithEffect(action, DecisionState{
+		SimulationTimeSeconds: observation.SimulationTimeSeconds,
+		StateVersion:          observation.StateVersion,
+	}, func() error { return applyErr }); !errors.Is(err, applyErr) {
+		t.Fatalf("expected worker failure, got %v", err)
+	}
+	if coordinator.PendingCount() != 1 {
+		t.Fatal("failed environment effect must leave the decision pending")
+	}
+	action.Kind = NavigationActionKeepRoute
+	action.CandidateID = ""
+	if err := coordinator.SubmitWithEffect(action, DecisionState{
+		SimulationTimeSeconds: observation.SimulationTimeSeconds,
+		StateVersion:          observation.StateVersion,
+	}, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := pending.Wait(context.Background(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Resolution != DecisionApplied || outcome.Action.Kind != NavigationActionKeepRoute {
+		t.Fatalf("unexpected retry outcome: %#v", outcome)
+	}
+}
+
+func TestDecisionCoordinatorTimeoutDoesNotRaceInFlightEffect(t *testing.T) {
+	coordinator := NewDecisionCoordinator()
+	defer coordinator.Close()
+	observation, fallback := decisionFixture("decision-effect-timeout")
+	pending, err := coordinator.Begin(observation, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := DecisionAction{
+		DecisionID:               observation.DecisionID,
+		AgentID:                  observation.AgentID,
+		BasedOnStateVersion:      observation.StateVersion,
+		ValidUntilSimulationTime: observation.ValidUntilSimulationTime,
+		Kind:                     NavigationActionKeepRoute,
+	}
+	effectStarted := make(chan struct{})
+	releaseEffect := make(chan struct{})
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- coordinator.SubmitWithEffect(action, DecisionState{
+			SimulationTimeSeconds: observation.SimulationTimeSeconds,
+			StateVersion:          observation.StateVersion,
+		}, func() error {
+			close(effectStarted)
+			<-releaseEffect
+			return nil
+		})
+	}()
+	<-effectStarted
+	waitDone := make(chan DecisionOutcome, 1)
+	go func() {
+		outcome, waitErr := pending.Wait(context.Background(), 10*time.Millisecond)
+		if waitErr != nil {
+			waitDone <- DecisionOutcome{Reason: waitErr.Error()}
+			return
+		}
+		waitDone <- outcome
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(releaseEffect)
+	if err := <-submitDone; err != nil {
+		t.Fatal(err)
+	}
+	outcome := <-waitDone
+	if outcome.Resolution != DecisionApplied || outcome.UsedFallback {
+		t.Fatalf("an accepted in-flight effect must win timeout deferral: %#v", outcome)
+	}
+}
+
 func TestDecisionCoordinatorRejectsStaleThenAcceptsCorrection(t *testing.T) {
 	coordinator := NewDecisionCoordinator()
 	defer coordinator.Close()

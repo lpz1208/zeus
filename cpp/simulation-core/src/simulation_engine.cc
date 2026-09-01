@@ -309,6 +309,34 @@ SimulationResult SimulationEngine::run(
     double next_periodic_sample_s = result.config.sample_interval_seconds;
 
     std::vector<std::uint32_t> occupancy(edge_count, 0);
+    // Reused per-tick movement order (queue order, see the movement phase).
+    std::vector<std::uint32_t> move_order;
+    // Agent-controlled vehicle bookkeeping for snapshots and injections.
+    std::vector<std::uint8_t> agent_flags(demands.size(), 0);
+    std::vector<std::uint32_t> agent_indices;
+    for (std::size_t i = 0; i < demands.size(); ++i) {
+        if (demands[i].agent_controlled) {
+            agent_flags[i] = 1;
+            agent_indices.push_back(static_cast<std::uint32_t>(i));
+        }
+    }
+    std::vector<std::uint32_t> invalidated_agents;
+    std::uint64_t agent_driving_count = 0;
+    std::uint64_t arrived_count = 0;
+    // Per-edge KPI slots, created lazily for edges that ever carry traffic.
+    std::vector<std::int32_t> kpi_slot(edge_count, -1);
+    const auto kpiFor = [&](zeus::map::EdgeIndex edge) -> EdgeKpi& {
+        std::int32_t& slot = kpi_slot[edge];
+        if (slot < 0) {
+            slot = static_cast<std::int32_t>(result.edge_kpis.size());
+            result.edge_kpis.push_back({edge, 0, 0, 0.0, 0.0});
+        }
+        return result.edge_kpis[static_cast<std::size_t>(slot)];
+    };
+    // Residence time is attributed exactly at the exit event: a vehicle that
+    // enters and leaves an edge within one tick still occupies it for that
+    // dwell time, which a tick-end occupancy snapshot would miss.
+    std::vector<double> edge_entered_at(store.size(), 0.0);
     // Entry reservations and exit releases are buffered separately: an entry
     // reserves capacity immediately (no over-admission within a tick), while
     // a slot only frees after the tick-end commit (no same-tick cascade
@@ -360,7 +388,8 @@ SimulationResult SimulationEngine::run(
         const double density_ratio =
             others / static_cast<double>(effectiveCapacity(edge));
         const double congestion_speed_ratio = std::min(
-            1.0, std::max(result.config.min_speed_ratio, 1.0 - density_ratio));
+            1.0, std::max(std::max(result.config.min_speed_ratio, 0.01),
+                          1.0 - density_ratio));
         const double speed_penalty =
             1.0 / std::max(0.01, edge_speed_factor[edge]);
         const double capacity_penalty =
@@ -522,6 +551,12 @@ SimulationResult SimulationEngine::run(
             if (!topology_affected && !cost_affected) {
                 continue;
             }
+            if (agent_flags[i] != 0) {
+                // Agent-controlled vehicles change routes only through their
+                // own decision loop; surface the invalidation instead.
+                invalidated_agents.push_back(static_cast<std::uint32_t>(i));
+                continue;
+            }
 
             ++result.stats.reroute_attempts;
             const VehicleDemand& demand = demands[i];
@@ -611,6 +646,130 @@ SimulationResult SimulationEngine::run(
         return switched_any;
     };
 
+    // Applies one committed agent action at the tick boundary. The route is
+    // re-planned deterministically from the vehicle's live position with the
+    // algorithm chosen at commit time, so a stale candidate can never inject
+    // an outdated path; failures keep the previous route.
+    const auto applyInjectedRoute = [&](const RouteInjection& injection, double now) {
+        const std::size_t i = injection.vehicle_id;
+        if (i >= store.size() ||
+            (store.states_[i] != VehicleState::kWaiting &&
+             store.states_[i] != VehicleState::kDriving)) {
+            return;
+        }
+        ++result.stats.reroute_attempts;
+        const zeus::routing::RoutePath& old_route = result.routes[store.route_ids_[i]];
+        const zeus::routing::RoutingOverlay overlay{
+            routing_edge_enabled, routing_edge_cost_factors};
+        const std::uint32_t old_route_id = store.route_ids_[i];
+        const auto recordFailure = [&]() {
+            ++result.stats.reroute_failed;
+            result.reroutes.push_back(
+                {now, store.ids_[i], old_route_id, old_route_id, false});
+        };
+        if (routing_edge_enabled[old_route.edges.back()] == 0) {
+            recordFailure();
+            return;
+        }
+        zeus::routing::RouteRequest request;
+        request.origin = demands[i].origin;
+        request.destination = demands[i].destination;
+        request.algorithm = injection.algorithm;
+        request.overlay = &overlay;
+        request.destination_position = zeus::routing::RoutePosition{
+            old_route.edges.back(), old_route.end_offset_m};
+        if (store.states_[i] == VehicleState::kDriving) {
+            request.origin_position = zeus::routing::RoutePosition{
+                old_route.edges[store.route_indices_[i]], store.offsets_[i]};
+        }
+        const zeus::routing::RouteResult planned = planner_.plan(request);
+        ++result.stats.route_plans;
+        if (!planned.ok) {
+            recordFailure();
+            return;
+        }
+        result.routes.push_back(planned.path);
+        const std::uint32_t new_route_id =
+            static_cast<std::uint32_t>(result.routes.size() - 1);
+        store.route_ids_[i] = new_route_id;
+        store.route_indices_[i] = 0;
+        result.vehicles[i].route_id = new_route_id;
+        ++result.stats.reroute_succeeded;
+        result.reroutes.push_back({now, store.ids_[i], old_route_id, new_route_id, true});
+    };
+
+    // Publishes the immutable snapshot of a committed boundary. No-op unless
+    // a run controller (stateful session) is attached.
+    const auto publishSnapshot = [&](std::uint64_t committed_ticks, bool periodic_due) {
+        if (run_control == nullptr) {
+            return;
+        }
+        TickSnapshot snapshot;
+        snapshot.tick = committed_ticks;
+        snapshot.simulation_time_s =
+            std::min(static_cast<double>(committed_ticks) * step, duration);
+        snapshot.arrived = arrived_count;
+        snapshot.driving = driving_count;
+        snapshot.unroutable = store.size() - routable;
+        snapshot.waiting = store.size() - arrived_count - driving_count -
+                           (store.size() - routable);
+        snapshot.decision_due = !invalidated_agents.empty() || periodic_due;
+        snapshot.decision_reason = !invalidated_agents.empty()
+                                       ? "route_invalidated"
+                                       : (periodic_due ? "periodic" : "");
+        for (std::size_t e = 0; e < edge_count; ++e) {
+            if (occupancy[e] == 0 && !edge_closed[e] && edge_speed_factor[e] == 1.0 &&
+                edge_capacity_factor[e] == 1.0 &&
+                routing_edge_cost_factors[e] == 1.0) {
+                continue;
+            }
+            EdgeTickState state;
+            state.edge = static_cast<zeus::map::EdgeIndex>(e);
+            state.occupancy = occupancy[e];
+            state.effective_capacity = effectiveCapacity(state.edge);
+            state.closed = edge_closed[e];
+            state.speed_factor = edge_speed_factor[e];
+            state.routing_cost_factor = routing_edge_cost_factors[e];
+            if (kpi_slot[e] >= 0) {
+                const EdgeKpi& kpi =
+                    result.edge_kpis[static_cast<std::size_t>(kpi_slot[e])];
+                state.mean_speed_mps = kpi.vehicle_seconds > 1e-9
+                                           ? kpi.distance_m / kpi.vehicle_seconds
+                                           : 0.0;
+            }
+            snapshot.edges.push_back(state);
+        }
+        for (const std::uint32_t agent : agent_indices) {
+            const std::size_t i = agent;
+            const zeus::routing::RoutePath& route = result.routes[store.route_ids_[i]];
+            AgentVehicleState state;
+            state.vehicle_id = store.ids_[i];
+            state.state = store.states_[i];
+            state.route_id = store.route_ids_[i];
+            state.destination_edge = route.edges.back();
+            state.route_end_offset_m = route.end_offset_m;
+            state.held = store.held_[i];
+            state.route_invalidated =
+                std::find(invalidated_agents.begin(), invalidated_agents.end(), agent) !=
+                invalidated_agents.end();
+            if (store.states_[i] == VehicleState::kDriving) {
+                state.edge = route.edges[store.route_indices_[i]];
+                state.offset_s = store.offsets_[i];
+                state.remaining_edges.assign(
+                    route.edges.begin() + static_cast<std::ptrdiff_t>(store.route_indices_[i]),
+                    route.edges.end());
+                state.remaining_eta_s =
+                    remainingRouteTime(route, store.route_indices_[i], store.offsets_[i]);
+            } else if (store.states_[i] == VehicleState::kWaiting) {
+                state.remaining_edges = route.edges;
+                state.remaining_eta_s = remainingRouteTime(route, 0, route.start_offset_m);
+            }
+            snapshot.agents.push_back(std::move(state));
+        }
+        run_control->publishTickState(snapshot);
+    };
+    publishSnapshot(0, false);
+
     std::uint64_t stalled_ticks = 0;
     std::uint64_t tick = 0;
     std::size_t control_cursor = 0;
@@ -626,6 +785,11 @@ SimulationResult SimulationEngine::run(
                 break;
             }
         }
+        std::vector<RouteInjection> injections;
+        if (run_control != nullptr) {
+            injections = run_control->collectRouteInjections();
+        }
+        invalidated_agents.clear();
 
         bool control_activity = false;
         bool topology_restricted = false;
@@ -718,6 +882,12 @@ SimulationResult SimulationEngine::run(
             }
         }
 
+        // Committed agent actions apply at this boundary, after the control
+        // block refreshed the routing weights their planning relies on.
+        for (const RouteInjection& injection : injections) {
+            applyInjectedRoute(injection, now);
+        }
+
         if (driving_count == 0 && pending_entries == 0) {
             break;
         }
@@ -743,6 +913,11 @@ SimulationResult SimulationEngine::run(
                 continue;  // queued before the network entry
             }
             delta_in[first] += 1;
+            ++kpiFor(first).entries;
+            edge_entered_at[i] = now;
+            if (agent_flags[i] != 0) {
+                ++agent_driving_count;
+            }
             store.states_[i] = VehicleState::kDriving;
             --pending_entries;
             ++driving_count;
@@ -759,15 +934,33 @@ SimulationResult SimulationEngine::run(
         }
 
         // Movement phase: occupancy is immutable until every vehicle has
-        // advanced. Boundary entries reserve delta_in in id order, and all
-        // releases stay in delta_out until the tick-end commit.
+        // advanced. Boundary entries reserve delta_in in physical queue order,
+        // and all releases stay in delta_out until the tick-end commit. The
+        // order is (current edge, offset descending, id) from tick-start
+        // positions so a boundary slot goes to the physically-first vehicle
+        // instead of the lowest vehicle id.
+        move_order.clear();
         for (std::size_t i = 0; i < store.size(); ++i) {
-            if (store.states_[i] != VehicleState::kDriving) {
-                continue;
+            if (store.states_[i] == VehicleState::kDriving && !store.held_[i]) {
+                move_order.push_back(static_cast<std::uint32_t>(i));
             }
-            if (store.held_[i]) {
-                continue;
-            }
+        }
+        std::sort(
+            move_order.begin(), move_order.end(),
+            [&](std::uint32_t lhs, std::uint32_t rhs) {
+                const zeus::map::EdgeIndex lhs_edge = result.routes[store.route_ids_[lhs]]
+                                                          .edges[store.route_indices_[lhs]];
+                const zeus::map::EdgeIndex rhs_edge = result.routes[store.route_ids_[rhs]]
+                                                          .edges[store.route_indices_[rhs]];
+                if (lhs_edge != rhs_edge) {
+                    return lhs_edge < rhs_edge;
+                }
+                if (store.offsets_[lhs] != store.offsets_[rhs]) {
+                    return store.offsets_[lhs] > store.offsets_[rhs];
+                }
+                return lhs < rhs;
+            });
+        for (const std::uint32_t i : move_order) {
             double remaining = step;
             while (remaining > 1e-12) {
                 const zeus::routing::RoutePath& route = result.routes[store.route_ids_[i]];
@@ -793,17 +986,21 @@ SimulationResult SimulationEngine::run(
                 const double distance = edge_end - store.offsets_[i];
                 if (distance <= 1e-9) {
                     if (at_last_edge) {
+                        // Arrivals leave the network and consume no downstream
+                        // capacity, so the discharge headway must not gate or
+                        // throttle them.
                         const double event_time = now + (step - remaining);
-                        if (!canExit(edge_index, event_time)) {
-                            remaining = 0.0;  // wait for the discharge headway
-                            break;
-                        }
                         store.states_[i] = VehicleState::kArrived;
                         --driving_count;
                         delta_out[edge_index] -= 1;
                         store.arrives_[i] = event_time;
                         result.vehicles[i].arrive_s = event_time;
-                        last_exit_s[edge_index] = event_time;
+                        kpiFor(edge_index).vehicle_seconds +=
+                            event_time - edge_entered_at[i];
+                        ++arrived_count;
+                        if (agent_flags[i] != 0) {
+                            --agent_driving_count;
+                        }
                         recordSample(i, event_time, edge_index, edge_end);
                         moved = true;
                         break;
@@ -834,6 +1031,10 @@ SimulationResult SimulationEngine::run(
                     }
                     delta_out[edge_index] -= 1;
                     delta_in[next] += 1;
+                    ++kpiFor(next).entries;
+                    kpiFor(edge_index).vehicle_seconds +=
+                        event_time - edge_entered_at[i];
+                    edge_entered_at[i] = event_time;
                     last_exit_s[edge_index] = event_time;
                     recordSignalPass(edge.to, edge_index, next, event_time);
                     store.route_indices_[i] = route_index + 1;
@@ -848,25 +1049,30 @@ SimulationResult SimulationEngine::run(
                     const double advance = speed * remaining;
                     store.offsets_[i] += advance;
                     store.traveled_[i] += advance;
+                    kpiFor(edge_index).distance_m += advance;
                     moved = moved || advance > 1e-9;
                     remaining = 0.0;
                 } else {
                     store.offsets_[i] = edge_end;
                     store.traveled_[i] += distance;
+                    kpiFor(edge_index).distance_m += distance;
                     remaining -= time_to_end;
                     const double event_time = now + (step - remaining);
                     moved = true;
                     if (at_last_edge) {
-                        if (!canExit(edge_index, event_time)) {
-                            remaining = 0.0;  // wait for the discharge headway
-                            break;
-                        }
+                        // Arrivals are exempt from the discharge headway: they
+                        // release their slot without throttling later exits.
                         store.states_[i] = VehicleState::kArrived;
                         --driving_count;
                         delta_out[edge_index] -= 1;
                         store.arrives_[i] = event_time;
                         result.vehicles[i].arrive_s = event_time;
-                        last_exit_s[edge_index] = event_time;
+                        kpiFor(edge_index).vehicle_seconds +=
+                            event_time - edge_entered_at[i];
+                        ++arrived_count;
+                        if (agent_flags[i] != 0) {
+                            --agent_driving_count;
+                        }
                         recordSample(i, event_time, edge_index, edge_end);
                         break;
                     }
@@ -895,6 +1101,10 @@ SimulationResult SimulationEngine::run(
                     }
                     delta_out[edge_index] -= 1;
                     delta_in[next] += 1;
+                    ++kpiFor(next).entries;
+                    kpiFor(edge_index).vehicle_seconds +=
+                        event_time - edge_entered_at[i];
+                    edge_entered_at[i] = event_time;
                     last_exit_s[edge_index] = event_time;
                     recordSignalPass(edge.to, edge_index, next, event_time);
                     store.route_indices_[i] = route_index + 1;
@@ -924,6 +1134,10 @@ SimulationResult SimulationEngine::run(
                 static_cast<std::int64_t>(occupancy[e]) + delta_in[e] + delta_out[e]);
         }
 
+        // The boundary just committed: publish the snapshot the session will
+        // serve to observers and use to detect until_event wake-ups.
+        publishSnapshot(tick + 1, periodic_cost_scan && agent_driving_count > 0);
+
         bool has_future_departure = false;
         for (std::size_t i = 0; i < store.size(); ++i) {
             if (store.states_[i] == VehicleState::kWaiting &&
@@ -943,6 +1157,11 @@ SimulationResult SimulationEngine::run(
                 break;
             }
         }
+    }
+
+    for (EdgeKpi& kpi : result.edge_kpis) {
+        kpi.mean_speed_mps =
+            kpi.vehicle_seconds > 1e-9 ? kpi.distance_m / kpi.vehicle_seconds : 0.0;
     }
 
     double travel_sum = 0.0;

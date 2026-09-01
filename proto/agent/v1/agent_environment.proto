@@ -79,6 +79,10 @@ message AlgorithmCapability {
   bool supports_k_candidates = 5;
   bool supports_time_dependency = 6;
   bool deterministic = 7;
+  repeated string supported_objectives = 8;
+  bool exact = 9;
+  string search_direction = 10;
+  bool uses_heuristic = 11;
 }
 
 // NavigationObservation is an immutable snapshot. An action based on this
@@ -187,6 +191,30 @@ message StepSessionResponse {
   repeated NavigationObservation observations = 2;
 }
 
+message SnapshotSessionRequest {
+  string session_id = 1;
+}
+
+message SnapshotSessionResponse {
+  string snapshot_id = 1;
+  SessionState source_state = 2;
+  string storage = 3;
+}
+
+message RestoreSessionRequest {
+  string snapshot_id = 1;
+}
+
+message RestoreSessionResponse {
+  SessionState state = 1;
+}
+
+message DeleteSnapshotRequest {
+  string snapshot_id = 1;
+}
+
+message DeleteSnapshotResponse {}
+
 message CloseSessionRequest {
   string session_id = 1;
 }
@@ -200,5 +228,8 @@ service SimulationEnvironment {
   rpc Observe(ObserveRequest) returns (ObserveResponse);
   rpc SubmitAction(SubmitActionRequest) returns (SubmitActionResponse);
   rpc StepSession(StepSessionRequest) returns (StepSessionResponse);
+  rpc SnapshotSession(SnapshotSessionRequest) returns (SnapshotSessionResponse);
+  rpc RestoreSession(RestoreSessionRequest) returns (RestoreSessionResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
   rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
 }

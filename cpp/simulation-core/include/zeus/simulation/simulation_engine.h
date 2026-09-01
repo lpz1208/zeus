@@ -20,6 +20,18 @@ public:
         std::uint64_t next_tick,
         double simulation_time_s) = 0;
 
+    // Called by the engine thread after every committed tick boundary with an
+    // immutable snapshot of the resulting state. Default: ignored.
+    virtual void publishTickState(const TickSnapshot& snapshot) {
+        (void)snapshot;
+    }
+
+    // Drained by the engine thread right after the tick barrier opens;
+    // returned injections are applied at this boundary. Default: none.
+    [[nodiscard]] virtual std::vector<RouteInjection> collectRouteInjections() {
+        return {};
+    }
+
     virtual ~SimulationRunControl() = default;
 };
 

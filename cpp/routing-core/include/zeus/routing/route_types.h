@@ -20,9 +20,27 @@ enum class Algorithm : std::uint8_t {
     kBidirectionalAStar = 3,
 };
 
+// Stable metadata exposed to navigation agents. Algorithms remain ordinary
+// deterministic C++ functions; this registry describes when an orchestrator
+// may select each one without coupling it to search internals.
+struct AlgorithmCapability {
+    Algorithm algorithm = Algorithm::kDijkstra;
+    const char* version = "1";
+    const char* search_direction = "forward";
+    bool supports_dynamic_weights = true;
+    bool supports_incremental_repair = false;
+    bool supports_k_candidates = false;
+    bool supports_time_dependency = false;
+    bool deterministic = true;
+    bool exact = true;
+    bool uses_heuristic = false;
+};
+
 [[nodiscard]] const char* algorithmName(Algorithm algorithm);
 [[nodiscard]] bool parseAlgorithm(const std::string& value, Algorithm& algorithm);
 [[nodiscard]] bool isBidirectional(Algorithm algorithm);
+[[nodiscard]] std::span<const AlgorithmCapability> algorithmCapabilities();
+[[nodiscard]] const AlgorithmCapability* algorithmCapability(Algorithm algorithm);
 
 // Defensive floor for edges whose speed limit is missing or invalid; such
 // edges exist in published maps because invalid speeds are errors, not fatals.

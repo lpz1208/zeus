@@ -36,6 +36,12 @@ type Config struct {
 	ImportWorkers   int
 	SimulateWorkers int
 	RouteWorkerMaps int
+	// SessionWorkerMaps bounds resident session-worker processes (one per
+	// recently used map); each hosts many agent sessions.
+	SessionWorkerMaps int
+	// AgentDecisionWallTTL bounds real-time agent reasoning. Simulation time
+	// does not advance while a request-driven decision is pending.
+	AgentDecisionWallTTL time.Duration
 }
 
 type Server struct {
@@ -48,9 +54,16 @@ type Server struct {
 	// routeWorkers keeps one framed C++ process per recently used immutable
 	// map version, so HTTP routing reuses MapRuntime and RoutePlanner indexes.
 	routeWorkers *RouteWorkerManager
+	// sessionWorkers keeps resident C++ session-worker processes hosting
+	// stateful agent simulation sessions per recently used map version.
+	sessionWorkers *SessionWorkerManager
+	// agentSessions tracks server-side metadata of live agent sessions; the
+	// authoritative state always lives inside the C++ worker process.
+	agentSessions agentSessionRegistry
 	// decisions coordinates active Agent decision barriers. It owns only
 	// pending waits; authoritative simulation state remains in the C++ worker.
-	decisions *DecisionCoordinator
+	decisions       *DecisionCoordinator
+	decisionWallTTL time.Duration
 }
 
 type APIError struct {
@@ -370,6 +383,8 @@ func main() {
 	flag.IntVar(&config.ImportWorkers, "import-workers", 2, "maximum concurrent map imports")
 	flag.IntVar(&config.SimulateWorkers, "simulate-workers", 2, "maximum concurrent simulations")
 	flag.IntVar(&config.RouteWorkerMaps, "route-worker-maps", 4, "maximum resident route map workers")
+	flag.IntVar(&config.SessionWorkerMaps, "session-worker-maps", 2, "maximum resident agent session map workers")
+	flag.DurationVar(&config.AgentDecisionWallTTL, "agent-decision-wall-ttl", 5*time.Minute, "maximum wall time for one agent decision")
 	flag.Parse()
 
 	server := NewServer(config, slog.Default())
@@ -410,23 +425,35 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 	if config.CmdLimit == 0 {
 		config.CmdLimit = 2 * time.Minute
 	}
+	if config.AgentDecisionWallTTL <= 0 {
+		config.AgentDecisionWallTTL = 5 * time.Minute
+	}
 	simSlots := config.SimulateWorkers
 	if simSlots <= 0 {
 		simSlots = 2
 	}
 	return &Server{
-		config:       config,
-		logger:       logger,
-		jobs:         NewJobManager(config.ImportWorkers),
-		simSlots:     make(chan struct{}, simSlots),
-		routeWorkers: NewRouteWorkerManager(config.ZeusMap, config.CmdLimit, config.RouteWorkerMaps),
-		decisions:    NewDecisionCoordinator(),
+		config:         config,
+		logger:         logger,
+		jobs:           NewJobManager(config.ImportWorkers),
+		simSlots:       make(chan struct{}, simSlots),
+		routeWorkers:   NewRouteWorkerManager(config.ZeusMap, config.CmdLimit, config.RouteWorkerMaps),
+		sessionWorkers: NewSessionWorkerManager(config.ZeusMap, 10*config.CmdLimit, config.SessionWorkerMaps),
+		agentSessions: agentSessionRegistry{
+			sessions:  make(map[string]agentSessionEntry),
+			snapshots: make(map[string]agentSnapshotEntry),
+		},
+		decisions:       NewDecisionCoordinator(),
+		decisionWallTTL: config.AgentDecisionWallTTL,
 	}
 }
 
 func (s *Server) Close() {
 	if s.decisions != nil {
 		s.decisions.Close()
+	}
+	if s.sessionWorkers != nil {
+		s.sessionWorkers.Close()
 	}
 	if s.routeWorkers != nil {
 		s.routeWorkers.Close()
@@ -469,6 +496,20 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/maps/{id}/query", s.handleQuery)
 	mux.HandleFunc("POST /api/maps/{id}/route", s.handleRoute)
 	mux.HandleFunc("POST /api/maps/{id}/simulate", s.handleSimulate)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions", s.handleCreateAgentSession)
+	mux.HandleFunc("GET /api/maps/{id}/agent/tools", s.handleAgentTools)
+	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}", s.handleObserveAgentSession)
+	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/agent/{vehicle}", s.handleAgentObserveVehicle)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/plan", s.handleAgentPlan)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/step", s.handleAgentStep)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/actions", s.handleAgentAction)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/run", s.handleAgentRunToEnd)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/pause", s.handleAgentPause)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/snapshots", s.handleCreateAgentSnapshot)
+	mux.HandleFunc("POST /api/maps/{id}/agent/snapshots/{snapshot}/restore", s.handleRestoreAgentSnapshot)
+	mux.HandleFunc("DELETE /api/maps/{id}/agent/snapshots/{snapshot}", s.handleDeleteAgentSnapshot)
+	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/result", s.handleAgentSessionResult)
+	mux.HandleFunc("DELETE /api/maps/{id}/agent/sessions/{session}", s.handleCloseAgentSession)
 	mux.Handle("/", spaHandler(s.config.WebDir))
 	return requestLogger(s.logger, mux)
 }

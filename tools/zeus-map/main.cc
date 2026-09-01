@@ -25,9 +25,18 @@
 #include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
+
+#include "session_worker.h"
+#include "simulate_io.h"
 #include "zeus/simulation/simulation_engine.h"
 
 namespace {
+
+using zeus::cli::parseSignalPlans;
+using zeus::cli::parseSimulationControls;
+using zeus::cli::splitTabs;
+using zeus::cli::transformWgs84Batch;
+using zeus::cli::trim;
 
 using Options = std::unordered_map<std::string, std::string>;
 
@@ -49,6 +58,7 @@ void printUsage() {
         << "  zeus-map route <map.zmap> (--lon LON --lat LAT --dest-lon LON --dest-lat LAT\n"
         << "                       | --x X --y Y --dest-x X --dest-y Y) [options]\n"
         << "  zeus-map route-worker <map.zmap>  # framed requests on stdin/stdout\n"
+        << "  zeus-map session-worker <map.zmap>  # framed agent sessions on stdin/stdout\n"
         << "  zeus-map simulate <map.zmap> (--lon LON --lat LAT --dest-lon LON --dest-lat LAT\n"
         << "                          [--count N --spread S] | --od-file FILE) [options]\n\n"
         << "Import options:\n"
@@ -83,19 +93,25 @@ void printUsage() {
         << "Simulate options:\n"
         << "  --count N                  vehicles for the single OD pair (default 1)\n"
         << "  --spread SECONDS           linear departure window (default 0)\n"
-        << "  --od-file FILE             lon,lat,dest_lon,dest_lat,depart_s[,algorithm] rows\n"
+        << "  --od-file FILE             lon,lat,dest_lon,dest_lat,depart_s[,algorithm][,agent] rows\n"
         << "  --algorithm dijkstra|astar|bidijkstra|biastar\n"
         << "  --duration SECONDS         simulation horizon (default 3600)\n"
         << "  --step SECONDS             tick length (default 1)\n"
         << "  --sample-interval SECONDS  trajectory sampling (default 30)\n"
-        << "  --exit-headway-ff SECONDS   discharge headway at free flow (default 0=off)\n"
-        << "  --exit-headway-jam SECONDS  discharge headway under jam (default 0=off)\n"
+        << "  --exit-headway-ff SECONDS   discharge headway at free flow (default 1.4)\n"
+        << "  --exit-headway-jam SECONDS  discharge headway under jam (default 2.0)\n"
         << "  --reroute-interval SECONDS  live congestion scan interval (default 0=off)\n"
         << "  --reroute-cost-ratio RATIO  material edge-cost change threshold (default 1.25)\n"
         << "  --controls FILE            time,scope,target,action[,value] rows\n"
         << "  --signals FILE             node,phase,green,yellow,all_red,offset,from,to[,flow_vph] rows\n"
         << "  --output FILE              write per-vehicle WGS84 trajectory GeoJSON\n"
-        << "  --playback FILE            write the web playback document\n";
+        << "  --playback FILE            write the web playback document\n\n"
+        << "Session worker protocol (tab-delimited lines, JSON payloads):\n"
+        << "  reset ID duration step sample ff jam reroute ratio min_speed od controls signals\n"
+        << "  observe ID [edge filter] | agent-observe ID vehicle\n"
+        << "  plan ID vehicle algorithm | commit ID vehicle candidate version\n"
+        << "  keep ID vehicle version | step ID ticks | step_event ID max_ticks\n"
+        << "  run-to-end ID | pause ID | result ID traj playback | close ID | shutdown\n";
 }
 
 Options parseOptions(int argc, char** argv, int start) {
@@ -210,44 +226,6 @@ zeus::map::Point2d wgs84ToRuntime(
     return {lon, lat};
 }
 
-std::string trim(const std::string& value) {
-    const auto begin = value.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos) {
-        return "";
-    }
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(begin, end - begin + 1);
-}
-
-// Transforms WGS84 lon/lat arrays in place into the runtime CRS.
-void transformWgs84Batch(
-    std::vector<double>& xs,
-    std::vector<double>& ys,
-    const std::string& runtime_crs_wkt) {
-    if (xs.empty()) {
-        return;
-    }
-    OGRSpatialReference source;
-    source.SetWellKnownGeogCS("WGS84");
-    source.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-    OGRSpatialReference target;
-    if (target.importFromWkt(runtime_crs_wkt.c_str()) != OGRERR_NONE) {
-        throw std::runtime_error("runtime map contains an invalid CRS");
-    }
-    target.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-    struct TransformDeleter {
-        void operator()(OGRCoordinateTransformation* transform) const {
-            OGRCoordinateTransformation::DestroyCT(transform);
-        }
-    };
-    std::unique_ptr<OGRCoordinateTransformation, TransformDeleter> transform(
-        OGRCreateCoordinateTransformation(&source, &target));
-    if (!transform ||
-        !transform->Transform(static_cast<int>(xs.size()), xs.data(), ys.data())) {
-        throw std::runtime_error("failed to transform WGS84 demand points to runtime CRS");
-    }
-}
-
 int executeRoute(
     const zeus::map::MapRuntime& runtime,
     const zeus::routing::RoutePlanner& planner,
@@ -326,20 +304,6 @@ int executeRoute(
     return 0;
 }
 
-std::vector<std::string> splitTabs(const std::string& line) {
-    std::vector<std::string> fields;
-    std::size_t begin = 0;
-    while (true) {
-        const std::size_t end = line.find('\t', begin);
-        if (end == std::string::npos) {
-            fields.push_back(line.substr(begin));
-            return fields;
-        }
-        fields.push_back(line.substr(begin, end - begin));
-        begin = end + 1;
-    }
-}
-
 int runRouteWorker(const zeus::map::MapRuntime& runtime) {
     const zeus::routing::RoutePlanner planner(runtime);
     std::cout << "ZEUS_ROUTE_WORKER\t1\n" << std::flush;
@@ -375,174 +339,6 @@ int runRouteWorker(const zeus::map::MapRuntime& runtime) {
         std::cout << std::flush;
     }
     return 0;
-}
-
-std::vector<zeus::simulation::SimulationControlEvent> parseSimulationControls(
-    const std::string& path) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("cannot open simulation controls file: " + path);
-    }
-    std::vector<zeus::simulation::SimulationControlEvent> controls;
-    std::string line;
-    std::size_t line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
-        line = trim(line);
-        if (line.empty() || line.front() == '#') {
-            continue;
-        }
-        std::vector<std::string> fields;
-        std::size_t begin = 0;
-        while (true) {
-            const std::size_t comma = line.find(',', begin);
-            if (comma == std::string::npos) {
-                fields.push_back(trim(line.substr(begin)));
-                break;
-            }
-            fields.push_back(trim(line.substr(begin, comma - begin)));
-            begin = comma + 1;
-        }
-        if (fields.size() < 4 || fields.size() > 5) {
-            throw std::runtime_error(
-                "invalid controls line " + std::to_string(line_number) +
-                ": expected time_s,vehicle|edge|junction,target_id,action[,value]");
-        }
-        zeus::simulation::SimulationControlEvent control;
-        control.time_s = std::stod(fields[0]);
-        const unsigned long long target_id = std::stoull(fields[2]);
-        if (target_id > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::runtime_error(
-                "controls target ID exceeds uint32 range on line " +
-                std::to_string(line_number));
-        }
-        control.target_id = static_cast<std::uint32_t>(target_id);
-        if (fields[1] == "vehicle") {
-            control.scope = zeus::simulation::ControlScope::kVehicle;
-        } else if (fields[1] == "edge" || fields[1] == "road") {
-            control.scope = zeus::simulation::ControlScope::kEdge;
-        } else if (fields[1] == "junction") {
-            control.scope = zeus::simulation::ControlScope::kJunction;
-        } else {
-            throw std::runtime_error(
-                "invalid controls scope on line " + std::to_string(line_number));
-        }
-        if (fields[3] == "hold") {
-            control.action = zeus::simulation::ControlAction::kHold;
-        } else if (fields[3] == "release") {
-            control.action = zeus::simulation::ControlAction::kRelease;
-        } else if (fields[3] == "close") {
-            control.action = zeus::simulation::ControlAction::kClose;
-        } else if (fields[3] == "open") {
-            control.action = zeus::simulation::ControlAction::kOpen;
-        } else if (fields[3] == "speed_factor") {
-            control.action = zeus::simulation::ControlAction::kSetSpeedFactor;
-        } else if (fields[3] == "capacity_factor") {
-            control.action = zeus::simulation::ControlAction::kSetCapacityFactor;
-        } else {
-            throw std::runtime_error(
-                "invalid controls action on line " + std::to_string(line_number));
-        }
-        if (fields.size() == 5 && !fields[4].empty()) {
-            control.value = std::stod(fields[4]);
-        }
-        controls.push_back(control);
-    }
-    return controls;
-}
-
-std::vector<zeus::simulation::JunctionSignalPlan> parseSignalPlans(
-    const std::string& path) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("cannot open signal plans file: " + path);
-    }
-    std::vector<zeus::simulation::JunctionSignalPlan> plans;
-    std::string line;
-    std::size_t line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
-        line = trim(line);
-        if (line.empty() || line.front() == '#') {
-            continue;
-        }
-        std::vector<std::string> fields;
-        std::size_t begin = 0;
-        while (true) {
-            const std::size_t comma = line.find(',', begin);
-            if (comma == std::string::npos) {
-                fields.push_back(trim(line.substr(begin)));
-                break;
-            }
-            fields.push_back(trim(line.substr(begin, comma - begin)));
-            begin = comma + 1;
-        }
-        if (fields.size() < 8 || fields.size() > 9) {
-            throw std::runtime_error(
-                "invalid signal line " + std::to_string(line_number) +
-                ": expected node_id,phase,green_s,yellow_s,all_red_s,offset_s,from_edge,to_edge[,saturation_flow_vph]");
-        }
-        const auto checkedId = [&](const std::string& value, const char* name) {
-            const unsigned long long parsed = std::stoull(value);
-            if (parsed > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::runtime_error(
-                    std::string("signal ") + name + " exceeds uint32 range on line " +
-                    std::to_string(line_number));
-            }
-            return static_cast<std::uint32_t>(parsed);
-        };
-        const auto node = static_cast<zeus::map::NodeIndex>(checkedId(fields[0], "node ID"));
-        const std::uint32_t phase_index = checkedId(fields[1], "phase index");
-        if (phase_index >= 1024) {
-            throw std::runtime_error("signal phase index is too large on line " +
-                                     std::to_string(line_number));
-        }
-        const double green = std::stod(fields[2]);
-        const double yellow = std::stod(fields[3]);
-        const double all_red = std::stod(fields[4]);
-        const double offset = std::stod(fields[5]);
-        const auto from_edge = static_cast<zeus::map::EdgeIndex>(
-            checkedId(fields[6], "from edge"));
-        const auto to_edge = static_cast<zeus::map::EdgeIndex>(
-            checkedId(fields[7], "to edge"));
-        const double saturation_flow_vph =
-            fields.size() == 9 ? std::stod(fields[8]) : 1800.0;
-
-        auto found = std::find_if(
-            plans.begin(), plans.end(),
-            [node](const zeus::simulation::JunctionSignalPlan& plan) {
-                return plan.node == node;
-            });
-        if (found == plans.end()) {
-            plans.push_back({node, offset, yellow, all_red, {}});
-            found = std::prev(plans.end());
-        } else if (std::abs(found->offset_seconds - offset) > 1e-9 ||
-                   std::abs(found->yellow_seconds - yellow) > 1e-9 ||
-                   std::abs(found->all_red_seconds - all_red) > 1e-9) {
-            throw std::runtime_error(
-                "inconsistent signal plan timing on line " +
-                std::to_string(line_number));
-        }
-        if (found->phases.size() <= phase_index) {
-            found->phases.resize(static_cast<std::size_t>(phase_index) + 1);
-        }
-        zeus::simulation::SignalPhase& phase = found->phases[phase_index];
-        if (phase.movements.empty()) {
-            phase.green_seconds = green;
-            phase.saturation_flow_vph = saturation_flow_vph;
-        } else if (std::abs(phase.green_seconds - green) > 1e-9) {
-            throw std::runtime_error(
-                "inconsistent signal phase green time on line " +
-                std::to_string(line_number));
-        } else if (std::abs(
-                       phase.saturation_flow_vph - saturation_flow_vph) > 1e-9) {
-            throw std::runtime_error(
-                "inconsistent signal phase saturation flow on line " +
-                std::to_string(line_number));
-        }
-        phase.movements.push_back({from_edge, to_edge});
-    }
-    return plans;
 }
 
 int run(int argc, char** argv) {
@@ -650,6 +446,9 @@ int run(int argc, char** argv) {
     }
 
     zeus::map::MapRuntime runtime(std::move(map));
+    if (command == "session-worker") {
+        return zeus::cli::runSessionWorker(runtime);
+    }
     if (command == "route-worker") {
         return runRouteWorker(runtime);
     }
@@ -721,66 +520,18 @@ int run(int argc, char** argv) {
     if (command == "simulate") {
         // Demand source: a single OD pair expanded into --count departures
         // spread linearly over --spread seconds, or an od file with one
-        // "lon,lat,dest_lon,dest_lat,depart_s[,algorithm]" row per vehicle.
-        struct Wgs84Demand {
-            double origin_lon = 0.0;
-            double origin_lat = 0.0;
-            double dest_lon = 0.0;
-            double dest_lat = 0.0;
-            double depart_s = 0.0;
-            std::string algorithm;
-        };
-        std::vector<Wgs84Demand> wgs84_demands;
+        // "lon,lat,dest_lon,dest_lat,depart_s[,algorithm][,agent]" row per
+        // vehicle.
+        std::vector<zeus::cli::OdRow> od_rows;
         if (const auto found = options.find("od-file"); found != options.end()) {
-            std::ifstream input(found->second);
-            if (!input) {
-                throw std::runtime_error("cannot open od file: " + found->second);
-            }
-            std::string line;
-            std::size_t line_number = 0;
-            while (std::getline(input, line)) {
-                ++line_number;
-                line = trim(line);
-                if (line.empty() || line.front() == '#') {
-                    continue;
-                }
-                std::vector<std::string> fields;
-                std::size_t start = 0;
-                while (true) {
-                    const std::size_t comma = line.find(',', start);
-                    if (comma == std::string::npos) {
-                        fields.push_back(line.substr(start));
-                        break;
-                    }
-                    fields.push_back(line.substr(start, comma - start));
-                    start = comma + 1;
-                }
-                if (fields.size() < 5 || fields.size() > 6) {
-                    throw std::runtime_error("invalid od file line " +
-                                             std::to_string(line_number) +
-                                             ": expected lon,lat,dest_lon,dest_lat,depart_s[,algorithm]");
-                }
-                Wgs84Demand demand;
-                demand.origin_lon = std::stod(trim(fields[0]));
-                demand.origin_lat = std::stod(trim(fields[1]));
-                demand.dest_lon = std::stod(trim(fields[2]));
-                demand.dest_lat = std::stod(trim(fields[3]));
-                demand.depart_s = std::stod(trim(fields[4]));
-                if (fields.size() == 6) {
-                    demand.algorithm = trim(fields[5]);
-                }
-                wgs84_demands.push_back(demand);
-            }
+            od_rows = zeus::cli::parseOdFile(found->second);
         } else if (options.contains("lon") && options.contains("lat") &&
                    options.contains("dest-lon") && options.contains("dest-lat")) {
-            const Wgs84Demand base{
-                std::stod(options.at("lon")),
-                std::stod(options.at("lat")),
-                std::stod(options.at("dest-lon")),
-                std::stod(options.at("dest-lat")),
-                0.0,
-                "",
-            };
+            zeus::cli::OdRow base;
+            base.origin_lon = std::stod(options.at("lon"));
+            base.origin_lat = std::stod(options.at("lat"));
+            base.dest_lon = std::stod(options.at("dest-lon"));
+            base.dest_lat = std::stod(options.at("dest-lat"));
             const int count = options.contains("count")
                                   ? std::stoi(options.at("count"))
                                   : 1;
@@ -794,12 +545,12 @@ int run(int argc, char** argv) {
                 throw std::invalid_argument("--spread must be a finite non-negative value");
             }
             for (int i = 0; i < count; ++i) {
-                Wgs84Demand demand = base;
-                demand.depart_s = spread > 0.0 && count > 1
-                                      ? spread * static_cast<double>(i) /
-                                            static_cast<double>(count - 1)
-                                      : 0.0;
-                wgs84_demands.push_back(demand);
+                zeus::cli::OdRow row = base;
+                row.depart_s = spread > 0.0 && count > 1
+                                   ? spread * static_cast<double>(i) /
+                                         static_cast<double>(count - 1)
+                                   : 0.0;
+                od_rows.push_back(row);
             }
         } else {
             throw std::invalid_argument(
@@ -845,35 +596,9 @@ int run(int argc, char** argv) {
             signal_plans = parseSignalPlans(found->second);
         }
 
-        // Convert every demand point in one batch through a shared transform.
-        std::vector<double> xs;
-        std::vector<double> ys;
-        xs.reserve(wgs84_demands.size() * 2);
-        ys.reserve(wgs84_demands.size() * 2);
-        for (const Wgs84Demand& demand : wgs84_demands) {
-            xs.push_back(demand.origin_lon);
-            ys.push_back(demand.origin_lat);
-            xs.push_back(demand.dest_lon);
-            ys.push_back(demand.dest_lat);
-        }
-        transformWgs84Batch(xs, ys, runtime.data().metadata.runtime_crs_wkt);
-
-        std::vector<zeus::simulation::VehicleDemand> demands;
-        demands.reserve(wgs84_demands.size());
-        for (std::size_t i = 0; i < wgs84_demands.size(); ++i) {
-            zeus::simulation::VehicleDemand demand;
-            demand.origin = {xs[2 * i], ys[2 * i]};
-            demand.destination = {xs[2 * i + 1], ys[2 * i + 1]};
-            demand.depart_time_s = wgs84_demands[i].depart_s;
-            demand.algorithm = algorithm;
-            if (!wgs84_demands[i].algorithm.empty() &&
-                !zeus::routing::parseAlgorithm(
-                    wgs84_demands[i].algorithm, demand.algorithm)) {
-                throw std::invalid_argument(
-                    "unknown routing algorithm: " + wgs84_demands[i].algorithm);
-            }
-            demands.push_back(demand);
-        }
+        const std::vector<zeus::simulation::VehicleDemand> demands =
+            zeus::cli::buildVehicleDemands(
+                od_rows, algorithm, runtime.data().metadata.runtime_crs_wkt);
 
         const zeus::routing::RoutePlanner planner(runtime);
         const zeus::simulation::SimulationEngine engine(runtime, planner);
@@ -911,6 +636,7 @@ int run(int argc, char** argv) {
                   << result.stats.signal_saturation_wait_events << '\n'
                   << "signal_movements_passed="
                   << result.stats.signal_movements_passed << '\n'
+                  << "edge_kpis=" << result.edge_kpis.size() << '\n'
                   << "avg_travel_s=" << result.stats.average_travel_s << '\n'
                   << "min_travel_s=" << result.stats.min_travel_s << '\n'
                   << "max_travel_s=" << result.stats.max_travel_s << '\n'

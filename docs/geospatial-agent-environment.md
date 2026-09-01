@@ -2,7 +2,7 @@
 
 > 文档状态：目标架构，待分阶段实施
 >
-> 最后更新：2026-08-30
+> 最后更新：2026-09-01
 >
 > 关联文档：[overall-architecture.md](overall-architecture.md)、[simulation-core-design.md](simulation-core-design.md)、[routing-core-design.md](routing-core-design.md)
 
@@ -373,7 +373,18 @@ latency / token usage / failure and fallback
 
 ## 12. 分阶段实施计划
 
-### 当前落地状态（2026-08-30）
+### 当前落地状态（2026-09-01）
+
+- `zeus-map session-worker <map.zmap>` 常驻进程已实现：stdin/stdout tab 帧协议（`ZEUS_SESSION_WORKER`/`ZEUS_SESSION_RESPONSE`），命令覆盖 reset、observe、agent-observe、plan、commit、keep、step、step_event、resume、run-to-end、pause、snapshot、restore、drop-snapshot、result、close、shutdown；一个进程按 session_id 承载多张会话。`resume` 非阻塞启动引擎线程，允许同一命令通道继续处理 pause/observe 和其他会话。
+- 引擎在每个已提交 tick 边界发布 `TickSnapshot`：热边（占用/容量/封闭/速度与路由代价因子/均速）、agent 车辆切片（位置、路线、ETA、路线失效标记）、决策事件与原因；`step_event` 推进至 agent 路线失效或周期扫描事件后暂停。单车 Observation 通过地图空间索引筛选车辆 2 km 内最多 64 条热边，不再按全局热边顺序截断。
+- 动作注入已实现：`commit` 在下一 tick 边界从车辆实时位置按候选记录的算法确定性重规划（候选路径本身不跨边界，杜绝陈旧位置），`keep` 为版本校验确认；agent 车辆被排除出自动重规划。
+- Go 控制面：`SessionWorkerManager`（按地图常驻、LRU、挂死重启）+ `/api/maps/{id}/agent/sessions/*` 端点（创建/观察/plan/step/actions/run/pause/result/关闭），决策边界自动开 `DecisionCoordinator` 屏障（默认 5 分钟墙上 TTL，可配置）；超时 fallback 会把版本校验的 keep_route 实际提交到 C++。actions 采用两阶段语义，只有 Worker 明确接受后才关闭屏障，拒绝时保留决策供修正；每个 Session 有活动决策门禁，未处理前拒绝继续 step。HTTP `/run` 使用非阻塞 resume，因此 `/pause` 可在后续请求中生效。
+- 第一版进程内 Snapshot/Restore 已实现：只允许在暂停或完成边界创建快照，保存配置、需求、控制、信号、目标 tick 和已接受的 commit/keep 动作日志；restore 通过确定性重放创建独立 Session，可用于同一 Worker 生命周期内的实验分叉。Go 已提供创建、恢复和删除快照端点；恢复到决策边界时会为新 Session 打开独立 Decision Barrier。
+- 四算法 Tool Registry 已实现：C++ `algorithmCapabilities()` 是能力元数据的唯一来源，`session-worker tools` 与 `GET /api/maps/{id}/agent/tools` 暴露 registry version、算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性和精确性声明；单车 Observation 同步携带该能力列表。
+- 同步落地保真度修复：出口放行间隔默认 1.4/2.0 s 且到达免闸、min_speed_ratio 默认 0（饱和路段真停，含动态代价除零保护）、移动序按队列序放行、per-edge KPI（entries/vehicle_seconds/mean_speed，playback 导出）、建图期自动生成转向罚时（U-turn 5 s、急左转 2 s、支路进干路 3 s，max-merge sidecar）。
+- 尚未实现：跨 Worker 重启的持久化快照文件、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码接入、gRPC 边界、Python agent-runtime。
+
+### 2026-08-30 之前的状态（历史）
 
 - 已定义 `proto/agent/v1/agent_environment.proto`，覆盖三种决策模式、Observation、Action、DecisionTrace、state version、仿真时间有效期和目标 Session 服务。
 - 已在 Go 控制服务实现线程安全的 `DecisionCoordinator`：注册后再发布观察，支持 Barrier 阻塞等待、墙上时间超时、确定性 fallback、取消/关闭回收，以及提交时的 Agent、`state_version` 和 TTL 校验。
@@ -389,7 +400,7 @@ latency / token usage / failure and fallback
 - 为现有四种 C++ 路由算法增加 Tool Registry 元数据。
 - 用规则策略复现当前动态重规划，作为 Agent 环境回归基线。
 
-### A1：有状态 Environment MVP（下一优先级）
+### A1：有状态 Environment MVP（进行中）
 
 - 将同步仿真演进为可创建、暂停、观察、step、快照和关闭的 `SimulationSession`。
 - 实现 `until_event` 推进和 state version。

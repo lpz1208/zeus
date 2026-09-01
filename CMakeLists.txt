@@ -72,7 +72,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(zeus_simulation_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(zeus-map tools/zeus-map/main.cc)
+add_executable(zeus-map
+    tools/zeus-map/main.cc
+    tools/zeus-map/session_worker.cc
+    tools/zeus-map/simulate_io.cc)
 target_link_libraries(zeus-map PRIVATE zeus_map_engine zeus_routing_core zeus_simulation_core)
 
 if(ZEUS_BUILD_TESTS)

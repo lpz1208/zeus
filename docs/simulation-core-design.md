@@ -50,9 +50,9 @@ zeus_simulation_core
 | `duration_seconds` | 900 s | 仿真时域 |
 | `sample_interval_seconds` | 15 s | 周期采样目标间隔 |
 | `jam_spacing_m` | 7 m | 单车占用的等效路段长度 |
-| `min_speed_ratio` | 0.15 | 拥堵时自由流速度下限比例 |
-| `exit_headway_ff_s` | 0 s | 自由流状态的路段最小驶出间隔，0 表示关闭 |
-| `exit_headway_jam_s` | 0 s | 拥堵状态的路段最小驶出间隔，0 表示沿用自由流值 |
+| `min_speed_ratio` | 0 | 拥堵时自由流速度下限比例；0 表示饱和路段可以让车真正停下（引擎保留 0.01 m/s 数值地板） |
+| `exit_headway_ff_s` | 1.4 s | 自由流状态的路段最小驶出间隔（SUMO meso tau 风格），0 表示关闭 |
+| `exit_headway_jam_s` | 2.0 s | 拥堵状态的路段最小驶出间隔；到达目的地不受该闸门约束 |
 | `reroute_interval_seconds` | 0 s | 周期拥堵权重扫描间隔，0 表示关闭 |
 | `reroute_cost_ratio` | 1.25 | 相对上次发布权重的显著变化倍率 |
 | `deadlock_probe_ticks` | 300 | 连续无移动 tick 的死锁阈值 |
@@ -85,7 +85,7 @@ capacity[e] = max(1, floor(length_m[e] / jam_spacing_m) × lane_count[e])
 
 ```text
 density_ratio = (occupancy[e] - 1) / capacity[e]
-v_eff = free_speed[e] × clamp(1 - density_ratio, 0.15, 1.0)
+v_eff = free_speed[e] × clamp(1 - density_ratio, min_speed_ratio, 1.0)
 ```
 
 入口和跨边准入要求：
@@ -417,12 +417,17 @@ reset
 - close 在边界取消并 join 工作线程，保留带 `stats.cancelled=true` 的部分 `SimulationResult` 供审计。
 - `barrier_wait_ms` 单独记录墙上等待，`compute_ms` 只保留初始化与真实仿真计算时间。
 
-当前 Session 仍是进程内 C++ API，尚未暴露常驻 CLI/gRPC；Observation 暂时只有 tick、仿真时间、版本和生命周期状态，车辆/道路聚合及动态动作提交属于下一切片。
+Session 已通过 `zeus-map session-worker <map.zmap>` 常驻进程边界暴露（stdin/stdout tab 帧，`ZEUS_SESSION_WORKER`/`ZEUS_SESSION_RESPONSE` 协议，与 route-worker 同风格）：
+`reset/observe/agent-observe/plan/commit/keep/step/step_event/resume/run-to-end/pause/snapshot/restore/drop-snapshot/result/close/shutdown`。`resume` 启动自由运行后立即返回，使串行帧通道仍能处理 pause/observe 和同地图的其他会话；同步 `run-to-end` 保留给 CLI/测试调用。
+引擎在每个已提交边界发布 `TickSnapshot`（热边状态、agent 车辆位置/路线/ETA、decision_due 及原因），
+`step_event` 推进到决策事件（agent 路线失效或周期扫描）后暂停；`commit` 在下一 tick 边界从车辆实时位置确定性重规划并换路，`keep` 是版本校验的确认。
+Go 控制面以 `SessionWorkerManager` 复用 worker 进程，`/api/maps/{id}/agent/sessions/*` 端点驱动请求式决策环，并与 `DecisionCoordinator` 的 state version/TTL 校验对接。动作先由 C++ 权威环境确认，再原子关闭 Go 决策屏障；Worker 拒绝时屏障保持可重试。墙上超时会实际提交版本校验的 keep fallback，Session 在活动决策解决前禁止继续 step。
+进程内 Snapshot/Restore 已通过确定性重放实现：暂停边界记录配置、需求、控制、信号、目标 tick 和 Agent 动作日志，恢复时创建独立 Session 并在原 tick 重放动作；该实现支持同 Worker 生命周期内分叉，但尚不跨 Worker 重启持久化。进程内 BARRIER 阻塞模式仍未实现。
 
 ## 16. 已知简化
 
 1. 已支持显式转向级信号相位、独立饱和流率和节点整体开/闭；尚未自动推导冲突区、从转向车道数计算流率或生成信号配时。
-2. 路段内所有车辆在同 tick 使用同一密度快照；出口间隔是边级汇总门控，不做逐车道车头时距和排队位置细分。
+2. 路段内所有车辆在同 tick 使用同一密度快照；出口间隔是边级汇总门控，不做逐车道车头时距和排队位置细分。移动阶段按（当前边，offset 降序，id）排序处理，同 tick 内跨多条边的次序仍是近似。
 3. 封闭、限速、降容和显著拥堵会触发受影响车辆重规划；替代道路恢复或代价下降目前不会主动扫描所有车辆并吸回原路。
 4. 单 OD 在闭环或容量组合下仍可能死锁，由 300 tick 探测器提前结束并显式标记。
 5. 当前控制是运行前提交的确定性时间线，Go API 同步运行并内联完整回放；不适合十万车交互式长时域任务或运行中人工接管。
@@ -430,13 +435,12 @@ reset
 
 ## 17. 后续优先级
 
-1. 为已实现的 C++ `SimulationSession` 增加常驻 session-worker/gRPC 边界，并补齐 until-event、snapshot、restore 和车辆/道路聚合 Observation。
-2. 将已定义的 Observation、Action、Tool 与 DecisionTrace Protobuf 接入 Session，并把 Go `DecisionCoordinator` 的 state version/TTL 校验连接到 C++ 当前状态。
+1. 将进程内重放快照扩展为带版本、校验和与地图哈希的持久化文件，并增加 gRPC 边界与 worker 内阻塞式 BARRIER 决策模式（当前为请求驱动异步环）。
+2. Observation、Action、Tool 与 DecisionTrace 的 Protobuf 生成代码接入（协议已定义，帧协议先行）。
 3. 增加路线稳定性窗口、重规划冷却时间，并支持替代道路恢复后的受控全局收益扫描；规则策略作为 Navigation Agent 的确定性回归基线。
-4. 仿真任务异步化，增加暂停、单步、取消和持久化 run。
-5. Protobuf/WebSocket 降采样实时帧与分块回放文件。
-6. 在转向级信号相位上增加冲突组、车道数驱动的流率推导、自动配时和更可靠的车道方向解析。
-7. 1 万、5 万、10 万车辆的 Release 基准、内存剖析和分区并行，并增加事件聚合与 Agent 唤醒预算。
-8. 多 OD/OD 矩阵、需求曲线和场景版本。
+4. Protobuf/WebSocket 降采样实时帧与分块回放文件。
+5. 在转向级信号相位上增加冲突组、车道数驱动的流率推导、自动配时和更可靠的车道方向解析。
+6. 1 万、5 万、10 万车辆的 Release 基准、内存剖析和分区并行，并增加事件聚合与 Agent 唤醒预算。
+7. 多 OD/OD 矩阵、需求曲线和场景版本。
 
 Agent 层设计与分阶段计划见 [geospatial-agent-environment.md](geospatial-agent-environment.md)。

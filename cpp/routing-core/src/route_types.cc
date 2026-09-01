@@ -1,10 +1,25 @@
 #include "zeus/routing/route_types.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <string>
 
 namespace zeus::routing {
+namespace {
+
+constexpr std::array<AlgorithmCapability, 4> kCapabilities = {{
+    {Algorithm::kDijkstra, "1", "forward", true, false, false, false,
+     true, true, false},
+    {Algorithm::kAStar, "1", "forward", true, false, false, false,
+     true, true, true},
+    {Algorithm::kBidirectionalDijkstra, "1", "bidirectional", true, false,
+     false, false, true, true, false},
+    {Algorithm::kBidirectionalAStar, "1", "bidirectional", true, false,
+     false, false, true, true, true},
+}};
+
+}  // namespace
 
 const char* algorithmName(Algorithm algorithm) {
     switch (algorithm) {
@@ -49,6 +64,19 @@ bool parseAlgorithm(const std::string& value, Algorithm& algorithm) {
 bool isBidirectional(Algorithm algorithm) {
     return algorithm == Algorithm::kBidirectionalDijkstra ||
            algorithm == Algorithm::kBidirectionalAStar;
+}
+
+std::span<const AlgorithmCapability> algorithmCapabilities() {
+    return kCapabilities;
+}
+
+const AlgorithmCapability* algorithmCapability(Algorithm algorithm) {
+    const auto found = std::find_if(
+        kCapabilities.begin(), kCapabilities.end(),
+        [algorithm](const AlgorithmCapability& capability) {
+            return capability.algorithm == algorithm;
+        });
+    return found == kCapabilities.end() ? nullptr : &*found;
 }
 
 const char* routeFailureName(RouteFailure failure) {

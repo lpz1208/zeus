@@ -192,6 +192,35 @@ void runStatefulSessionCancellationTest() {
     require(rejected, "closed session rejects further stepping");
 }
 
+void runStatefulSessionResumePauseTest() {
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(1000000.0, 0.0);
+    fixture.addEdge(n0, n1, 1.0);
+
+    SimSetup setup(fixture.data);
+    const std::vector<zeus::simulation::VehicleDemand> demands = {
+        demand(0.0, 0.5, 1000000.0, 0.5),
+    };
+    zeus::simulation::SimulationSession session(
+        *setup.engine, quickConfig(1000000.0), demands);
+    const zeus::simulation::SimulationSessionState initial = session.reset();
+    const zeus::simulation::SimulationSessionState resumed = session.resume();
+    require(resumed.state_version == initial.state_version && !resumed.finished,
+            "resume acknowledges immediately without waiting for completion");
+    session.pause();
+
+    zeus::simulation::SimulationSessionState paused = session.observe();
+    for (int attempt = 0; attempt < 1000 && !paused.paused && !paused.finished;
+         ++attempt) {
+        usleep(1000);
+        paused = session.observe();
+    }
+    require(paused.paused && !paused.finished,
+            "pause reaches a committed boundary after non-blocking resume");
+    session.close();
+}
+
 void runSingleVehicleArrivalTest() {
     Fixture fixture;
     const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
@@ -262,9 +291,11 @@ void runCongestionSlowdownTest() {
 
     SimSetup setup(fixture.data);
     // Edge capacity is floor(100 / 7) = 14. Every vehicle sees 13 others, so
-    // the speed clamps to 15 percent from the first movement tick.
+    // the speed clamps to the pinned 15 percent floor from the first tick.
+    zeus::simulation::SimulationConfig config = quickConfig(600.0);
+    config.min_speed_ratio = 0.15;
     const zeus::simulation::SimulationResult result = setup.engine->run(
-        quickConfig(600.0), identicalFleet(14, 10.0, 0.5, 90.0, 0.5));
+        config, identicalFleet(14, 10.0, 0.5, 90.0, 0.5));
 
     require(result.ok && result.stats.arrived == 14, "congested fleet all arrives");
     require(result.stats.route_plans == 1, "identical demands share one pooled route");
@@ -280,8 +311,10 @@ void runQueueAtEntryTest() {
     fixture.addEdge(n0, n1, 20.0);
 
     SimSetup setup(fixture.data);
+    zeus::simulation::SimulationConfig config = quickConfig(600.0);
+    config.min_speed_ratio = 0.15;
     const zeus::simulation::SimulationResult result = setup.engine->run(
-        quickConfig(600.0), identicalFleet(15, 10.0, 0.5, 90.0, 0.5));
+        config, identicalFleet(15, 10.0, 0.5, 90.0, 0.5));
 
     require(result.ok && result.stats.arrived == 15, "queued fleet all arrives");
     const auto& last_vehicle = result.vehicles.back();
@@ -329,37 +362,133 @@ void runSpillbackTest() {
 }
 
 void runExitHeadwayTest() {
-    // Two vehicles drive in lockstep on one wide edge and would arrive at the
-    // same moment; the exit headway gate must stagger their arrivals.
+    // Two vehicles drive in lockstep through one boundary; the exit headway
+    // gate must stagger their crossings of the shared upstream edge.
     const auto runPair = [](double headway_ff) {
         Fixture fixture;
         const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
         const zeus::map::NodeIndex n1 = fixture.addNode(100.0, 0.0);
+        const zeus::map::NodeIndex n2 = fixture.addNode(200.0, 0.0);
         fixture.addEdge(n0, n1, 10.0);
+        const zeus::map::EdgeIndex downstream = fixture.addEdge(n1, n2, 10.0);
         SimSetup setup(fixture.data);
         zeus::simulation::SimulationConfig config = quickConfig(600.0);
         config.exit_headway_ff_s = headway_ff;
         config.exit_headway_jam_s = headway_ff;
-        return setup.engine->run(config, identicalFleet(2, 10.0, 0.5, 90.0, 0.5));
+        zeus::simulation::SimulationResult result = setup.engine->run(
+            config, identicalFleet(2, 10.0, 0.5, 190.0, 0.5));
+        struct Crossings {
+            double first = -1.0;
+            double second = -1.0;
+        };
+        Crossings crossings;
+        for (std::size_t v = 0; v < 2; ++v) {
+            for (const auto& sample : result.vehicles[v].samples) {
+                if (sample.edge == downstream && near(sample.offset_s, 0.0)) {
+                    (v == 0 ? crossings.first : crossings.second) = sample.t;
+                    break;
+                }
+            }
+        }
+        return std::pair{result, crossings};
     };
 
-    const zeus::simulation::SimulationResult unthrottled = runPair(0.0);
+    const auto [unthrottled, unthrottled_crossings] = runPair(0.0);
     require(unthrottled.ok && unthrottled.stats.arrived == 2,
             "unthrottled pair arrives");
-    require(unthrottled.vehicles[0].arrive_s > 8.0 - 1e-9 &&
-                unthrottled.vehicles[0].arrive_s < 10.0,
+    require(unthrottled_crossings.first > 8.0 - 1e-9 &&
+                unthrottled_crossings.first < 10.0,
             "unthrottled travel stays near the free-flow time");
-    require(near(unthrottled.vehicles[0].arrive_s, unthrottled.vehicles[1].arrive_s),
-            "unthrottled lockstep pair arrives together");
+    require(near(unthrottled_crossings.first, unthrottled_crossings.second, 1e-9),
+            "unthrottled lockstep pair crosses the boundary together");
 
-    const zeus::simulation::SimulationResult throttled = runPair(2.0);
+    const auto [throttled, throttled_crossings] = runPair(2.0);
     require(throttled.ok && throttled.stats.arrived == 2,
             "throttled pair arrives");
-    require(throttled.vehicles[1].arrive_s >=
-                throttled.vehicles[0].arrive_s + 2.0 - 1e-9,
+    require(throttled_crossings.second >=
+                throttled_crossings.first + 2.0 - 1e-9,
             "the second discharge waits for the headway");
     require(throttled.stats.max_travel_s > throttled.stats.min_travel_s,
             "the headway gate staggers the fleet");
+}
+
+void runArrivalExemptFromHeadwayTest() {
+    // Defaults enable the discharge headway, yet arrivals at the destination
+    // must not be gated: a lockstep pair on one edge arrives together.
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(100.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);
+
+    SimSetup setup(fixture.data);
+    const zeus::simulation::SimulationResult result = setup.engine->run(
+        quickConfig(600.0), identicalFleet(2, 10.0, 0.5, 90.0, 0.5));
+    require(result.ok && result.stats.arrived == 2, "arriving pair completes");
+    require(result.config.exit_headway_ff_s > 0.0,
+            "defaults enable the discharge headway");
+    require(near(result.vehicles[0].arrive_s, result.vehicles[1].arrive_s, 1e-9),
+            "arrivals are exempt from the discharge headway");
+}
+
+void runBoundarySlotOrderTest() {
+    // Two vehicles reach a one-slot boundary in the same tick. The physically
+    // ahead vehicle (larger offset) crosses first even though its id is
+    // higher; the older id-order behaviour let the rear vehicle grab the slot.
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(100.0, 0.0);
+    const zeus::map::NodeIndex n2 = fixture.addNode(107.0, 0.0);
+    const zeus::map::NodeIndex n3 = fixture.addNode(207.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);
+    const zeus::map::EdgeIndex bottleneck = fixture.addEdge(n1, n2, 10.0);
+    fixture.addEdge(n2, n3, 10.0);
+
+    SimSetup setup(fixture.data);
+    const std::vector<zeus::simulation::VehicleDemand> demands = {
+        demand(90.0, 0.5, 200.0, 0.5),   // id 0, physically behind
+        demand(95.0, 0.5, 200.0, 0.5),   // id 1, physically ahead
+    };
+    const zeus::simulation::SimulationResult result =
+        setup.engine->run(quickConfig(60.0), demands);
+
+    require(result.ok && result.stats.arrived == 2, "boundary fleet arrives");
+    const auto crossingTime = [&](std::size_t vehicle) {
+        for (const auto& sample : result.vehicles[vehicle].samples) {
+            if (sample.edge == bottleneck && near(sample.offset_s, 0.0)) {
+                return sample.t;
+            }
+        }
+        return -1.0;
+    };
+    require(crossingTime(1) > 0.0 && crossingTime(1) < 1.0,
+            "the physically ahead vehicle crosses the boundary first");
+    require(crossingTime(0) >= 2.0 - 1e-9,
+            "the rear vehicle queues behind the occupied slot");
+}
+
+void runMinSpeedRatioZeroCrawlTest() {
+    // Default min_speed_ratio is zero: a saturated edge slows traffic below
+    // the old 15 percent floor, and the dynamic routing factor stays finite
+    // (no divide-by-zero overlay costs) when periodic reroutes are enabled.
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(100.0, 0.0);
+    fixture.addEdge(n0, n1, 20.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::SimulationConfig config = quickConfig(600.0);
+    config.reroute_interval_seconds = 1.0;
+    const zeus::simulation::SimulationResult result = setup.engine->run(
+        config, identicalFleet(14, 10.0, 0.5, 90.0, 0.5));
+
+    require(result.ok && result.stats.arrived == 14, "crawling fleet arrives");
+    require(near(config.min_speed_ratio, 0.0), "test pins the zero default");
+    // 13 others on capacity 14: speed ratio 1/14 of free flow, well below the
+    // previous 15 percent floor, so the 80 m trip takes >= 40 s.
+    require(result.stats.max_travel_s > 40.0,
+            "saturated traffic crawls below the old 15 percent floor");
+    require(result.stats.reroute_attempts >= 0,
+            "periodic reroute scans ran without invalid overlay costs");
 }
 
 void runClosureRerouteTest() {
@@ -489,6 +618,13 @@ void runPeriodicCongestionRerouteTest() {
     auto config = quickConfig(180.0, 1.0, 5.0);
     config.reroute_interval_seconds = 1.0;
     config.reroute_cost_ratio = 1.25;
+    // This test exercises the cost-scan reroute mechanism, which needs traffic
+    // to pile up into a deep storage jam. The discharge headway defaults now
+    // meter bottlenecks instead of letting them fill, so the legacy pile-up
+    // dynamics are pinned explicitly.
+    config.min_speed_ratio = 0.15;
+    config.exit_headway_ff_s = 0.0;
+    config.exit_headway_jam_s = 0.0;
     const auto result = setup.engine->run(
         config, identicalFleet(11, 0.0, 0.5, 210.0, 0.5));
 
@@ -505,6 +641,297 @@ void runPeriodicCongestionRerouteTest() {
                     last_route.edges.end() &&
                 last_route.edges.back() == goal,
             "the queued vehicle avoids the live congested branch");
+}
+
+void runEdgeKpiTest() {
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(50.0, 0.0);
+    const zeus::map::NodeIndex n2 = fixture.addNode(100.0, 0.0);
+    const zeus::map::NodeIndex n3 = fixture.addNode(150.0, 0.0);
+    fixture.addEdge(n0, n1, 50.0);
+    fixture.addEdge(n1, n2, 50.0);
+    fixture.addEdge(n2, n3, 50.0);
+
+    SimSetup setup(fixture.data);
+    const zeus::simulation::SimulationResult result =
+        setup.engine->run(quickConfig(30.0, 1.0, 5.0), {demand(0.0, 0.5, 150.0, 0.5)});
+
+    require(result.ok && result.stats.arrived == 1, "kpi corridor vehicle arrives");
+    require(result.edge_kpis.size() == 3, "every traversed edge reports a kpi");
+    for (const zeus::simulation::EdgeKpi& kpi : result.edge_kpis) {
+        require(kpi.entries == 1, "single vehicle enters each edge once");
+        require(kpi.vehicle_seconds >= 1.0 - 1e-9,
+                "vehicle seconds cover at least the traversal time");
+        require(kpi.mean_speed_mps > 25.0 && kpi.mean_speed_mps <= 50.0 + 1e-9,
+                "empty-road mean speed stays within half of free flow");
+    }
+}
+
+void runTickSnapshotPublishTest() {
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(100.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::VehicleDemand agent = demand(10.0, 0.5, 90.0, 0.5);
+    agent.agent_controlled = true;
+    const std::vector<zeus::simulation::VehicleDemand> demands = {agent};
+    zeus::simulation::SimulationSession session(*setup.engine, quickConfig(60.0), demands);
+    const zeus::simulation::SimulationSessionState initial = session.reset();
+    const zeus::simulation::TickSnapshot zero = session.snapshot();
+    require(zero.tick == 0 && zero.agents.size() == 1 &&
+                zero.agents.front().state == zeus::simulation::VehicleState::kWaiting &&
+                zero.agents.front().remaining_edges.size() == 1,
+            "tick-zero snapshot exposes the waiting agent and its route");
+
+    const zeus::simulation::SimulationSessionState after_two = session.step(2);
+    const zeus::simulation::TickSnapshot snapshot = session.snapshot();
+    require(snapshot.tick == after_two.tick &&
+                snapshot.state_version == after_two.state_version,
+            "snapshot boundary matches the session state version");
+    require(snapshot.driving == 1 && snapshot.arrived == 0 && snapshot.waiting == 0,
+            "snapshot counts reflect the driving agent");
+    require(snapshot.agents.size() == 1 &&
+                snapshot.agents.front().state == zeus::simulation::VehicleState::kDriving &&
+                snapshot.agents.front().edge == 0 &&
+                snapshot.agents.front().offset_s > 0.0,
+            "snapshot agent carries its live position");
+    require(!snapshot.decision_due && snapshot.decision_reason.empty(),
+            "no decision is due without route changes");
+    session.close();
+}
+
+void runUntilEventRouteInvalidatedTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(100.0, 0.0);
+    const auto n2 = fixture.addNode(200.0, 0.0);
+    const auto n3 = fixture.addNode(100.0, 100.0);
+    const auto n4 = fixture.addNode(300.0, 0.0);
+    const auto first = fixture.addEdge(n0, n1, 10.0);
+    const auto blocked = fixture.addEdge(n1, n2, 10.0);
+    const auto detour_a = fixture.addEdge(n1, n3, 10.0);
+    const auto detour_b = fixture.addEdge(n3, n2, 10.0);
+    const auto goal = fixture.addEdge(n2, n4, 10.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::VehicleDemand agent = demand(10.0, 0.5, 290.0, 0.5);
+    agent.agent_controlled = true;
+    std::vector<zeus::simulation::VehicleDemand> demands = {
+        agent, demand(10.0, 0.6, 290.0, 0.6)};
+    std::vector<zeus::simulation::SimulationControlEvent> controls = {
+        {1.0, zeus::simulation::ControlScope::kEdge, blocked,
+         zeus::simulation::ControlAction::kClose, 1.0},
+    };
+    zeus::simulation::SimulationSession session(
+        *setup.engine, quickConfig(120.0), demands, controls);
+    session.reset();
+    const zeus::simulation::SimulationSessionState stopped = session.stepUntilEvent(1000);
+
+    const zeus::simulation::TickSnapshot snapshot = session.snapshot();
+    require(snapshot.decision_due && snapshot.decision_reason == "route_invalidated",
+            "closure on the agent route raises a decision event");
+    require(stopped.tick <= 1000, "until-event respects the step cap");
+    const auto& agent_state = snapshot.agents.front();
+    require(agent_state.route_invalidated,
+            "the agent slice marks its own route as invalidated");
+    require(agent_state.remaining_edges.size() == 3 &&
+                agent_state.remaining_edges[1] == blocked,
+            "agent keeps its original route until it decides");
+    (void)first;
+    (void)detour_a;
+    (void)detour_b;
+
+    session.runToEnd();
+    const zeus::simulation::SimulationResult result = session.result();
+    require(result.stats.reroute_succeeded == 1,
+            "only the non-agent vehicle reroutes automatically");
+    require(result.routes[result.vehicles[0].route_id].edges ==
+                std::vector<zeus::map::EdgeIndex>{first, blocked, goal},
+            "the agent vehicle never switches route without a commit");
+    session.close();
+}
+
+void runUntilEventPeriodicTest() {
+    Fixture fixture;
+    const zeus::map::NodeIndex n0 = fixture.addNode(0.0, 0.0);
+    const zeus::map::NodeIndex n1 = fixture.addNode(1000.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::VehicleDemand agent = demand(0.0, 0.5, 1000.0, 0.5);
+    agent.agent_controlled = true;
+    zeus::simulation::SimulationConfig config = quickConfig(200.0, 1.0, 10.0);
+    config.reroute_interval_seconds = 2.0;
+    const std::vector<zeus::simulation::VehicleDemand> demands = {agent};
+    zeus::simulation::SimulationSession session(*setup.engine, config, demands);
+    session.reset();
+    const zeus::simulation::SimulationSessionState stopped = session.stepUntilEvent(100);
+    const zeus::simulation::TickSnapshot snapshot = session.snapshot();
+    require(snapshot.decision_due && snapshot.decision_reason == "periodic",
+            "the periodic congestion scan wakes a driving agent");
+    require(stopped.tick > 0 && stopped.tick <= 100,
+            "periodic wake-up lands inside the step cap");
+    session.close();
+}
+
+void runAgentCommitRouteTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(100.0, 0.0);
+    const auto n2 = fixture.addNode(200.0, 0.0);
+    const auto n3 = fixture.addNode(100.0, 100.0);
+    const auto n4 = fixture.addNode(300.0, 0.0);
+    const auto first = fixture.addEdge(n0, n1, 10.0);
+    const auto blocked = fixture.addEdge(n1, n2, 10.0);
+    const auto detour_a = fixture.addEdge(n1, n3, 10.0);
+    const auto detour_b = fixture.addEdge(n3, n2, 10.0);
+    const auto goal = fixture.addEdge(n2, n4, 10.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::VehicleDemand agent = demand(10.0, 0.5, 290.0, 0.5);
+    agent.agent_controlled = true;
+    std::vector<zeus::simulation::SimulationControlEvent> controls = {
+        {1.0, zeus::simulation::ControlScope::kEdge, blocked,
+         zeus::simulation::ControlAction::kClose, 1.0},
+    };
+    const std::vector<zeus::simulation::VehicleDemand> demands = {agent};
+    zeus::simulation::SimulationSession session(
+        *setup.engine, quickConfig(120.0), demands, controls);
+    session.reset();
+    session.stepUntilEvent(1000);
+    const zeus::simulation::SimulationSessionState observed = session.observe();
+
+    require(session.commitRoute(999, zeus::routing::Algorithm::kAStar,
+                                observed.state_version) ==
+                zeus::simulation::SimulationSession::CommitResult::kRejectedUnknownVehicle,
+            "commit rejects an unknown vehicle");
+    require(session.commitRoute(0, zeus::routing::Algorithm::kAStar,
+                                observed.state_version - 1) ==
+                zeus::simulation::SimulationSession::CommitResult::kRejectedStaleVersion,
+            "commit rejects a stale state version");
+    require(session.commitRoute(0, zeus::routing::Algorithm::kAStar,
+                                observed.state_version) ==
+                zeus::simulation::SimulationSession::CommitResult::kApplied,
+            "commit against the current version is queued");
+
+    session.step(1);
+    session.runToEnd();
+    const zeus::simulation::SimulationResult result = session.result();
+    require(result.stats.arrived == 1, "committed agent reaches its destination");
+    require(result.stats.reroute_attempts == 1 &&
+                result.stats.reroute_succeeded == 1,
+            "the queued injection replans exactly once");
+    require(result.routes[result.vehicles[0].route_id].edges ==
+                std::vector<zeus::map::EdgeIndex>{first, detour_a, detour_b, goal},
+            "the injected replan follows the open detour");
+    require(result.reroutes.size() == 1 && result.reroutes[0].success,
+            "the injection leaves a successful reroute record");
+    session.close();
+}
+
+void runSessionReplayForkTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(100.0, 0.0);
+    const auto n2 = fixture.addNode(200.0, 0.0);
+    const auto n3 = fixture.addNode(100.0, 100.0);
+    const auto n4 = fixture.addNode(300.0, 0.0);
+    fixture.addEdge(n0, n1, 10.0);
+    const auto blocked = fixture.addEdge(n1, n2, 10.0);
+    fixture.addEdge(n1, n3, 10.0);
+    fixture.addEdge(n3, n2, 10.0);
+    fixture.addEdge(n2, n4, 10.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::VehicleDemand agent = demand(10.0, 0.5, 290.0, 0.5);
+    agent.agent_controlled = true;
+    const std::vector<zeus::simulation::VehicleDemand> demands = {agent};
+    const std::vector<zeus::simulation::SimulationControlEvent> controls = {
+        {1.0, zeus::simulation::ControlScope::kEdge, blocked,
+         zeus::simulation::ControlAction::kClose, 1.0},
+    };
+    const auto config = quickConfig(120.0);
+
+    zeus::simulation::SimulationSession source(
+        *setup.engine, config, demands, controls);
+    static_cast<void>(source.reset());
+    const auto decision = source.stepUntilEvent(1000);
+    require(source.commitRoute(0, zeus::routing::Algorithm::kAStar,
+                               decision.state_version) ==
+                zeus::simulation::SimulationSession::CommitResult::kApplied,
+            "source fork action is accepted");
+    const auto source_state = source.step(5);
+    const auto source_snapshot = source.snapshot();
+
+    zeus::simulation::SimulationSession restored(
+        *setup.engine, config, demands, controls);
+    static_cast<void>(restored.reset());
+    const auto replay_boundary = restored.step(decision.tick);
+    require(restored.commitRoute(0, zeus::routing::Algorithm::kAStar,
+                                 replay_boundary.state_version) ==
+                zeus::simulation::SimulationSession::CommitResult::kApplied,
+            "recorded fork action replays at its original tick");
+    const auto restored_state = restored.step(source_state.tick - replay_boundary.tick);
+    const auto restored_snapshot = restored.snapshot();
+
+    require(restored_state.tick == source_state.tick &&
+                restored_snapshot.agents.size() == source_snapshot.agents.size() &&
+                restored_snapshot.driving == source_snapshot.driving &&
+                restored_snapshot.arrived == source_snapshot.arrived,
+            "deterministic replay reaches the same aggregate snapshot");
+    require(restored_snapshot.agents.front().edge ==
+                    source_snapshot.agents.front().edge &&
+                near(restored_snapshot.agents.front().offset_s,
+                     source_snapshot.agents.front().offset_s) &&
+                restored_snapshot.agents.front().remaining_edges ==
+                    source_snapshot.agents.front().remaining_edges,
+            "restored fork reproduces agent position and remaining route");
+    source.close();
+    restored.close();
+}
+
+void runAgentKeepRouteTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0.0, 0.0);
+    const auto n1 = fixture.addNode(100.0, 0.0);
+    const auto n2 = fixture.addNode(200.0, 0.0);
+    const auto first = fixture.addEdge(n0, n1, 10.0);
+    const auto blocked = fixture.addEdge(n1, n2, 10.0);
+
+    SimSetup setup(fixture.data);
+    zeus::simulation::VehicleDemand agent = demand(10.0, 0.5, 190.0, 0.5);
+    agent.agent_controlled = true;
+    std::vector<zeus::simulation::SimulationControlEvent> controls = {
+        {1.0, zeus::simulation::ControlScope::kEdge, blocked,
+         zeus::simulation::ControlAction::kClose, 1.0},
+    };
+    const std::vector<zeus::simulation::VehicleDemand> demands = {
+        agent, demand(10.0, 0.6, 90.0, 0.6, 1000.0)};
+    zeus::simulation::SimulationSession session(
+        *setup.engine, quickConfig(30.0), demands, controls);
+    session.reset();
+    session.stepUntilEvent(1000);
+    const std::uint64_t version = session.observe().state_version;
+    require(session.keepRoute(1, version) ==
+                zeus::simulation::SimulationSession::CommitResult::kRejectedNotAgent,
+            "actions cannot take control of a non-agent vehicle");
+    require(session.keepRoute(0, version) ==
+                zeus::simulation::SimulationSession::CommitResult::kApplied,
+            "keep against the current version is acknowledged");
+
+    session.runToEnd();
+    const zeus::simulation::SimulationResult result = session.result();
+    require(result.stats.arrived == 0 && result.stats.driving_at_end == 1,
+            "the kept route never crosses the closed edge");
+    require(result.stats.reroute_attempts == 0,
+            "keep does not trigger any replanning");
+    require(result.routes[result.vehicles[0].route_id].edges ==
+                std::vector<zeus::map::EdgeIndex>{first, blocked},
+            "the agent keeps its original route");
+    session.close();
 }
 
 void runDeterminismTest() {
@@ -941,6 +1368,7 @@ int main() {
     try {
         runStatefulSessionStepTest();
         runStatefulSessionCancellationTest();
+        runStatefulSessionResumePauseTest();
         runSingleVehicleArrivalTest();
         runMultiEdgeTickTest();
         runCongestionSlowdownTest();
@@ -959,6 +1387,16 @@ int main() {
         runUnroutableDemandTest();
         runExportTest();
         runExitHeadwayTest();
+        runArrivalExemptFromHeadwayTest();
+        runBoundarySlotOrderTest();
+        runMinSpeedRatioZeroCrawlTest();
+        runEdgeKpiTest();
+        runTickSnapshotPublishTest();
+        runUntilEventRouteInvalidatedTest();
+        runUntilEventPeriodicTest();
+        runAgentCommitRouteTest();
+        runSessionReplayForkTest();
+        runAgentKeepRouteTest();
         runClosureRerouteTest();
         runClosureRerouteFailureTest();
         runDynamicWeightControlRerouteTest();

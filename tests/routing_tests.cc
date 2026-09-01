@@ -599,6 +599,31 @@ void runTurnPenaltyTest() {
             "turn-aware result reports the legal detour travel time");
 }
 
+void runAlgorithmCapabilityRegistryTest() {
+    const auto capabilities = zeus::routing::algorithmCapabilities();
+    require(capabilities.size() == 4, "tool registry exposes all four algorithms");
+    for (const zeus::routing::AlgorithmCapability& capability : capabilities) {
+        require(capability.version != nullptr && capability.deterministic &&
+                    capability.exact && capability.supports_dynamic_weights &&
+                    !capability.supports_incremental_repair &&
+                    !capability.supports_k_candidates &&
+                    !capability.supports_time_dependency,
+                "baseline capability flags match implemented search semantics");
+        require(zeus::routing::algorithmCapability(capability.algorithm) == &capability,
+                "algorithm lookup returns its stable registry entry");
+    }
+    const auto* astar =
+        zeus::routing::algorithmCapability(zeus::routing::Algorithm::kAStar);
+    const auto* bidijkstra = zeus::routing::algorithmCapability(
+        zeus::routing::Algorithm::kBidirectionalDijkstra);
+    require(astar != nullptr && astar->uses_heuristic &&
+                std::string(astar->search_direction) == "forward",
+            "A* advertises forward heuristic search");
+    require(bidijkstra != nullptr && !bidijkstra->uses_heuristic &&
+                std::string(bidijkstra->search_direction) == "bidirectional",
+            "bidirectional Dijkstra advertises its search direction");
+}
+
 }  // namespace
 
 int main() {
@@ -620,6 +645,7 @@ int main() {
         runBidirectionalDeterminismTest();
         runTurnRestrictionTest();
         runTurnPenaltyTest();
+        runAlgorithmCapabilityRegistryTest();
         std::cout << "all routing tests passed\n";
         return 0;
     } catch (const std::exception& error) {

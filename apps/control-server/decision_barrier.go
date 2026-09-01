@@ -15,6 +15,7 @@ var (
 	ErrDecisionAlreadyPending    = errors.New("decision is already pending")
 	ErrDecisionNotPending        = errors.New("decision is not pending")
 	ErrDecisionAlreadyAwaited    = errors.New("decision is already being awaited")
+	ErrDecisionApplying          = errors.New("decision action is already being applied")
 	ErrDecisionAgentMismatch     = errors.New("decision agent does not match observation")
 	ErrDecisionStateMismatch     = errors.New("decision state version is stale")
 	ErrDecisionExpired           = errors.New("decision validity window has expired")
@@ -102,6 +103,10 @@ type pendingDecision struct {
 	openedAt    time.Time
 	result      chan DecisionOutcome
 	awaited     atomic.Bool
+	applying    bool
+	fallbackDue bool
+	fallbackRes DecisionResolution
+	fallbackWhy string
 }
 
 // PendingDecision is a handle returned after the barrier has been registered.
@@ -233,6 +238,19 @@ func (c *DecisionCoordinator) Submit(
 	action DecisionAction,
 	current DecisionState,
 ) error {
+	return c.SubmitWithEffect(action, current, nil)
+}
+
+// SubmitWithEffect applies an action to the authoritative environment before
+// resolving its decision barrier. A failed effect leaves the barrier pending,
+// allowing the caller to correct or retry the action. While the effect is in
+// flight, timeout/cancellation resolution is deferred so a fallback cannot be
+// committed concurrently with the accepted action.
+func (c *DecisionCoordinator) SubmitWithEffect(
+	action DecisionAction,
+	current DecisionState,
+	effect func() error,
+) error {
 	if err := validateDecisionAction(action); err != nil {
 		return err
 	}
@@ -241,20 +259,27 @@ func (c *DecisionCoordinator) Submit(
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrDecisionCoordinatorClosed
 	}
 	pending, exists := c.pending[action.DecisionID]
 	if !exists {
+		c.mu.Unlock()
 		return ErrDecisionNotPending
+	}
+	if pending.applying {
+		c.mu.Unlock()
+		return ErrDecisionApplying
 	}
 	observation := pending.observation
 	if action.AgentID != observation.AgentID {
+		c.mu.Unlock()
 		return ErrDecisionAgentMismatch
 	}
 	if action.BasedOnStateVersion != observation.StateVersion ||
 		current.StateVersion != observation.StateVersion {
+		c.mu.Unlock()
 		return ErrDecisionStateMismatch
 	}
 	validUntil := math.Min(
@@ -262,7 +287,30 @@ func (c *DecisionCoordinator) Submit(
 		action.ValidUntilSimulationTime,
 	)
 	if current.SimulationTimeSeconds > validUntil+1e-9 {
+		c.mu.Unlock()
 		return ErrDecisionExpired
+	}
+	pending.applying = true
+	c.mu.Unlock()
+
+	var effectErr error
+	if effect != nil {
+		effectErr = effect()
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	currentPending, exists := c.pending[action.DecisionID]
+	if !exists || currentPending != pending {
+		return ErrDecisionNotPending
+	}
+	pending.applying = false
+	if effectErr != nil {
+		if pending.fallbackDue {
+			c.resolveFallbackLocked(
+				pending, pending.fallbackRes, pending.fallbackWhy)
+		}
+		return effectErr
 	}
 
 	delete(c.pending, action.DecisionID)
@@ -288,6 +336,21 @@ func (c *DecisionCoordinator) resolveFallback(
 	if !exists || current != pending {
 		return false
 	}
+	if pending.applying {
+		pending.fallbackDue = true
+		pending.fallbackRes = resolution
+		pending.fallbackWhy = reason
+		return true
+	}
+	c.resolveFallbackLocked(pending, resolution, reason)
+	return true
+}
+
+func (c *DecisionCoordinator) resolveFallbackLocked(
+	pending *pendingDecision,
+	resolution DecisionResolution,
+	reason string,
+) {
 	delete(c.pending, pending.observation.DecisionID)
 	pending.result <- DecisionOutcome{
 		Observation:  pending.observation,
@@ -298,7 +361,6 @@ func (c *DecisionCoordinator) resolveFallback(
 		OpenedAt:     pending.openedAt,
 		ResolvedAt:   c.clock(),
 	}
-	return true
 }
 
 func (c *DecisionCoordinator) PendingCount() int {

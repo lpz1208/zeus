@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numbers>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -267,6 +268,67 @@ void removeOrphanNodes(MapData& map) {
     map.nodes = std::move(compacted);
 }
 
+// Generated intersection-delay penalties, calibrated after SUMO's turnaround
+// penalty (5 s) and minor-link penalty (1.5 s per internal lane, aggregated
+// here into one approach value). Only penalized movements become explicit
+// transitions; straight and same-class turns stay implicit zero cost.
+constexpr float kUturnPenaltyS = 5.0F;
+constexpr float kSharpLeftPenaltyS = 2.0F;
+constexpr float kMinorToMajorPenaltyS = 3.0F;
+constexpr double kSharpTurnRad = 100.0 * std::numbers::pi / 180.0;
+constexpr int kMinorRankFloor = 4;
+constexpr int kMajorRankCeiling = 2;
+
+// Ranks mirror the drivable class set of the OSM preprocessor; lower is more
+// major. Unknown classes rank with residential-style minor roads.
+int roadClassRank(const std::string& road_class) {
+    static const std::unordered_map<std::string, int> ranks = {
+        {"motorway", 1},        {"motorway_link", 1}, {"trunk", 1},
+        {"trunk_link", 1},      {"primary", 2},       {"primary_link", 2},
+        {"secondary", 3},       {"secondary_link", 3},
+        {"tertiary", 4},        {"tertiary_link", 4},
+        {"unclassified", 5},    {"residential", 5},   {"road", 5},
+        {"living_street", 5},   {"service", 6},       {"track", 6},
+    };
+    const auto found = ranks.find(road_class);
+    return found == ranks.end() ? 5 : found->second;
+}
+
+double normalizeAngle(double angle) {
+    while (angle > std::numbers::pi) {
+        angle -= 2.0 * std::numbers::pi;
+    }
+    while (angle <= -std::numbers::pi) {
+        angle += 2.0 * std::numbers::pi;
+    }
+    return angle;
+}
+
+// Heading of an edge's first or last directed geometry segment, mirroring the
+// directed-segment walking in MapRuntime::worldPose. Nullopt for degenerate
+// segments; the caller then treats the turn angle as unknown.
+std::optional<double> segmentHeading(
+    const MapData& map, const DirectedEdge& edge, bool last_segment) {
+    if (edge.geometry_count < 2) {
+        return std::nullopt;
+    }
+    const std::uint32_t count = edge.geometry_count;
+    const std::uint32_t a_offset =
+        last_segment ? (edge.geometry_reversed ? 1 : count - 2)
+                     : (edge.geometry_reversed ? count - 1 : 0);
+    const std::uint32_t b_offset =
+        last_segment ? (edge.geometry_reversed ? 0 : count - 1)
+                     : (edge.geometry_reversed ? count - 2 : 1);
+    const Point2d a = map.geometry_points[edge.geometry_offset + a_offset];
+    const Point2d b = map.geometry_points[edge.geometry_offset + b_offset];
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    if (std::hypot(dx, dy) <= 1e-9) {
+        return std::nullopt;
+    }
+    return std::atan2(dy, dx);
+}
+
 void buildTurnTransitions(BuildResult& result, const ImportedRoads& imported) {
     std::unordered_map<std::uint64_t, std::size_t> transition_by_pair;
     const auto addTransition = [&](EdgeIndex from, EdgeIndex to, bool prohibited,
@@ -403,6 +465,50 @@ void buildTurnTransitions(BuildResult& result, const ImportedRoads& imported) {
                 addTransition(
                     from, to, source.kind == SourceTurnKind::kNo,
                     source.kind == SourceTurnKind::kPenalty ? source.penalty_s : 0.0F);
+            }
+        }
+    }
+
+    // Generated junction penalties. Emitted only for penalized movements so
+    // the transition table stays proportional to real intersection delay;
+    // addTransition max-merges with sidecar entries without summing.
+    std::vector<std::vector<EdgeIndex>> incoming_by_node(result.map.nodes.size());
+    for (std::size_t i = 0; i < result.map.edges.size(); ++i) {
+        const DirectedEdge& edge = result.map.edges[i];
+        if (edge.to < incoming_by_node.size()) {
+            incoming_by_node[edge.to].push_back(static_cast<EdgeIndex>(i));
+        }
+    }
+    for (std::size_t node = 0; node < result.map.nodes.size(); ++node) {
+        for (const EdgeIndex from : incoming_by_node[node]) {
+            const DirectedEdge& from_edge = result.map.edges[from];
+            const std::optional<double> incoming_heading =
+                segmentHeading(result.map, from_edge, true);
+            for (const EdgeIndex to : outgoing_by_node[node]) {
+                const DirectedEdge& to_edge = result.map.edges[to];
+                float penalty = 0.0F;
+                if (to_edge.road_id == from_edge.road_id &&
+                    to_edge.from == from_edge.to && to_edge.to == from_edge.from) {
+                    // U-turn onto the opposite twin of the same road piece.
+                    penalty = kUturnPenaltyS;
+                } else {
+                    if (incoming_heading.has_value()) {
+                        const std::optional<double> outgoing_heading =
+                            segmentHeading(result.map, to_edge, false);
+                        if (outgoing_heading.has_value() &&
+                            normalizeAngle(*outgoing_heading - *incoming_heading) >=
+                                kSharpTurnRad) {
+                            penalty = std::max(penalty, kSharpLeftPenaltyS);
+                        }
+                    }
+                    if (roadClassRank(from_edge.road_class) >= kMinorRankFloor &&
+                        roadClassRank(to_edge.road_class) <= kMajorRankCeiling) {
+                        penalty = std::max(penalty, kMinorToMajorPenaltyS);
+                    }
+                }
+                if (penalty > 0.0F) {
+                    addTransition(from, to, false, penalty);
+                }
             }
         }
     }
