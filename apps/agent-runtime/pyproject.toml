@@ -1,0 +1,24 @@
+[project]
+name = "zeus-agent"
+version = "0.1.0"
+description = "Zeus A2 single navigation agent runtime (HTTP transport)"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "langgraph>=0.2",
+    "langgraph-checkpoint-sqlite>=3.0",
+    "pydantic>=2.7",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zeus_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

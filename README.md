@@ -2,7 +2,7 @@
 
 Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。当前仓库已完成作为 Agent Environment 基础的地图引擎、四算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线，按车辆、道路和路口编排控制事件，配置转向级信号相位与独立饱和放行率，运行多车仿真并通过时间滑块回放车辆轨迹。封路、限速、降容和可选的周期拥堵扫描会更新动态路由权重并重规划受影响车辆，路段还可配置密度插值的出口放行间隔。
 
-下一阶段将把同步仿真演进为有状态 Environment，让 Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A*、双向搜索以及后续 D* Lite、K 最短路和时间依赖路由作为 Tools 动态选择，并通过可校验的 Action 提交路线。LLM 不替代路径算法，也不进入逐 tick 热路径。
+平台已经把同步仿真演进为有状态 Environment：Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A* 和双向搜索作为 Tools 动态选择，并通过带状态版本的 Action 提交路线。LLM 不替代路径算法，也不进入逐 tick 热路径；D* Lite、K 最短路和时间依赖路由仍在后续计划中。
 
 ## 快速启动
 
@@ -61,6 +61,37 @@ printf 'reset\ts1\t900\t1\t30\t1.4\t2.0\t0\t1.25\t0\tod.csv\t\t\nstep_event\ts1\
 ```
 
 HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v1` 四算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界还可创建进程内快照，并通过确定性动作重放恢复成独立 Session，用于实验分叉；跨 Worker 重启的持久化快照仍在后续计划中。
+
+`apps/agent-runtime` 提供 A2 单导航智能体闭环（Python，uv 管理）：`EnvironmentClient` HTTP 传输抽象、`RulePolicy` 确定性基线、LangGraph 八节点主决策图（纯循环仅作故障兜底）、Action Guard、Gymnasium 风格适配器，以及严格 JSON 输出的 Chat Completions 兼容 `ModelProvider`。模型只能选择环境签发的 `candidateId`，失败时确定性降级为规则策略。运行时支持 SQLite Checkpointer、稳定 `thread_id` 中断/恢复，以及可查询的 Observation→Tools→Decision→Guard→Action DecisionTrace。`make agent-runtime-test` 跑单测；起服务后 `make agent-runtime-e2e` 在真实地图上验证封路→失效→重规划→到达全链路。
+
+默认 CLI 使用 LangGraph + 规则基线；接兼容模型服务时只从环境变量读取密钥：
+
+```bash
+export ZEUS_MODEL_API_KEY='...'
+export ZEUS_MODEL='your-model-id'
+export ZEUS_MODEL_BASE_URL='https://provider.example/v1'
+cd apps/agent-runtime
+uv run python -m zeus_agent.run --map-id <map-id> --provider openai-compatible
+```
+
+需要把快速仿真与慢速推理解耦时，可在确定性节点边界持久化并稍后恢复；恢复不会重新创建环境 Session，也不会重放已执行动作：
+
+```bash
+uv run python -m zeus_agent.run --map-id <id> \
+  --checkpoint-db .runs/checkpoints.sqlite \
+  --trace-db .runs/traces.sqlite \
+  --thread-id experiment-01 --interrupt-after observe
+
+uv run python -m zeus_agent.run --map-id <id> \
+  --checkpoint-db .runs/checkpoints.sqlite \
+  --trace-db .runs/traces.sqlite \
+  --thread-id experiment-01 --resume
+
+uv run python -m zeus_agent.trace \
+  --db .runs/traces.sqlite --thread-id experiment-01 --node decide
+```
+
+这里持久化的是 Agent 图状态；当前环境 Session 仍由常驻 C++ Worker 持有，因此跨 Worker 重启恢复还需要后续的环境快照文件。
 
 ## OSM 转向限制
 

@@ -108,11 +108,11 @@ Observe → Trigger → Decide → Tool Call → Guard → Commit → Step → O
 
 ### 5.2 模型接入：独立 ModelProvider
 
-Agent Runtime 只依赖内部接口：
+Agent Runtime 只依赖内部接口（v1 同步签名，与同步 HTTP 客户端及普通 LangGraph 节点一致，异步化随传输层替换一并处理）：
 
 ```python
 class ModelProvider(Protocol):
-    async def decide(self, request: DecisionRequest) -> DecisionResponse: ...
+    def decide(self, request: DecisionRequest) -> DecisionResponse: ...
 ```
 
 首个实现可以使用 OpenAI Responses API，也可以增加本地模型或其他兼容供应商。Observation、Action 和 Tool Schema 使用 Zeus 自己的 Pydantic/Protobuf 模型，不直接使用某个供应商的消息类型。
@@ -373,7 +373,7 @@ latency / token usage / failure and fallback
 
 ## 12. 分阶段实施计划
 
-### 当前落地状态（2026-09-01）
+### 当前落地状态（2026-09-02）
 
 - `zeus-map session-worker <map.zmap>` 常驻进程已实现：stdin/stdout tab 帧协议（`ZEUS_SESSION_WORKER`/`ZEUS_SESSION_RESPONSE`），命令覆盖 reset、observe、agent-observe、plan、commit、keep、step、step_event、resume、run-to-end、pause、snapshot、restore、drop-snapshot、result、close、shutdown；一个进程按 session_id 承载多张会话。`resume` 非阻塞启动引擎线程，允许同一命令通道继续处理 pause/observe 和其他会话。
 - 引擎在每个已提交 tick 边界发布 `TickSnapshot`：热边（占用/容量/封闭/速度与路由代价因子/均速）、agent 车辆切片（位置、路线、ETA、路线失效标记）、决策事件与原因；`step_event` 推进至 agent 路线失效或周期扫描事件后暂停。单车 Observation 通过地图空间索引筛选车辆 2 km 内最多 64 条热边，不再按全局热边顺序截断。
@@ -382,7 +382,16 @@ latency / token usage / failure and fallback
 - 第一版进程内 Snapshot/Restore 已实现：只允许在暂停或完成边界创建快照，保存配置、需求、控制、信号、目标 tick 和已接受的 commit/keep 动作日志；restore 通过确定性重放创建独立 Session，可用于同一 Worker 生命周期内的实验分叉。Go 已提供创建、恢复和删除快照端点；恢复到决策边界时会为新 Session 打开独立 Decision Barrier。
 - 四算法 Tool Registry 已实现：C++ `algorithmCapabilities()` 是能力元数据的唯一来源，`session-worker tools` 与 `GET /api/maps/{id}/agent/tools` 暴露 registry version、算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性和精确性声明；单车 Observation 同步携带该能力列表。
 - 同步落地保真度修复：出口放行间隔默认 1.4/2.0 s 且到达免闸、min_speed_ratio 默认 0（饱和路段真停，含动态代价除零保护）、移动序按队列序放行、per-edge KPI（entries/vehicle_seconds/mean_speed，playback 导出）、建图期自动生成转向罚时（U-turn 5 s、急左转 2 s、支路进干路 3 s，max-merge sidecar）。
-- 尚未实现：跨 Worker 重启的持久化快照文件、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码接入、gRPC 边界、Python agent-runtime。
+- A2 单导航智能体最小闭环已交付（apps/agent-runtime，uv + LangGraph + httpx + pydantic）：
+  - `EnvironmentClient` Protocol + HTTP 实现（传输抽象；HTTP-first 是 A2 的明确决策，目标 gRPC 边界未放弃）；
+  - `RulePolicy` 确定性回归基线（无有效候选→keep；路线失效→commit 最优；改进 ≥10% 才 commit；timeS→lengthM→candidateId 确定性排序）与 `MockModelProvider`（按触发词脚本或包装 RulePolicy）；
+  - 决策图八节点 advance→observe→select_tools→plan→compare→decide→guard→act：LangGraph `StateGraph` 是默认执行器，`run_nodes()` 仅作为依赖损坏时的确定性故障兜底；`run_episode(use_langgraph=...)` 已真实选择执行路径，不再忽略参数；
+  - `ModelProvider` 已真正接入 decide 节点；提供严格 JSON 输出的 Chat Completions 兼容 HTTP 适配器，Observation prompt 有长度预算，模型只能选择环境签发的候选，记录模型名、延迟、输入/输出 token 与简短 rationale；传输、结构或候选校验失败时用 `RulePolicy` 解开屏障；
+  - LangGraph SQLite Checkpointer 已接入稳定 `thread_id`：可在任一确定性节点后中断，并用同一图线程从下一节点恢复；恢复不重新创建环境 Session，也不重复执行已完成节点。`zeus_runs` 和 `zeus_decision_traces` 独立记录运行状态与逐节点写入，覆盖 Observation、候选工具、模型决策、Guard、Action、仿真 tick/state_version、延迟和 token 指标；`python -m zeus_agent.trace` 支持按线程和节点查询 JSON；
+  - Action Guard：候选 ok、basedOnStateVersion 与观察版本一致、改进比 ≥10%（路线失效豁免改进与冷却检查）、提交冷却仅在自愿切换之间生效；提交失败确定性 fallback 为 keep_route；
+  - Gymnasium 风格 `ZeusEnv`（reset/step，reward=ETA 减少量，惰性接入 gymnasium）与 `python -m zeus_agent.run` CLI；
+  - 39 个单元测试（httpx.MockTransport 脚本化假环境，含 409→fallback、模型非法候选/非法 JSON、模型失败规则降级、LangGraph 与显式纯循环路径、SQLite 节点中断→跨调用恢复且不重复 Session/动作、DecisionTrace 去重与 thread_id 防碰撞）；e2e 封路场景在真实武汉地图通过：252 边路线 t=1517s 封中段边 → observe 后持久化中断 → 重新打开 SQLite 恢复 → 四算法比较 → commit → 4567 tick 到达，78 次决策、约 5.5s 墙钟，审计链完整。
+- 尚未实现：跨 Worker 重启的持久化环境快照文件（当前 Checkpointer 只恢复 Agent 图，要求原 Session 仍存活）、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码/gRPC 接入、生产模型供应商的在线验收与密钥管理、A*/动态算法/Navigation Agent 批量对照实验、K 最短路（比较器已算法无关）。
 
 ### 2026-08-30 之前的状态（历史）
 

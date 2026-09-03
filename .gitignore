@@ -5,5 +5,10 @@
 /apps/web/dist/
 /apps/web/tsconfig.tsbuildinfo
 /apps/control-server/control-server
+/apps/agent-runtime/.venv/
+/apps/agent-runtime/.pytest_cache/
+/apps/agent-runtime/.runs/
+**/__pycache__/
+*.py[cod]
 *.zmap
 .DS_Store
