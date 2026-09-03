@@ -164,7 +164,13 @@ public:
         condition_.notify_all();
         condition_.wait(lock, [this, target_tick] {
             return state_.finished || worker_error_ != nullptr ||
-                   event_reached_ ||
+                   // publishTickState observes the committed event before the
+                   // engine enters the following waitForTick boundary. Do not
+                   // return merely because the event flag was published: the
+                   // authoritative state version must first advance to the
+                   // same snapshot tick and the worker must actually pause.
+                   (event_reached_ && state_.paused && snapshot_.has_value() &&
+                    state_.tick >= snapshot_->tick) ||
                    (state_.paused && state_.tick >= target_tick);
         });
         step_until_event_ = false;

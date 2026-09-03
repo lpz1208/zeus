@@ -1,4 +1,16 @@
 import type {
+  AgentActionRequest,
+  AgentSessionCreated,
+  AgentActionResult,
+  AgentRouteCandidate,
+  AgentSessionObservation,
+  AgentSessionRequest,
+  AgentSessionState,
+  AgentSnapshot,
+  AgentSnapshotRestore,
+  AgentStepResponse,
+  AgentToolRegistry,
+  AgentVehicleObservation,
   ImportJob,
   InspectResult,
   IssueGeoJSON,
@@ -168,6 +180,97 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+    })
+  },
+
+  getAgentTools(mapId: string): Promise<AgentToolRegistry> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/tools`)
+  },
+
+  createAgentSession(mapId: string, payload: AgentSessionRequest): Promise<AgentSessionCreated> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  },
+
+  observeAgentSession(mapId: string, sessionId: string): Promise<AgentSessionObservation> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}`)
+  },
+
+  observeAgentVehicle(
+    mapId: string,
+    sessionId: string,
+    vehicleId: number,
+  ): Promise<AgentVehicleObservation> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/agent/${vehicleId}`)
+  },
+
+  planAgentRoute(
+    mapId: string,
+    sessionId: string,
+    vehicleId: number,
+    algorithm: string,
+  ): Promise<AgentRouteCandidate> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vehicleId, algorithm }),
+    })
+  },
+
+  stepAgentSession(
+    mapId: string,
+    sessionId: string,
+    payload: { ticks?: number; untilEvent?: boolean; maxTicks?: number },
+  ): Promise<AgentStepResponse> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/step`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  },
+
+  submitAgentAction(
+    mapId: string,
+    sessionId: string,
+    payload: AgentActionRequest,
+  ): Promise<AgentActionResult> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/actions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  },
+
+  pauseAgentSession(mapId: string, sessionId: string): Promise<AgentSessionState> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/pause`, {
+      method: 'POST',
+    })
+  },
+
+  createAgentSnapshot(mapId: string, sessionId: string): Promise<AgentSnapshot> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/snapshots`, {
+      method: 'POST',
+    })
+  },
+
+  restoreAgentSnapshot(mapId: string, snapshotId: string): Promise<AgentSnapshotRestore> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/snapshots/${encodeURIComponent(snapshotId)}/restore`, {
+      method: 'POST',
+    })
+  },
+
+  deleteAgentSnapshot(mapId: string, snapshotId: string): Promise<void> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/snapshots/${encodeURIComponent(snapshotId)}`, {
+      method: 'DELETE',
+    })
+  },
+
+  closeAgentSession(mapId: string, sessionId: string): Promise<void> {
+    return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
     })
   },
 }

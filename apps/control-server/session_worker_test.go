@@ -172,6 +172,11 @@ func newAgentSessionTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
 	executable, logPath := createFakeSessionWorker(t)
 	dataDir := t.TempDir()
+	return newAgentSessionServer(t, dataDir, executable), logPath
+}
+
+func newAgentSessionServer(t *testing.T, dataDir, executable string) *Server {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Join(dataDir, "maps", "m1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +190,11 @@ func newAgentSessionTestServer(t *testing.T) (*Server, string) {
 		DataDir: dataDir, WebDir: t.TempDir(), ZeusMap: executable,
 		CmdLimit: 2 * time.Second, SessionWorkerMaps: 2,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return server, logPath
+	if err := server.ensureDirectories(); err != nil {
+		server.Close()
+		t.Fatal(err)
+	}
+	return server
 }
 
 func agentSessionRequest(
@@ -419,6 +428,14 @@ func TestAgentSessionSnapshotRestoreFork(t *testing.T) {
 	if snapshotID == "" {
 		t.Fatalf("snapshot response missing id: %v", snapshot)
 	}
+	if snapshot["storage"] != "durable_replay_v1" {
+		t.Fatalf("snapshot was not persisted: %v", snapshot)
+	}
+	snapshotPath := filepath.Join(
+		server.config.DataDir, "agent-snapshots", snapshotID+".json")
+	if _, err := os.Stat(snapshotPath); err != nil {
+		t.Fatalf("durable snapshot file missing: %v", err)
+	}
 	status, restored := agentSessionRequest(
 		t, server, http.MethodPost,
 		"/api/maps/m1/agent/snapshots/"+snapshotID+"/restore", "")
@@ -442,15 +459,59 @@ func TestAgentSessionSnapshotRestoreFork(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("delete snapshot failed: %d", status)
 	}
+	if _, err := os.Stat(snapshotPath); !os.IsNotExist(err) {
+		t.Fatalf("snapshot artifact still exists after delete: %v", err)
+	}
 	log := fakeSessionLog(t, logPath)
 	for _, expected := range []string{
 		"snapshot\t" + sourceID + "\t" + snapshotID,
-		"restore\t" + snapshotID + "\t" + restoredID,
+		"reset\t" + restoredID,
 		"drop-snapshot\t" + snapshotID,
 	} {
 		if !strings.Contains(log, expected) {
 			t.Fatalf("snapshot command log missing %q: %q", expected, log)
 		}
+	}
+}
+
+func TestAgentSnapshotRestoresAfterServerAndWorkerRestart(t *testing.T) {
+	executable, _ := createFakeSessionWorker(t)
+	dataDir := t.TempDir()
+	server := newAgentSessionServer(t, dataDir, executable)
+	status, created := agentSessionRequest(
+		t, server, http.MethodPost, "/api/maps/m1/agent/sessions",
+		`{"vehicles":[{"fromLon":1,"fromLat":2,"toLon":3,"toLat":4,"agent":true}],`+
+			`"durationSeconds":900,"stepSeconds":1,"sampleIntervalSeconds":15}`)
+	if status != http.StatusOK {
+		t.Fatalf("create failed: %d %v", status, created)
+	}
+	sourceID, _ := created["sessionId"].(string)
+	status, snapshot := agentSessionRequest(
+		t, server, http.MethodPost,
+		"/api/maps/m1/agent/sessions/"+sourceID+"/snapshots", "")
+	if status != http.StatusOK {
+		t.Fatalf("snapshot failed: %d %v", status, snapshot)
+	}
+	snapshotID, _ := snapshot["snapshotId"].(string)
+	server.Close() // drops both the registry and the resident worker process
+
+	restarted := newAgentSessionServer(t, dataDir, executable)
+	defer restarted.Close()
+	if _, ok := restarted.agentSessions.getSnapshot(snapshotID); ok {
+		t.Fatal("restart test requires an initially empty in-memory registry")
+	}
+	status, restored := agentSessionRequest(
+		t, restarted, http.MethodPost,
+		"/api/maps/m1/agent/snapshots/"+snapshotID+"/restore", "")
+	if status != http.StatusOK {
+		t.Fatalf("durable restore failed after restart: %d %v", status, restored)
+	}
+	if restored["storage"] != "durable_replay_v1" {
+		t.Fatalf("restore did not use durable replay: %v", restored)
+	}
+	state, _ := restored["state"].(map[string]any)
+	if state["sessionId"] == "" || state["sessionId"] == sourceID {
+		t.Fatalf("restart restore did not create a fresh session: %v", restored)
 	}
 }
 

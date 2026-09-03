@@ -1,7 +1,7 @@
 # Zeus Web 地图工作台
 
 > 状态：MVP 已实现  
-> 最后更新：2026-08-30
+> 最后更新：2026-09-01
 
 ## 1. 定位
 
@@ -43,6 +43,8 @@ React Web
 - 交通仿真：复用当前 OD 和算法，可配置车辆数、线性发车分布、时域、采样间隔、自由流/拥堵出口间隔，以及周期拥堵扫描间隔和动态权重阈值；转向信号编辑器可为地图拾取的节点编排绿灯相位、黄灯、全红、周期偏移和每转向独立饱和流率，转向使用 `fromEdge > toEdge` 表达；Go 端点同步触发 C++ 中观内核，返回统计、轨迹 GeoJSON 和回放数据。
 - 仿真回放：琥珀色轨迹叠加在路网上，车辆使用 MapLibre circle layer；时间滑块支持播放/暂停和 1×/10×/30×，每帧通过二分插值更新 source，不创建 DOM Marker。
 - 封路、限速、降容及达到阈值的实时拥堵权重会触发受影响车辆重规划；结果面板展示尝试/成功/失败数，Playback 保存逐车重规划事件并在时间控制台累计显示。
+- Agent 工作台（顶栏 AGENT 按钮进入）：地图点选 OD 创建有状态 Agent 会话，事件驱动推进到决策边界；仿真在决策屏障处冻结，决策横幅展示触发原因与状态版本，可一键比较 Tool Registry 全部算法并提交所选候选或保持路线；候选路线、当前剩余路线与起点预览在地图上联动渲染。
+- Agent 车辆实时位置：观察返回的 `edgeId + offsetM`（米）按道路要素 `EDGE_IDS`/`DIRECTION` 还原有向边几何并插值为经纬度，复用 MapCanvas 车辆圆点层渲染；观察/工具/轨迹三标签控制台展示位置、ETA、附近道路态势、环境事件、算法能力注册表和带状态版本徽章的决策轨迹；支持会话快照保存、恢复与删除。
 - 高亮最佳道路，展示 edge、road ID、offset、横向距离和置信度。
 - 没有控制服务或地图时展示合成演示路网。
 - 工作台采用白色技术地图主题：左侧集中数据与图层管理，中央保留最大地图视野，右侧将要素详情和拓扑质检收拢为两个标签页。
@@ -91,6 +93,20 @@ React Web
 | POST | `/api/maps/{id}/query` | XY 或经纬度道路匹配 |
 | POST | `/api/maps/{id}/route` | 四种基准算法路径规划，返回统计与路线 GeoJSON；吸附失败与不可达返回 200 + `ok:false` |
 | POST | `/api/maps/{id}/simulate` | 运行确定性中观仿真，返回统计、轨迹 GeoJSON 和 Playback JSON；全部不可规划返回 200 + `ok:false` |
+| GET | `/api/maps/{id}/agent/tools` | 路由算法 Tool Registry（能力元数据） |
+| POST | `/api/maps/{id}/agent/sessions` | 创建有状态 Agent 会话（OD 含 `agent` 标记、控制事件与信号） |
+| GET | `/api/maps/{id}/agent/sessions/{session}` | 会话热边观察（占用/封闭/代价因子与 agent 车辆状态） |
+| GET | `/api/maps/{id}/agent/sessions/{session}/agent/{vehicle}` | 单 agent 车辆观察（位置、ETA、剩余路线、附近道路、事件） |
+| POST | `/api/maps/{id}/agent/sessions/{session}/plan` | 用指定算法从实时位置规划候选路线 |
+| POST | `/api/maps/{id}/agent/sessions/{session}/step` | 单步或 `untilEvent` 推进；决策边界返回 `decisionId` |
+| POST | `/api/maps/{id}/agent/sessions/{session}/actions` | 提交 `commit_route`/`keep_route`（状态版本 + 仿真时间 TTL 校验） |
+| POST | `/api/maps/{id}/agent/sessions/{session}/run` | 非阻塞恢复自由运行 |
+| POST | `/api/maps/{id}/agent/sessions/{session}/pause` | 在下一边界暂停 |
+| GET | `/api/maps/{id}/agent/sessions/{session}/result` | 完成后内联轨迹与回放导出 |
+| POST | `/api/maps/{id}/agent/sessions/{session}/snapshots` | 创建会话快照 |
+| POST | `/api/maps/{id}/agent/snapshots/{snapshot}/restore` | 从快照恢复为新会话（回放已提交动作） |
+| DELETE | `/api/maps/{id}/agent/snapshots/{snapshot}` | 删除快照 |
+| DELETE | `/api/maps/{id}/agent/sessions/{session}` | 关闭会话 |
 
 上传限制为 512 MiB。每次上传必须是一个 `.geojson` / `.json` 文件，或一套同名的 `.shp`、`.shx`、`.dbf`、`.prj`（`.cpg` 可选）。接口使用 `sourceFile` 标识主数据文件；旧版 `shapefile` 请求字段仍可兼容。`POST /api/maps/import` 可携带 `osmPreprocess`，字段为 `enabled`、`includeService`、`includeTrack`、`includePrivate` 和 `minLengthMeters`。只有检查结果含精确 `highway` 字段时才允许启用。C++ 命令不经过 shell 拼接，并有执行超时。
 
@@ -172,6 +188,8 @@ data/
 - 通过 Web API 上传武汉 68,559 条 OSM 道路，检查结果自动返回 `osmRoadData:true`；异步任务在约 3.6 秒内完成清洗、148,787 条有向边编译和报告持久化，任务结果包含完整 `cleaning` 摘要。
 - 在武汉 269,060 条有向边地图上完成 100 车、900 tick、双向 A* 仿真：相同 OD 仅规划 1 次，输出 100 条轨迹和 10,142 个样本，C++ 推进约 61 ms；Web 类型检查和生产构建通过。
 - 动态路由 overlay、在途精确位置重规划、原终点保持、限速/降容/周期拥堵绕行、成功/失败统计、出口 headway 和转向级信号相位的 C++/Go/Web 类型回归通过。
+- Agent 工作台 TypeScript 类型检查与生产构建通过；组件拆分为 shell + 任务面板 + 检查器 + 决策横幅，会话状态收敛到 `useAgentSession` hook。
+- 车辆位置插值（edgeId+offsetM 按有向边几何还原）在武汉路网上冒烟验证：决策边界冻结、四算法候选比较、候选提交后车辆标记沿剩余路线移动。
 
 ## 8. 当前限制
 
@@ -189,8 +207,8 @@ data/
 
 ## 9. 下一步
 
-1. 配合有状态 `SimulationSession`，将仿真改为可暂停、单步、取消的异步 run，并接入分块回放和实时二进制帧。
-2. 增加 Agent 调试时间线，统一展示 Observation、触发原因、工具调用、候选路线、Guard 结果、算法切换、Action 和 Feedback。
+1. 会话级暂停、单步、事件推进与恢复运行已随 Agent 会话交付；剩余部分是传统批量仿真的异步 run、分块回放和实时二进制帧。
+2. Agent 调试时间线已随 Agent 工作台交付（观察/工具/Guard/动作按仿真时间记录并带状态版本徽章）；剩余部分是 LLM Reasoning Summary 展示与决策回放。
 3. 增加固定算法、规则策略、LLM 直接导航和 Navigation Agent 的同步对照视图与指标面板。
 4. 为已实现的转向级信号相位增加冲突组、从转向车道数自动推导流率、自动配时，以及替代道路恢复后的重规划冷却与收益扫描。
 5. 增加问题筛选、批量确认、修复操作及版本差异对比。

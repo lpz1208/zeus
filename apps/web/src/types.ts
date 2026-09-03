@@ -384,6 +384,8 @@ export type VehicleFrameGeoJSON = GeoJSON.FeatureCollection<
 
 export const emptyRouteGeoJSON: RouteGeoJSON = { type: 'FeatureCollection', features: [] }
 
+export const emptyVehicleFrame: VehicleFrameGeoJSON = { type: 'FeatureCollection', features: [] }
+
 export interface RoadProperties {
   ROAD_ID: string
   SOURCE_ID: string
@@ -417,3 +419,194 @@ export interface IssueProperties {
 }
 
 export type IssueGeoJSON = GeoJSON.FeatureCollection<GeoJSON.Point, IssueProperties>
+
+export interface AgentAlgorithmCapability {
+  algorithmId: RouteAlgorithm
+  algorithmVersion: string
+  supportedObjectives: string[]
+  searchDirection: string
+  supportsDynamicWeights: boolean
+  supportsIncrementalRepair: boolean
+  supportsKCandidates: boolean
+  supportsTimeDependency: boolean
+  deterministic: boolean
+  exact: boolean
+  usesHeuristic: boolean
+}
+
+export interface AgentToolRegistry {
+  registryVersion: string
+  algorithms: AgentAlgorithmCapability[]
+}
+
+export interface AgentVehicleSpec {
+  fromLon: number
+  fromLat: number
+  toLon: number
+  toLat: number
+  departSeconds: number
+  algorithm: RouteAlgorithm
+  agent: boolean
+}
+
+export interface AgentSessionRequest {
+  vehicles: AgentVehicleSpec[]
+  durationSeconds: number
+  stepSeconds: number
+  sampleIntervalSeconds: number
+  exitHeadwayFfSeconds: number
+  exitHeadwayJamSeconds: number
+  rerouteIntervalSeconds: number
+  rerouteCostRatio: number
+  minSpeedRatio: number
+  vehicleControls?: VehicleSimulationControl[]
+  roadControls?: RoadSimulationControl[]
+  junctionControls?: JunctionSimulationControl[]
+  signalPlans?: JunctionSignalPlan[]
+}
+
+// Agent session wire shapes. Authoritative sources (keep in sync):
+// - create/reset   -> tools/zeus-map/session_worker.cc commandReset
+// - step/pause hdr -> session_worker.cc writeStateHeader
+// - observe body   -> session_worker.cc writeSnapshot
+// - agent-observe  -> session_worker.cc commandAgentObserve
+// - Go mirror      -> apps/control-server/agent_sessions.go sessionStateFields
+
+/** State header shared by every session response. */
+export interface AgentSessionState {
+  tick: number
+  simulationTimeS: number
+  stateVersion: number
+  finished: boolean
+  cancelled?: boolean
+  decisionDue?: boolean
+  decisionReason?: string
+  agentVehicleIds?: number[]
+}
+
+/** Create-session (worker `reset`) response; superset of the state header. */
+export interface AgentSessionCreated extends AgentSessionState {
+  sessionId: string
+  ready?: boolean
+  paused?: boolean
+  vehicles?: number
+  /** agent-controlled vehicle indices (NOT AgentVehicleState objects) */
+  agents?: number[]
+}
+
+export interface AgentEdgeState {
+  edgeId: number
+  occupancy: number
+  capacity: number
+  closed: boolean
+  speedFactor: number
+  costFactor: number
+  meanSpeedMps: number
+}
+
+export interface AgentVehicleState {
+  vehicleId: number
+  state: string
+  edgeId: number
+  offsetM: number
+  routeId: number
+  destinationEdgeId: number
+  remainingEtaS: number
+  routeInvalidated: boolean
+  held: boolean
+  remainingEdgeIds: number[]
+}
+
+export interface AgentSessionObservation extends AgentSessionState {
+  counts: {
+    arrived: number
+    driving: number
+    waiting: number
+    unroutable: number
+  }
+  edges: AgentEdgeState[]
+  /** full agent vehicle states — present on observe responses only */
+  agents: AgentVehicleState[]
+}
+
+export interface AgentNearbyRoad {
+  edgeId: number
+  speedMps: number
+  freeFlowSpeedMps: number
+  occupancyRatio: number
+  estimatedTravelTimeS: number
+  closed: boolean
+}
+
+export interface AgentActiveEvent {
+  eventId: string
+  type: string
+  affectedEdgeIds: number[]
+}
+
+export interface AgentVehicleObservation extends AgentSessionState {
+  vehicleId: number
+  state: string
+  position: { edgeId: number; offsetM: number }
+  destinationEdgeId: number
+  remainingEtaS: number
+  routeInvalidated: boolean
+  remainingEdgeIds: number[]
+  nearbyRoads: AgentNearbyRoad[]
+  activeEvents: AgentActiveEvent[]
+  availableAlgorithms: AgentAlgorithmCapability[]
+}
+
+export interface AgentStepResponse {
+  state: AgentSessionState
+  decisionId?: string
+}
+
+export interface AgentRouteCandidate {
+  candidateId: string
+  vehicleId: number
+  algorithm: RouteAlgorithm
+  effectiveAlgorithm?: RouteAlgorithm
+  basedOnStateVersion?: number
+  ok: boolean
+  reason?: string
+  message?: string
+  timeS?: number
+  lengthM?: number
+  expandedNodes?: number
+  edges?: number[]
+}
+
+export interface AgentActionRequest {
+  decisionId: string
+  agentId: string
+  vehicleId: number
+  kind: 'keep_route' | 'commit_route'
+  candidateId?: string
+  basedOnStateVersion: number
+  validUntilSimulationTime?: number
+  reasonCode: string
+}
+
+export interface AgentActionResult {
+  accepted: boolean
+  reason: string
+  appliesAtNextTick: boolean
+}
+
+export interface AgentSnapshot {
+  snapshotId: string
+  sourceSessionId: string
+  tick: number
+  simulationTimeS: number
+  stateVersion: number
+  actionCount: number
+  storage: string
+}
+
+export interface AgentSnapshotRestore {
+  snapshotId: string
+  /** the restored session carries its new sessionId (worker restore payload) */
+  state: AgentSessionCreated
+  decisionId?: string
+}

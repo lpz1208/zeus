@@ -461,7 +461,9 @@ func (s *Server) Close() {
 }
 
 func (s *Server) ensureDirectories() error {
-	for _, directory := range []string{s.uploadsDir(), s.mapsDir(), s.referenceLayersDir()} {
+	for _, directory := range []string{
+		s.uploadsDir(), s.mapsDir(), s.referenceLayersDir(), s.agentSnapshotsDir(),
+	} {
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			return err
 		}

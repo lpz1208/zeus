@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,12 +52,34 @@ type agentSessionEntry struct {
 	runtime        string
 	stepSecond     float64
 	activeDecision string
+	request        AgentSessionRequest
 }
 
 type agentSnapshotEntry struct {
-	mapID      string
-	runtime    string
-	stepSecond float64
+	artifact agentSnapshotArtifact
+}
+
+const agentSnapshotFormatVersion = 1
+
+type agentReplayAction struct {
+	Tick      uint64 `json:"tick"`
+	VehicleID int    `json:"vehicleId"`
+	Kind      string `json:"kind"`
+	Algorithm string `json:"algorithm,omitempty"`
+}
+
+type agentSnapshotArtifact struct {
+	FormatVersion   int                 `json:"formatVersion"`
+	SnapshotID      string              `json:"snapshotId"`
+	MapID           string              `json:"mapId"`
+	SourceSessionID string              `json:"sourceSessionId"`
+	CreatedAt       time.Time           `json:"createdAt"`
+	Tick            uint64              `json:"tick"`
+	StateVersion    uint64              `json:"stateVersion"`
+	StepSecond      float64             `json:"stepSecond"`
+	DecisionPending bool                `json:"decisionPending"`
+	Request         AgentSessionRequest `json:"request"`
+	AppliedActions  []agentReplayAction `json:"appliedActions"`
 }
 
 type agentSessionRegistry struct {
@@ -129,6 +152,115 @@ func (r *agentSessionRegistry) removeSnapshot(id string) {
 	delete(r.snapshots, id)
 }
 
+func (s *Server) agentSnapshotsDir() string {
+	return filepath.Join(s.config.DataDir, "agent-snapshots")
+}
+
+func (s *Server) agentSnapshotPath(id string) (string, error) {
+	if !safeIDPattern.MatchString(id) {
+		return "", errors.New("invalid agent snapshot ID")
+	}
+	return filepath.Join(s.agentSnapshotsDir(), id+".json"), nil
+}
+
+func (s *Server) loadAgentSnapshot(id string) (agentSnapshotArtifact, error) {
+	path, err := s.agentSnapshotPath(id)
+	if err != nil {
+		return agentSnapshotArtifact{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return agentSnapshotArtifact{}, err
+	}
+	var artifact agentSnapshotArtifact
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return agentSnapshotArtifact{}, fmt.Errorf("decode agent snapshot: %w", err)
+	}
+	if artifact.FormatVersion != agentSnapshotFormatVersion ||
+		artifact.SnapshotID != id || artifact.MapID == "" {
+		return agentSnapshotArtifact{}, errors.New("invalid agent snapshot artifact")
+	}
+	return artifact, nil
+}
+
+type agentSessionResetError struct {
+	status int
+	err    error
+}
+
+func (e *agentSessionResetError) Error() string { return e.err.Error() }
+
+func (s *Server) resetAgentWorkerSession(
+	ctx context.Context,
+	record MapRecord,
+	request AgentSessionRequest,
+	sessionID string,
+) (SessionCommandResult, float64, error) {
+	odPath, err := writeAgentOdFile(&request)
+	if err != nil {
+		return SessionCommandResult{}, 0, &agentSessionResetError{
+			status: http.StatusBadRequest, err: err}
+	}
+	defer os.Remove(odPath)
+
+	config := SimulateRequest{
+		Count:            len(request.Vehicles),
+		DurationSeconds:  request.DurationSeconds,
+		StepSeconds:      request.StepSeconds,
+		VehicleControls:  request.VehicleControls,
+		RoadControls:     request.RoadControls,
+		JunctionControls: request.JunctionControls,
+		SignalPlans:      request.SignalPlans,
+	}
+	controlsPath, err := writeAgentCsvFile(
+		func() (string, error) { return buildSimulationControls(config, record.Summary) },
+		"zeus-agent-controls-*.csv")
+	if err != nil {
+		return SessionCommandResult{}, 0, &agentSessionResetError{
+			status: http.StatusBadRequest, err: err}
+	}
+	if controlsPath != "" {
+		defer os.Remove(controlsPath)
+	}
+	signalsPath, err := writeAgentCsvFile(
+		func() (string, error) { return buildSignalPlans(config, record.Summary) },
+		"zeus-agent-signals-*.csv")
+	if err != nil {
+		return SessionCommandResult{}, 0, &agentSessionResetError{
+			status: http.StatusBadRequest, err: err}
+	}
+	if signalsPath != "" {
+		defer os.Remove(signalsPath)
+	}
+
+	result, err := s.sessionWorkers.Command(
+		ctx, record.Runtime,
+		"reset", sessionID,
+		formatFloat(request.DurationSeconds),
+		formatFloat(request.StepSeconds),
+		formatFloat(request.SampleIntervalSeconds),
+		formatFloat(request.ExitHeadwayFfSeconds),
+		formatFloat(request.ExitHeadwayJamSeconds),
+		formatFloat(request.RerouteIntervalSeconds),
+		formatFloat(request.RerouteCostRatio),
+		formatFloat(request.MinSpeedRatio),
+		odPath, controlsPath, signalsPath)
+	if err != nil {
+		return SessionCommandResult{}, 0, &agentSessionResetError{
+			status: http.StatusBadGateway, err: err}
+	}
+	if result.ExitCode != 0 {
+		return SessionCommandResult{}, 0, &agentSessionResetError{
+			status: http.StatusBadRequest,
+			err:    errors.New(sessionWorkerErrorMessage(result.Payload))}
+	}
+	step := request.StepSeconds
+	if step <= 0 {
+		step = 1
+	}
+	return result, step, nil
+}
+
 // sessionStateFields mirrors the worker's state header for step responses.
 type sessionStateFields struct {
 	Tick            uint64  `json:"tick"`
@@ -140,12 +272,15 @@ type sessionStateFields struct {
 	DecisionReason  string  `json:"decisionReason"`
 	SessionID       string  `json:"sessionId,omitempty"`
 	Vehicles        int     `json:"vehicles,omitempty"`
-	Agents          []int   `json:"agents,omitempty"`
-	AgentVehicleIDs []int   `json:"agentVehicleIds,omitempty"`
-	Accepted        *bool   `json:"accepted,omitempty"`
-	Reason          string  `json:"reason,omitempty"`
-	AppliesNextTick *bool   `json:"appliesAtNextTick,omitempty"`
-	Error           string  `json:"error,omitempty"`
+	// Agents is an opaque passthrough: the create response carries agent
+	// vehicle indices while observe carries full AgentVehicleState objects,
+	// so it must never be typed as []int here.
+	Agents          json.RawMessage `json:"agents,omitempty"`
+	AgentVehicleIDs []int           `json:"agentVehicleIds,omitempty"`
+	Accepted        *bool           `json:"accepted,omitempty"`
+	Reason          string          `json:"reason,omitempty"`
+	AppliesNextTick *bool           `json:"appliesAtNextTick,omitempty"`
+	Error           string          `json:"error,omitempty"`
 }
 
 func (s *Server) agentSessionCommand(
@@ -265,70 +400,22 @@ func (s *Server) handleCreateAgentSession(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	odPath, err := writeAgentOdFile(&request)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	defer os.Remove(odPath)
-
-	config := SimulateRequest{
-		Count:            len(request.Vehicles),
-		DurationSeconds:  request.DurationSeconds,
-		StepSeconds:      request.StepSeconds,
-		VehicleControls:  request.VehicleControls,
-		RoadControls:     request.RoadControls,
-		JunctionControls: request.JunctionControls,
-		SignalPlans:      request.SignalPlans,
-	}
-	controlsPath, err := writeAgentCsvFile(
-		func() (string, error) { return buildSimulationControls(config, record.Summary) },
-		"zeus-agent-controls-*.csv")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if controlsPath != "" {
-		defer os.Remove(controlsPath)
-	}
-	signalsPath, err := writeAgentCsvFile(
-		func() (string, error) { return buildSignalPlans(config, record.Summary) },
-		"zeus-agent-signals-*.csv")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if signalsPath != "" {
-		defer os.Remove(signalsPath)
-	}
 
 	sessionID := newID("ses")
-	result, err := s.sessionWorkers.Command(
-		r.Context(), record.Runtime,
-		"reset", sessionID,
-		formatFloat(request.DurationSeconds),
-		formatFloat(request.StepSeconds),
-		formatFloat(request.SampleIntervalSeconds),
-		formatFloat(request.ExitHeadwayFfSeconds),
-		formatFloat(request.ExitHeadwayJamSeconds),
-		formatFloat(request.RerouteIntervalSeconds),
-		formatFloat(request.RerouteCostRatio),
-		formatFloat(request.MinSpeedRatio),
-		odPath, controlsPath, signalsPath)
+	result, step, err := s.resetAgentWorkerSession(
+		r.Context(), record, request, sessionID)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		var resetErr *agentSessionResetError
+		if errors.As(err, &resetErr) {
+			writeError(w, resetErr.status, resetErr.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
-	}
-	if result.ExitCode != 0 {
-		writeError(w, http.StatusBadRequest, string(result.Payload))
-		return
-	}
-	step := request.StepSeconds
-	if step <= 0 {
-		step = 1
 	}
 	s.agentSessions.add(sessionID, agentSessionEntry{
-		mapID: r.PathValue("id"), runtime: record.Runtime, stepSecond: step})
+		mapID: r.PathValue("id"), runtime: record.Runtime,
+		stepSecond: step, request: request})
 	s.logger.Info("agent session created",
 		slog.String("session", sessionID), slog.String("map", r.PathValue("id")))
 	writeJSON(w, http.StatusOK, json.RawMessage(result.Payload))
@@ -558,8 +645,12 @@ func (s *Server) openDecisionBarrier(
 		return "", err
 	}
 	agents := append([]int(nil), state.AgentVehicleIDs...)
-	if len(agents) == 0 {
-		agents = append(agents, state.Agents...)
+	if len(agents) == 0 && len(state.Agents) > 0 {
+		// Only the create/reset response lists plain vehicle indices here.
+		var ids []int
+		if json.Unmarshal(state.Agents, &ids) == nil {
+			agents = append(agents, ids...)
+		}
 	}
 	go func() {
 		defer s.agentSessions.clearDecision(sessionID, decisionID)
@@ -714,6 +805,133 @@ func (s *Server) handleAgentPause(w http.ResponseWriter, r *http.Request) {
 	s.agentSessionPassthrough(w, r, "pause", r.PathValue("session"))
 }
 
+func (s *Server) replayAgentSnapshot(
+	ctx context.Context,
+	artifact agentSnapshotArtifact,
+	sessionID string,
+) (state sessionStateFields, record MapRecord, err error) {
+	record, err = s.mapRecord(artifact.MapID)
+	if err != nil {
+		return state, record, fmt.Errorf("snapshot map is unavailable: %w", err)
+	}
+	reset, _, err := s.resetAgentWorkerSession(
+		ctx, record, artifact.Request, sessionID)
+	if err != nil {
+		return state, record, fmt.Errorf("reset snapshot session: %w", err)
+	}
+	success := false
+	defer func() {
+		if !success {
+			_, _ = s.sessionWorkers.Command(
+				context.Background(), record.Runtime, "close", sessionID)
+		}
+	}()
+	if err := json.Unmarshal(reset.Payload, &state); err != nil {
+		return state, record, errors.New("unreadable reset response during replay")
+	}
+
+	command := func(fields ...string) (json.RawMessage, error) {
+		result, commandErr := s.sessionWorkers.Command(ctx, record.Runtime, fields...)
+		if commandErr != nil {
+			return nil, commandErr
+		}
+		if result.ExitCode != 0 {
+			return nil, errors.New(sessionWorkerErrorMessage(result.Payload))
+		}
+		return result.Payload, nil
+	}
+	advanceTo := func(target uint64) error {
+		if state.Tick > target {
+			return fmt.Errorf("snapshot action tick %d precedes replay tick %d",
+				target, state.Tick)
+		}
+		if state.Tick == target {
+			return nil
+		}
+		payload, commandErr := command(
+			"step", sessionID, strconv.FormatUint(target-state.Tick, 10))
+		if commandErr != nil {
+			return commandErr
+		}
+		if err := json.Unmarshal(payload, &state); err != nil {
+			return errors.New("unreadable step response during replay")
+		}
+		if state.Tick != target {
+			return fmt.Errorf(
+				"snapshot replay reached tick %d instead of %d", state.Tick, target)
+		}
+		return nil
+	}
+
+	for _, action := range artifact.AppliedActions {
+		if action.Tick > artifact.Tick {
+			return state, record, errors.New("snapshot action is beyond target tick")
+		}
+		if err := advanceTo(action.Tick); err != nil {
+			return state, record, fmt.Errorf("advance before snapshot action: %w", err)
+		}
+		vehicle := strconv.Itoa(action.VehicleID)
+		version := strconv.FormatUint(state.StateVersion, 10)
+		var payload json.RawMessage
+		switch action.Kind {
+		case string(NavigationActionCommitRoute):
+			switch action.Algorithm {
+			case "dijkstra", "astar", "bidijkstra", "biastar":
+			default:
+				return state, record, fmt.Errorf(
+					"snapshot contains invalid algorithm %q", action.Algorithm)
+			}
+			planned, commandErr := command(
+				"plan", sessionID, vehicle, action.Algorithm)
+			if commandErr != nil {
+				return state, record, fmt.Errorf("replay plan: %w", commandErr)
+			}
+			var candidate struct {
+				CandidateID string `json:"candidateId"`
+				OK          bool   `json:"ok"`
+			}
+			if json.Unmarshal(planned, &candidate) != nil ||
+				!candidate.OK || candidate.CandidateID == "" {
+				return state, record, errors.New("snapshot replay could not reproduce route")
+			}
+			payload, err = command(
+				"commit", sessionID, vehicle, candidate.CandidateID, version)
+		case string(NavigationActionKeepRoute):
+			payload, err = command("keep", sessionID, vehicle, version)
+		default:
+			return state, record, fmt.Errorf(
+				"snapshot contains invalid action kind %q", action.Kind)
+		}
+		if err != nil {
+			return state, record, fmt.Errorf("replay action: %w", err)
+		}
+		var acknowledgement struct {
+			Accepted bool   `json:"accepted"`
+			Reason   string `json:"reason"`
+		}
+		if json.Unmarshal(payload, &acknowledgement) != nil ||
+			!acknowledgement.Accepted {
+			return state, record, fmt.Errorf(
+				"snapshot replay rejected action: %s", acknowledgement.Reason)
+		}
+	}
+	if err := advanceTo(artifact.Tick); err != nil {
+		return state, record, fmt.Errorf("advance to snapshot boundary: %w", err)
+	}
+	if state.StateVersion != artifact.StateVersion {
+		return state, record, fmt.Errorf(
+			"snapshot replay state version diverged: got %d, want %d",
+			state.StateVersion, artifact.StateVersion)
+	}
+	state.DecisionDue = artifact.DecisionPending
+	if !artifact.DecisionPending {
+		state.DecisionReason = ""
+	}
+	state.SessionID = sessionID
+	success = true
+	return state, record, nil
+}
+
 func (s *Server) handleCreateAgentSnapshot(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("session")
 	entry, ok := s.agentSessions.get(sessionID)
@@ -727,52 +945,86 @@ func (s *Server) handleCreateAgentSnapshot(w http.ResponseWriter, r *http.Reques
 	if payload == nil {
 		return
 	}
+	var workerSnapshot struct {
+		Tick           uint64              `json:"tick"`
+		StateVersion   uint64              `json:"stateVersion"`
+		AppliedActions []agentReplayAction `json:"actions"`
+	}
+	if err := json.Unmarshal(payload, &workerSnapshot); err != nil {
+		writeError(w, http.StatusBadGateway, "unreadable snapshot response")
+		return
+	}
+	artifact := agentSnapshotArtifact{
+		FormatVersion:   agentSnapshotFormatVersion,
+		SnapshotID:      snapshotID,
+		MapID:           entry.mapID,
+		SourceSessionID: sessionID,
+		CreatedAt:       time.Now().UTC(),
+		Tick:            workerSnapshot.Tick,
+		StateVersion:    workerSnapshot.StateVersion,
+		StepSecond:      entry.stepSecond,
+		DecisionPending: entry.activeDecision != "",
+		Request:         entry.request,
+		AppliedActions:  workerSnapshot.AppliedActions,
+	}
+	if err := os.MkdirAll(s.agentSnapshotsDir(), 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	path, _ := s.agentSnapshotPath(snapshotID)
+	if err := saveJSONFile(path, artifact); err != nil {
+		_, _ = s.sessionWorkers.Command(
+			context.Background(), entry.runtime, "drop-snapshot", snapshotID)
+		writeError(w, http.StatusInternalServerError,
+			"persist agent snapshot: "+err.Error())
+		return
+	}
 	s.agentSessions.addSnapshot(snapshotID, agentSnapshotEntry{
-		mapID: entry.mapID, runtime: entry.runtime, stepSecond: entry.stepSecond})
-	writeJSON(w, http.StatusOK, payload)
+		artifact: artifact})
+	var response map[string]any
+	_ = json.Unmarshal(payload, &response)
+	response["storage"] = "durable_replay_v1"
+	response["formatVersion"] = agentSnapshotFormatVersion
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleRestoreAgentSnapshot(w http.ResponseWriter, r *http.Request) {
 	snapshotID := r.PathValue("snapshot")
 	snapshot, ok := s.agentSessions.getSnapshot(snapshotID)
-	if !ok || snapshot.mapID != r.PathValue("id") {
+	if !ok {
+		artifact, err := s.loadAgentSnapshot(snapshotID)
+		if err == nil {
+			snapshot = agentSnapshotEntry{artifact: artifact}
+			s.agentSessions.addSnapshot(snapshotID, snapshot)
+			ok = true
+		}
+	}
+	if !ok || snapshot.artifact.MapID != r.PathValue("id") {
 		writeError(w, http.StatusNotFound, "unknown agent snapshot")
 		return
 	}
 	sessionID := newID("ses")
-	result, err := s.sessionWorkers.Command(
-		r.Context(), snapshot.runtime, "restore", snapshotID, sessionID)
+	state, record, err := s.replayAgentSnapshot(
+		r.Context(), snapshot.artifact, sessionID)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if result.ExitCode != 0 {
-		message := sessionWorkerErrorMessage(result.Payload)
-		if strings.Contains(message, "unknown snapshot") {
-			s.agentSessions.removeSnapshot(snapshotID)
-			writeError(w, http.StatusNotFound, message)
-			return
-		}
-		writeError(w, http.StatusBadRequest, message)
-		return
-	}
-	var state sessionStateFields
-	if err := json.Unmarshal(result.Payload, &state); err != nil {
-		writeError(w, http.StatusBadGateway, "unreadable restore response")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.agentSessions.add(sessionID, agentSessionEntry{
-		mapID: snapshot.mapID, runtime: snapshot.runtime,
-		stepSecond: snapshot.stepSecond})
+		mapID:      snapshot.artifact.MapID,
+		runtime:    record.Runtime,
+		stepSecond: snapshot.artifact.StepSecond,
+		request:    snapshot.artifact.Request})
 	response := map[string]any{
 		"snapshotId": snapshotID,
 		"state":      state,
+		"storage":    "durable_replay_v1",
 	}
 	if state.DecisionDue {
 		decisionID, barrierErr := s.openDecisionBarrier(sessionID, state)
 		if barrierErr != nil {
 			_, _ = s.sessionWorkers.Command(
-				context.Background(), snapshot.runtime, "close", sessionID)
+				context.Background(), record.Runtime, "close", sessionID)
 			s.agentSessions.remove(sessionID)
 			writeError(w, http.StatusInternalServerError, barrierErr.Error())
 			return
@@ -785,28 +1037,32 @@ func (s *Server) handleRestoreAgentSnapshot(w http.ResponseWriter, r *http.Reque
 func (s *Server) handleDeleteAgentSnapshot(w http.ResponseWriter, r *http.Request) {
 	snapshotID := r.PathValue("snapshot")
 	snapshot, ok := s.agentSessions.getSnapshot(snapshotID)
-	if !ok || snapshot.mapID != r.PathValue("id") {
+	if !ok {
+		artifact, err := s.loadAgentSnapshot(snapshotID)
+		if err == nil {
+			snapshot = agentSnapshotEntry{artifact: artifact}
+			ok = true
+		}
+	}
+	if !ok || snapshot.artifact.MapID != r.PathValue("id") {
 		writeError(w, http.StatusNotFound, "unknown agent snapshot")
 		return
 	}
-	result, err := s.sessionWorkers.Command(
-		r.Context(), snapshot.runtime, "drop-snapshot", snapshotID)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
+	if record, err := s.mapRecord(snapshot.artifact.MapID); err == nil {
+		// The durable artifact is authoritative. The process-local copy is only
+		// a cache and may already be gone after worker eviction or restart.
+		_, _ = s.sessionWorkers.Command(
+			r.Context(), record.Runtime, "drop-snapshot", snapshotID)
 	}
-	if result.ExitCode != 0 {
-		message := sessionWorkerErrorMessage(result.Payload)
-		if strings.Contains(message, "unknown snapshot") {
-			s.agentSessions.removeSnapshot(snapshotID)
-			writeError(w, http.StatusNotFound, message)
-			return
-		}
-		writeError(w, http.StatusBadRequest, message)
+	path, _ := s.agentSnapshotPath(snapshotID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.agentSessions.removeSnapshot(snapshotID)
-	writeJSON(w, http.StatusOK, json.RawMessage(result.Payload))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deleted": true, "snapshotId": snapshotID,
+		"storage": "durable_replay_v1"})
 }
 
 func sessionWorkerErrorMessage(payload json.RawMessage) string {

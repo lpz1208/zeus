@@ -733,6 +733,9 @@ void runUntilEventRouteInvalidatedTest() {
     const zeus::simulation::TickSnapshot snapshot = session.snapshot();
     require(snapshot.decision_due && snapshot.decision_reason == "route_invalidated",
             "closure on the agent route raises a decision event");
+    require(stopped.paused && stopped.tick == snapshot.tick &&
+                stopped.state_version == snapshot.state_version,
+            "until-event returns only after state and snapshot share a paused boundary");
     require(stopped.tick <= 1000, "until-event respects the step cap");
     const auto& agent_state = snapshot.agents.front();
     require(agent_state.route_invalidated,
@@ -772,6 +775,9 @@ void runUntilEventPeriodicTest() {
     const zeus::simulation::TickSnapshot snapshot = session.snapshot();
     require(snapshot.decision_due && snapshot.decision_reason == "periodic",
             "the periodic congestion scan wakes a driving agent");
+    require(stopped.paused && stopped.tick == snapshot.tick &&
+                stopped.state_version == snapshot.state_version,
+            "periodic wake-up publishes one authoritative paused version");
     require(stopped.tick > 0 && stopped.tick <= 100,
             "periodic wake-up lands inside the step cap");
     session.close();

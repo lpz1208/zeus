@@ -156,6 +156,26 @@ select:focus-visible {
 .system-status strong { font-size: 10px; letter-spacing: 0.05em; }
 .build-tag { margin-left: auto; color: var(--muted); font-size: 9px; }
 .pulse-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px #e8f7f0; }
+.agent-workspace-launch {
+  display: flex;
+  align-items: center;
+  height: 26px;
+  margin-left: auto;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--blue);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  gap: 6px;
+  cursor: pointer;
+}
+.agent-workspace-launch:hover:not(:disabled) { border-color: var(--blue); background: var(--blue-soft); }
+.agent-workspace-launch:disabled { color: var(--quiet); cursor: default; }
+.build-tag { margin-left: 10px; }
 .pulse-dot--offline { background: var(--orange); box-shadow: 0 0 0 4px #fff1e7; }
 
 .panel-grid { min-height: 0; background: var(--paper); }

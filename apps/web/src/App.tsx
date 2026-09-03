@@ -2,6 +2,7 @@ import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useSta
 import {
   Activity,
   AlertTriangle,
+  BrainCircuit,
   CarFront,
   Check,
   ChevronRight,
@@ -35,6 +36,8 @@ import {
   Zap,
 } from 'lucide-react'
 import { api } from './api'
+import { emptyVehicleFrame } from './types'
+import { AgentWorkbench } from './agent/AgentWorkbench'
 import { demoNetwork } from './demo'
 import { MapCanvas } from './MapCanvas'
 import { buildVehicleFrame } from './playback'
@@ -84,7 +87,6 @@ const emptyMapping: Mapping = {
 const emptyIssues: IssueGeoJSON = { type: 'FeatureCollection', features: [] }
 const emptyNodes: NodeGeoJSON = { type: 'FeatureCollection', features: [] }
 const emptyReference: ReferenceGeoJSON = { type: 'FeatureCollection', features: [] }
-const emptyVehicleFrame: VehicleFrameGeoJSON = { type: 'FeatureCollection', features: [] }
 const emptySimulationControls: SimulationControls = {
   vehicleControls: [],
   roadControls: [],
@@ -270,6 +272,7 @@ export function App() {
   const [pointer, setPointer] = useState<[number, number]>([116.391, 39.907])
   const [serviceOnline, setServiceOnline] = useState(false)
   const [error, setError] = useState('')
+  const [workspace, setWorkspace] = useState<'map' | 'agent'>('map')
 
   useEffect(() => {
     api.listMaps()
@@ -677,6 +680,21 @@ export function App() {
     [playbackTime, simResult],
   )
 
+  if (workspace === 'agent') {
+    return (
+      <AgentWorkbench
+        maps={maps}
+        activeMap={activeMap}
+        onMapChange={setActiveMap}
+        data={geoJSON}
+        nodeData={nodeGeoJSON}
+        issueData={issueGeoJSON}
+        referenceLayers={referenceViews}
+        onExit={() => setWorkspace('map')}
+      />
+    )
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -694,6 +712,9 @@ export function App() {
             <small>CONTROL PLANE</small>
             <strong>{serviceOnline ? 'ONLINE' : 'DEMO MODE'}</strong>
           </div>
+          <button className="agent-workspace-launch" type="button" onClick={() => setWorkspace('agent')} disabled={!activeMap}>
+            <BrainCircuit size={14} /> AGENT
+          </button>
           <span className="build-tag">BUILD 0.1.0</span>
         </div>
       </header>

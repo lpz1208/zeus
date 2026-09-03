@@ -867,7 +867,22 @@ private:
             << ", \"simulationTimeS\": " << jsonNumber(state.simulation_time_s)
             << ", \"stateVersion\": " << state.state_version
             << ", \"actionCount\": " << entry.applied_actions.size()
-            << ", \"storage\": \"process_local_replay\"}";
+            << ", \"actions\": [";
+        for (std::size_t i = 0; i < entry.applied_actions.size(); ++i) {
+            const AppliedAction& action = entry.applied_actions[i];
+            if (i > 0) {
+                out << ", ";
+            }
+            out << "{\"tick\": " << action.tick
+                << ", \"vehicleId\": " << action.vehicle_id
+                << ", \"kind\": " << jsonString(
+                       action.kind == AppliedActionKind::kCommit
+                           ? "commit_route" : "keep_route")
+                << ", \"algorithm\": "
+                << jsonString(zeus::routing::algorithmName(action.algorithm))
+                << "}";
+        }
+        out << "], \"storage\": \"process_local_replay\"}";
         return 0;
     }
 
