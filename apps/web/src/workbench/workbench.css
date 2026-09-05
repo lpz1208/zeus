@@ -122,6 +122,8 @@
 
 .wb-agent-launch:hover:not(:disabled) { border-color: var(--blue); background: var(--blue-soft); }
 .wb-agent-launch:disabled { color: var(--quiet); cursor: default; }
+.wb-benchmark-launch { color: var(--teal); }
+.wb-benchmark-launch:hover:not(:disabled) { border-color: var(--teal); background: #f0fdfa; }
 .wb-build { color: var(--muted); font-size: 9.5px; }
 
 /* -------------------------------------------------------------- left rail */
@@ -963,8 +965,10 @@
   body,
   #root { overflow: auto; }
   .wb-shell { display: grid; height: auto; min-height: 100dvh; grid-template-columns: 270px minmax(0, 1fr); grid-template-rows: 56px 62vh auto 24px; }
-  .wb-topbar { position: sticky; top: 0; grid-template-columns: 270px 1fr; }
-  .wb-status { display: none; }
+  .wb-topbar { position: sticky; top: 0; grid-template-columns: 270px 1fr auto; }
+  .wb-status { display: flex; padding: 0 10px; }
+  .wb-status__dot,
+  .wb-status > div { display: none; }
   .wb-rail { grid-column: 1; grid-row: 2 / 4; }
   .map-stage { grid-column: 2; grid-row: 2; min-height: 520px; }
   .wb-inspector { grid-column: 2; grid-row: 3; min-height: 420px; border-top: 1px solid var(--line); border-left: 0; }
@@ -975,9 +979,9 @@
   .wb-shell { display: block; }
   .wb-topbar { display: flex; height: 56px; justify-content: space-between; }
   .wb-brand { border: 0; }
-  .wb-pipeline { padding-right: 14px; }
-  .wb-pipeline__step > svg,
-  .wb-pipeline__step strong { display: none; }
+  .wb-pipeline { display: none; }
+  .wb-status { margin-left: auto; border-left: 1px solid var(--line); }
+  .wb-status .wb-agent-launch { width: 31px; padding: 0; justify-content: center; font-size: 0; }
   .wb-rail { max-height: none; border-right: 0; border-bottom: 1px solid var(--line); }
   .map-stage { height: 65vh; min-height: 440px; }
   .wb-inspector { min-height: 500px; }

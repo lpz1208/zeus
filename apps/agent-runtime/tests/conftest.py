@@ -38,6 +38,7 @@ class FakeEnvironment:
         self.commits = 0
         self.keeps = 0
         self.actions: list[dict] = []
+        self.planned_algorithms: list[str] = []
         self.requests: list[tuple[str, str]] = []
         self.fail_first_commit = fail_first_commit
         self.session_closed = False
@@ -96,6 +97,7 @@ class FakeEnvironment:
             self.invalidated = False
             self.commits = self.keeps = 0
             self.actions = []
+            self.planned_algorithms = []
             self.session_closed = False
             self.session_lost = False
             return httpx.Response(200, json={
@@ -153,8 +155,48 @@ class FakeEnvironment:
                 "storage": "durable_replay_v1",
             })
 
+        if tail == "ses_test/result" and method == "GET":
+            return httpx.Response(200, json={
+                "summary": {
+                    "ok": True,
+                    "arrived": 1 if self.finished else 0,
+                    "vehicles": 1,
+                    "unroutable": 0,
+                    "avgTravelS": float(self.tick),
+                    "minTravelS": float(self.tick),
+                    "maxTravelS": float(self.tick),
+                    "totalDistanceM": 5000.0,
+                    "ticks": self.tick,
+                    "routePlans": 1 + self.commits,
+                    "rerouteAttempts": self.commits,
+                    "rerouteSucceeded": self.commits,
+                    "rerouteFailed": 0,
+                    "barrierWaitMs": 0.0,
+                    "computeMs": 2.5,
+                    "deadlock": False,
+                },
+                "geojson": {"type": "FeatureCollection", "features": []},
+                "playback": {
+                    "duration_s": float(self.tick),
+                    "vehicles": [],
+                    "edge_kpis": [
+                        {
+                            "edge_id": 7,
+                            "vehicle_seconds_s": 12.0,
+                            "mean_speed_mps": 3.0,
+                        },
+                        {
+                            "edge_id": 8,
+                            "vehicle_seconds_s": 20.0,
+                            "mean_speed_mps": 8.0,
+                        },
+                    ],
+                },
+            })
+
         if tail == "ses_test/plan" and method == "POST":
             algorithm = body.get("algorithm", "dijkstra")
+            self.planned_algorithms.append(algorithm)
             best = algorithm == "astar"
             return httpx.Response(200, json={
                 "candidateId": f"cand-{algorithm}",

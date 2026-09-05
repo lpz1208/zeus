@@ -11,7 +11,7 @@ from zeus_agent.client import (
     AgentVehicleSpec,
     RoadControl,
 )
-from zeus_agent.policy import RulePolicy
+from zeus_agent.policy import FixedRoutePolicy, RulePolicy
 from zeus_agent.model import MockModelProvider, ModelProviderError
 from zeus_agent.policy import Decision
 from zeus_agent.runner import Scenario, run_episode
@@ -119,3 +119,18 @@ def test_episode_can_explicitly_use_plain_loop(fake_client):
     trace = run_episode(fake_client, scenario(), use_langgraph=False)
     assert trace.execution_mode == "plain_loop"
     assert trace.finished and trace.arrived
+
+
+def test_episode_cancellation_resolves_barrier_and_closes_session():
+    environment = FakeEnvironment()
+    trace = run_episode(
+        client_for(environment),
+        scenario(),
+        FixedRoutePolicy(),
+        algorithm_ids=(),
+        should_cancel=lambda: environment.keeps >= 1,
+    )
+    assert trace.error == "cancelled"
+    assert not trace.finished
+    assert environment.session_closed
+    assert environment.keeps == 1

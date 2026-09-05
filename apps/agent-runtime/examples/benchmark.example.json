@@ -1,0 +1,30 @@
+{
+  "name": "wuhan-navigation-baselines",
+  "repetitions": 3,
+  "congestionSpeedThresholdMps": 5.0,
+  "modelInputUsdPerMillionTokens": 0.0,
+  "modelOutputUsdPerMillionTokens": 0.0,
+  "scenarios": [
+    {
+      "id": "static-od-01",
+      "mapId": "replace-with-map-id",
+      "origin": [114.4911555, 30.9567005],
+      "destination": [114.8064655, 30.8130008],
+      "durationSeconds": 1800,
+      "stepSeconds": 1,
+      "rerouteIntervalSeconds": 30,
+      "rerouteCostRatio": 1.25,
+      "sampleIntervalSeconds": 10,
+      "maxDecisions": 100,
+      "seed": 20260904,
+      "roadControls": [],
+      "vehicleControls": []
+    }
+  ],
+  "strategies": [
+    {"id": "fixed-astar", "kind": "fixed", "algorithm": "astar"},
+    {"id": "reactive-astar", "kind": "reactive", "algorithm": "astar"},
+    {"id": "rule-agent", "kind": "rule_agent", "algorithm": "astar"},
+    {"id": "model-agent", "kind": "model_agent", "algorithm": "astar"}
+  ]
+}

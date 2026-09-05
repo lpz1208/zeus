@@ -2,7 +2,7 @@
 
 > 文档状态：目标架构，待分阶段实施
 >
-> 最后更新：2026-09-01
+> 最后更新：2026-09-05
 >
 > 关联文档：[overall-architecture.md](overall-architecture.md)、[simulation-core-design.md](simulation-core-design.md)、[routing-core-design.md](routing-core-design.md)
 
@@ -373,13 +373,13 @@ latency / token usage / failure and fallback
 
 ## 12. 分阶段实施计划
 
-### 当前落地状态（2026-09-02）
+### 当前落地状态（2026-09-05）
 
 - `zeus-map session-worker <map.zmap>` 常驻进程已实现：stdin/stdout tab 帧协议（`ZEUS_SESSION_WORKER`/`ZEUS_SESSION_RESPONSE`），命令覆盖 reset、observe、agent-observe、plan、commit、keep、step、step_event、resume、run-to-end、pause、snapshot、restore、drop-snapshot、result、close、shutdown；一个进程按 session_id 承载多张会话。`resume` 非阻塞启动引擎线程，允许同一命令通道继续处理 pause/observe 和其他会话。
 - 引擎在每个已提交 tick 边界发布 `TickSnapshot`：热边（占用/容量/封闭/速度与路由代价因子/均速）、agent 车辆切片（位置、路线、ETA、路线失效标记）、决策事件与原因；`step_event` 推进至 agent 路线失效或周期扫描事件后暂停。单车 Observation 通过地图空间索引筛选车辆 2 km 内最多 64 条热边，不再按全局热边顺序截断。
 - 动作注入已实现：`commit` 在下一 tick 边界从车辆实时位置按候选记录的算法确定性重规划（候选路径本身不跨边界，杜绝陈旧位置），`keep` 为版本校验确认；agent 车辆被排除出自动重规划。
 - Go 控制面：`SessionWorkerManager`（按地图常驻、LRU、挂死重启）+ `/api/maps/{id}/agent/sessions/*` 端点（创建/观察/plan/step/actions/run/pause/result/关闭），决策边界自动开 `DecisionCoordinator` 屏障（默认 5 分钟墙上 TTL，可配置）；超时 fallback 会把版本校验的 keep_route 实际提交到 C++。actions 采用两阶段语义，只有 Worker 明确接受后才关闭屏障，拒绝时保留决策供修正；每个 Session 有活动决策门禁，未处理前拒绝继续 step。HTTP `/run` 使用非阻塞 resume，因此 `/pause` 可在后续请求中生效。
-- 第一版进程内 Snapshot/Restore 已实现：只允许在暂停或完成边界创建快照，保存配置、需求、控制、信号、目标 tick 和已接受的 commit/keep 动作日志；restore 通过确定性重放创建独立 Session，可用于同一 Worker 生命周期内的实验分叉。Go 已提供创建、恢复和删除快照端点；恢复到决策边界时会为新 Session 打开独立 Decision Barrier。
+- 持久化 Snapshot/Restore 已实现：只允许在暂停或完成边界创建快照，按版本化 JSON 保存地图、请求、目标 tick 和已接受的 commit/keep 动作日志；restore 通过确定性重放创建独立 Session，控制服务或 Worker 重启后仍可加载。Go 已提供创建、恢复和删除快照端点；恢复到决策边界时会为新 Session 打开独立 Decision Barrier。
 - 四算法 Tool Registry 已实现：C++ `algorithmCapabilities()` 是能力元数据的唯一来源，`session-worker tools` 与 `GET /api/maps/{id}/agent/tools` 暴露 registry version、算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性和精确性声明；单车 Observation 同步携带该能力列表。
 - 同步落地保真度修复：出口放行间隔默认 1.4/2.0 s 且到达免闸、min_speed_ratio 默认 0（饱和路段真停，含动态代价除零保护）、移动序按队列序放行、per-edge KPI（entries/vehicle_seconds/mean_speed，playback 导出）、建图期自动生成转向罚时（U-turn 5 s、急左转 2 s、支路进干路 3 s，max-merge sidecar）。
 - A2 单导航智能体最小闭环已交付（apps/agent-runtime，uv + LangGraph + httpx + pydantic）：
@@ -390,8 +390,12 @@ latency / token usage / failure and fallback
   - LangGraph SQLite Checkpointer 已接入稳定 `thread_id`：可在任一确定性节点后中断，并用同一图线程从下一节点恢复；恢复不重新创建环境 Session，也不重复执行已完成节点。`zeus_runs` 和 `zeus_decision_traces` 独立记录运行状态与逐节点写入，覆盖 Observation、候选工具、模型决策、Guard、Action、仿真 tick/state_version、延迟和 token 指标；`python -m zeus_agent.trace` 支持按线程和节点查询 JSON；
   - Action Guard：候选 ok、basedOnStateVersion 与观察版本一致、改进比 ≥10%（路线失效豁免改进与冷却检查）、提交冷却仅在自愿切换之间生效；提交失败确定性 fallback 为 keep_route；
   - Gymnasium 风格 `ZeusEnv`（reset/step，reward=ETA 减少量，惰性接入 gymnasium）与 `python -m zeus_agent.run` CLI；
-  - 39 个单元测试（httpx.MockTransport 脚本化假环境，含 409→fallback、模型非法候选/非法 JSON、模型失败规则降级、LangGraph 与显式纯循环路径、SQLite 节点中断→跨调用恢复且不重复 Session/动作、DecisionTrace 去重与 thread_id 防碰撞）；e2e 封路场景在真实武汉地图通过：252 边路线 t=1517s 封中段边 → observe 后持久化中断 → 重新打开 SQLite 恢复 → 四算法比较 → commit → 4567 tick 到达，78 次决策、约 5.5s 墙钟，审计链完整。
-- 尚未实现：跨 Worker 重启的持久化环境快照文件（当前 Checkpointer 只恢复 Agent 图，要求原 Session 仍存活）、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码/gRPC 接入、生产模型供应商的在线验收与密钥管理、A*/动态算法/Navigation Agent 批量对照实验、K 最短路（比较器已算法无关）。
+  - Benchmark phase 1 已交付：JSON 清单定义场景、控制事件、固定种子、策略与重复次数；顺序运行 fixed、reactive、rule_agent、model_agent 四类策略，限制固定/反应式基线的算法工具集合；读取 C++ 权威结果与 playback edge KPI，按节点计时并聚合成功率、旅行时间、路线长度、重规划、路线工具调用、拥堵暴露、决策/模型延迟、实时倍率、token 和配置化费用，导出内嵌清单的版本化 JSON 与逐次运行 CSV。
+  - Benchmark Job Service 已交付：标准库 HTTP API 提交/列表/状态/结果/取消，SQLite 持久化清单、进度与报告，线程池限制并发和队列容量；运行中取消在决策安全边界提交 keep 并关闭 Session，排队任务可无执行取消；服务重启后未完成任务从头重新排队，模型密钥只从服务进程环境变量读取。
+  - Go 控制面 Benchmark 同源代理已交付：`/api/benchmarks` 与全部任务子路径保留方法、查询、请求体、状态码和响应头转发到可配置上游；连接失败返回稳定 `502` JSON，非法配置返回 `503`，浏览器默认不再跨域直连 `8090`。
+  - Benchmark Web 工作台已交付：可视化组合多场景、OD、道路/车辆控制事件、重复次数和四类策略；异步提交后轮询任务、显示场景 × 策略进度矩阵、取消运行和浏览历史，完成报告提供跨策略聚合图表、逐次运行证据及 JSON/CSV 下载。已用真实任务服务验证提交→运行→取消/完成链路，并通过 1440/760/390 px 响应式冒烟。
+  - 51 个单元测试（httpx.MockTransport 脚本化假环境，含 409→fallback、模型非法候选/非法 JSON、模型失败规则降级、LangGraph 与显式纯循环路径、SQLite 节点中断→跨调用恢复且不重复 Session/动作、DecisionTrace 去重与 thread_id 防碰撞、四策略评测矩阵、任务持久化/取消/恢复和 HTTP 生命周期）；e2e 封路场景在真实武汉地图通过：252 边路线 t=1517s 封中段边 → observe 后持久化中断 → 重新打开 SQLite 恢复 → 四算法比较 → commit → 4567 tick 到达，78 次决策、约 5.5s 墙钟，审计链完整。
+- 尚未实现：Benchmark 统一鉴权、用户级配额与进程监管、跨进程分布式任务调度、场景种子驱动的随机事件生成、路线抖动与无效动作等二阶段指标、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码/gRPC 接入、生产模型供应商的在线验收与密钥管理、D* Lite 与 K 最短路（比较器已算法无关）。
 
 ### 2026-08-30 之前的状态（历史）
 

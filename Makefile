@@ -1,5 +1,5 @@
 .PHONY: build build-map build-server build-web test test-proto run clean \
-	agent-runtime-setup agent-runtime-test agent-runtime-e2e
+	agent-runtime-setup agent-runtime-test agent-runtime-e2e agent-benchmark-service
 
 build: build-map build-server build-web
 
@@ -34,6 +34,9 @@ agent-runtime-test:
 
 agent-runtime-e2e:
 	cd apps/agent-runtime && UV_CACHE_DIR=$(CURDIR)/.cache/uv uv run python scripts/e2e_closure.py --base-url http://127.0.0.1:8080 --verify-resume
+
+agent-benchmark-service:
+	cd apps/agent-runtime && UV_CACHE_DIR=$(CURDIR)/.cache/uv uv run python -m zeus_agent.benchmark_service --base-url http://127.0.0.1:8080 --db $(CURDIR)/data/benchmarks.sqlite
 
 run: build
 	./build/zeus-server --addr 127.0.0.1:8080 --data-dir data --zeus-map ./build/zeus-map --web-dir ./apps/web/dist

@@ -1,4 +1,4 @@
-import { BrainCircuit, Check, ChevronRight, Waypoints } from 'lucide-react'
+import { BrainCircuit, Check, ChevronRight, FlaskConical, Waypoints } from 'lucide-react'
 import type { IntakeStage } from './useMapIntake'
 
 interface WorkbenchTopbarProps {
@@ -6,6 +6,7 @@ interface WorkbenchTopbarProps {
   serviceOnline: boolean
   agentEnabled: boolean
   onEnterAgent(): void
+  onEnterBenchmark(): void
 }
 
 function Pipeline({ stage }: { stage: IntakeStage }) {
@@ -32,7 +33,7 @@ function Pipeline({ stage }: { stage: IntakeStage }) {
 }
 
 export function WorkbenchTopbar({
-  intakeStage, serviceOnline, agentEnabled, onEnterAgent,
+  intakeStage, serviceOnline, agentEnabled, onEnterAgent, onEnterBenchmark,
 }: WorkbenchTopbarProps) {
   return (
     <header className="wb-topbar">
@@ -53,7 +54,9 @@ export function WorkbenchTopbar({
         <button className="wb-agent-launch" type="button" onClick={onEnterAgent} disabled={!agentEnabled}>
           <BrainCircuit size={14} /> AGENT
         </button>
-        <span className="wb-build">BUILD 0.1.0</span>
+        <button className="wb-agent-launch wb-benchmark-launch" type="button" onClick={onEnterBenchmark}>
+          <FlaskConical size={13} /> BENCH
+        </button>
       </div>
     </header>
   )

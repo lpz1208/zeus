@@ -1,7 +1,7 @@
 # Zeus Web 地图工作台
 
-> 状态：MVP 已实现  
-> 最后更新：2026-09-01
+> 状态：地图、Agent 与 Benchmark 工作台已实现
+> 最后更新：2026-09-05
 
 ## 1. 定位
 
@@ -9,9 +9,8 @@ Web 地图工作台是 C++ 地图引擎的可视化控制面，负责数据上�
 
 ```text
 React Web
-→ Go Control Server
-→ zeus-map CLI
-→ C++ Map Engine
+├→ Go Control Server → zeus-map CLI → C++ Map Engine
+└→ Python Benchmark Job Service → LangGraph Agent Runtime
 ```
 
 ## 2. 已实现功能
@@ -45,6 +44,8 @@ React Web
 - 封路、限速、降容及达到阈值的实时拥堵权重会触发受影响车辆重规划；结果面板展示尝试/成功/失败数，Playback 保存逐车重规划事件并在时间控制台累计显示。
 - Agent 工作台（顶栏 AGENT 按钮进入）：地图点选 OD 创建有状态 Agent 会话，事件驱动推进到决策边界；仿真在决策屏障处冻结，决策横幅展示触发原因与状态版本，可一键比较 Tool Registry 全部算法并提交所选候选或保持路线；候选路线、当前剩余路线与起点预览在地图上联动渲染。
 - Agent 车辆实时位置：观察返回的 `edgeId + offsetM`（米）按道路要素 `EDGE_IDS`/`DIRECTION` 还原有向边几何并插值为经纬度，复用 MapCanvas 车辆圆点层渲染；观察/工具/轨迹三标签控制台展示位置、ETA、附近道路态势、环境事件、算法能力注册表和带状态版本徽章的决策轨迹；支持会话快照保存、恢复与删除。
+- Benchmark 工作台（顶栏 BENCH 按钮进入）：用场景清单组合地图、OD、仿真参数、道路/车辆控制事件和 fixed、reactive、rule-agent、model-agent 四类策略；支持多场景复制、重复次数与模型计费参数，异步提交后轮询任务进度、取消运行、浏览历史，并以场景 × 策略矩阵和旅行时间、拥堵暴露、决策延迟、工具调用图表对照结果。完成或取消的报告可下载 JSON 与逐次运行 CSV。
+- Benchmark 工作台采用研究账本式三栏布局，与地图/Agent 工作台共享设计令牌；在 980 px 收敛为两栏、700 px 收敛为单栏，顶栏工作区入口在窄屏仍可访问。
 - 高亮最佳道路，展示 edge、road ID、offset、横向距离和置信度。
 - 没有控制服务或地图时展示合成演示路网。
 - 工作台采用白色技术地图主题：左侧集中数据与图层管理，中央保留最大地图视野，右侧将要素详情和拓扑质检收拢为两个标签页。
@@ -108,6 +109,17 @@ React Web
 | DELETE | `/api/maps/{id}/agent/snapshots/{snapshot}` | 删除快照 |
 | DELETE | `/api/maps/{id}/agent/sessions/{session}` | 关闭会话 |
 
+Benchmark Job Service 默认独立监听 `127.0.0.1:8090`，Go 控制面将下列同源路径反向代理到任务服务；可用 `--benchmark-url` 覆盖上游地址。前端默认使用同源路径，仅在绕过控制面调试时通过 `VITE_BENCHMARK_BASE_URL` 指定直连地址：
+
+| 方法 | 路径 | 功能 |
+| --- | --- | --- |
+| GET | `/health` | Benchmark 服务健康状态 |
+| POST | `/api/benchmarks` | 校验清单并创建异步评测任务 |
+| GET | `/api/benchmarks?limit=50` | 获取最近任务及进度 |
+| GET | `/api/benchmarks/{id}` | 获取单个任务状态 |
+| GET | `/api/benchmarks/{id}/result` | 获取完成或已取消任务的版本化报告 |
+| POST | `/api/benchmarks/{id}/cancel` | 请求在安全决策边界取消 |
+
 上传限制为 512 MiB。每次上传必须是一个 `.geojson` / `.json` 文件，或一套同名的 `.shp`、`.shx`、`.dbf`、`.prj`（`.cpg` 可选）。接口使用 `sourceFile` 标识主数据文件；旧版 `shapefile` 请求字段仍可兼容。`POST /api/maps/import` 可携带 `osmPreprocess`，字段为 `enabled`、`includeService`、`includeTrack`、`includePrivate` 和 `minLengthMeters`。只有检查结果含精确 `highway` 字段时才允许启用。C++ 命令不经过 shell 拼接，并有执行超时。
 
 GeoJSON 输入要求根对象可被 GDAL 识别为矢量数据集，道路几何为 `LineString` 或 `MultiLineString`。标准 GeoJSON 默认按 WGS84 读取，属性字段与 Shapefile 一样进入字段映射步骤。`Point`、`MultiPoint`、`Polygon`、`MultiPolygon` 会被识别为参考数据，可发布为独立图层，但不会被误当成道路编译。
@@ -142,7 +154,13 @@ http://127.0.0.1:8080
 npm --prefix apps/web run dev
 ```
 
-Vite 会将 `/api` 代理到 `127.0.0.1:8080`。
+Vite 会将 `/api` 代理到 `127.0.0.1:8080`，其中 `/api/benchmarks` 再由 Go 控制面转发到 Benchmark Job Service。
+
+运行 BENCH 工作台前另开终端启动持久化评测任务服务：
+
+```bash
+make agent-benchmark-service
+```
 
 ## 6. 数据目录
 
@@ -190,6 +208,7 @@ data/
 - 动态路由 overlay、在途精确位置重规划、原终点保持、限速/降容/周期拥堵绕行、成功/失败统计、出口 headway 和转向级信号相位的 C++/Go/Web 类型回归通过。
 - Agent 工作台 TypeScript 类型检查与生产构建通过；组件拆分为 shell + 任务面板 + 检查器 + 决策横幅，会话状态收敛到 `useAgentSession` hook。
 - 车辆位置插值（edgeId+offsetM 按有向边几何还原）在武汉路网上冒烟验证：决策边界冻结、四算法候选比较、候选提交后车辆标记沿剩余路线移动。
+- Benchmark 工作台通过真实服务完成任务列表、历史报告、前端清单提交、进度轮询和运行中取消闭环；同源代理通过 Go `8082` 提交武汉固定 A* 实验并读取完成状态与报告，未由客户端直连 Python `8092`；桌面 1440 px、平板 760 px、手机 390 px 均无横向溢出和控制台错误。
 
 ## 8. 当前限制
 
@@ -204,12 +223,14 @@ data/
 9. 尚未实现用户、项目和权限系统。
 10. 前端 MapLibre 目前打入主包，后续可按路由或模块进行代码分割。
 11. 仿真端点当前同步内联完整回放，受 40 万周期样本预算保护；十万级实时运行需要异步 Worker、分块回放和 WebSocket 二进制帧。
+12. Benchmark Job Service 已通过 Go 控制面提供同源反向代理，但仍是独立 Python 进程；尚未实现统一鉴权、用户级配额、自动进程监管和跨进程分布式调度。
+13. Benchmark 清单会记录随机种子，但种子驱动的随机事故/拥堵生成器与路线抖动、无效动作等二阶段指标尚未实现。
 
 ## 9. 下一步
 
 1. 会话级暂停、单步、事件推进与恢复运行已随 Agent 会话交付；剩余部分是传统批量仿真的异步 run、分块回放和实时二进制帧。
 2. Agent 调试时间线已随 Agent 工作台交付（观察/工具/Guard/动作按仿真时间记录并带状态版本徽章）；剩余部分是 LLM Reasoning Summary 展示与决策回放。
-3. 增加固定算法、规则策略、LLM 直接导航和 Navigation Agent 的同步对照视图与指标面板。
+3. 为 Benchmark Job Service 增加统一鉴权、用户级配额和进程监管，并为长实验增加分布式调度、实时事件流和报告路由级代码分割。
 4. 为已实现的转向级信号相位增加冲突组、从转向车道数自动推导流率、自动配时，以及替代道路恢复后的重规划冷却与收益扫描。
 5. 增加问题筛选、批量确认、修复操作及版本差异对比。
 6. 将任务状态和地图元数据迁移到 PostgreSQL，并接入持久化工作队列。

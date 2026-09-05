@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { AgentWorkbench } from './agent/AgentWorkbench'
+import { BenchmarkWorkbench } from './benchmark/BenchmarkWorkbench'
 import { useMapLibrary } from './hooks/useMapLibrary'
 import { useReferenceLayers } from './hooks/useReferenceLayers'
 import { MapWorkbench } from './workbench/MapWorkbench'
@@ -10,7 +11,7 @@ import { MapWorkbench } from './workbench/MapWorkbench'
  * the workbench that owns it.
  */
 export function App() {
-  const [workspace, setWorkspace] = useState<'map' | 'agent'>('map')
+  const [workspace, setWorkspace] = useState<'map' | 'agent' | 'benchmark'>('map')
   const library = useMapLibrary()
   const references = useReferenceLayers(library.maps, library.mapsLoaded)
 
@@ -29,11 +30,22 @@ export function App() {
     )
   }
 
+  if (workspace === 'benchmark') {
+    return (
+      <BenchmarkWorkbench
+        maps={library.maps}
+        activeMap={library.activeMap}
+        onExit={() => setWorkspace('map')}
+      />
+    )
+  }
+
   return (
     <MapWorkbench
       library={library}
       references={references}
       onEnterAgent={() => setWorkspace('agent')}
+      onEnterBenchmark={() => setWorkspace('benchmark')}
     />
   )
 }

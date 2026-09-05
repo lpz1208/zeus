@@ -348,6 +348,140 @@ export interface PlaybackData {
   vehicles: PlaybackVehicle[]
 }
 
+export type BenchmarkStrategyKind = 'fixed' | 'reactive' | 'rule_agent' | 'model_agent'
+export type BenchmarkJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface BenchmarkRoadControl {
+  timeSeconds: number
+  edgeIds: number[]
+  action: RoadControlAction
+  value: number
+}
+
+export interface BenchmarkVehicleControl {
+  timeSeconds: number
+  vehicleId: number
+  action: VehicleControlAction
+  value: number
+}
+
+export interface BenchmarkScenario {
+  id: string
+  mapId: string
+  origin: [number, number]
+  destination: [number, number]
+  durationSeconds: number
+  stepSeconds: number
+  rerouteIntervalSeconds: number
+  rerouteCostRatio: number
+  sampleIntervalSeconds: number
+  maxDecisions: number
+  seed: number
+  roadControls: BenchmarkRoadControl[]
+  vehicleControls: BenchmarkVehicleControl[]
+}
+
+export interface BenchmarkStrategy {
+  id: string
+  kind: BenchmarkStrategyKind
+  algorithm: RouteAlgorithm
+}
+
+export interface BenchmarkManifest {
+  name: string
+  repetitions: number
+  congestionSpeedThresholdMps: number
+  modelInputUsdPerMillionTokens: number
+  modelOutputUsdPerMillionTokens: number
+  scenarios: BenchmarkScenario[]
+  strategies: BenchmarkStrategy[]
+}
+
+export interface BenchmarkJob {
+  jobId: string
+  status: BenchmarkJobStatus
+  createdAt: string
+  startedAt: string | null
+  completedAt: string | null
+  totalRuns: number
+  completedRuns: number
+  successfulRuns: number
+  cancelRequested: boolean
+  manifest: BenchmarkManifest
+  error: string | null
+}
+
+export interface BenchmarkMetricSummary {
+  mean: number
+  p50: number
+  p95: number
+  minimum: number
+  maximum: number
+}
+
+export interface BenchmarkAggregate {
+  scenario_id: string
+  strategy_id: string
+  runs: number
+  successes: number
+  success_rate: number
+  travel_time_s: BenchmarkMetricSummary | null
+  route_length_m: BenchmarkMetricSummary | null
+  replanning_count: BenchmarkMetricSummary | null
+  congestion_exposure_s: BenchmarkMetricSummary | null
+  route_tool_calls: BenchmarkMetricSummary | null
+  decision_wall_ms: BenchmarkMetricSummary | null
+  model_latency_ms: BenchmarkMetricSummary | null
+  model_cost_usd: BenchmarkMetricSummary | null
+  real_time_factor: BenchmarkMetricSummary | null
+}
+
+export interface BenchmarkRun {
+  run_id: string
+  scenario_id: string
+  strategy_id: string
+  strategy_kind: BenchmarkStrategyKind
+  algorithm: RouteAlgorithm
+  execution_mode: string
+  model_name: string
+  repetition: number
+  seed: number
+  success: boolean
+  arrived: boolean
+  finished: boolean
+  travel_time_s: number | null
+  route_length_m: number | null
+  replanning_count: number
+  environment_reroute_attempts: number
+  congestion_exposure_s: number
+  decisions: number
+  route_tool_calls: number
+  decision_wall_ms: number
+  model_latency_ms: number
+  model_calls: number
+  model_failures: number
+  input_tokens: number
+  output_tokens: number
+  model_cost_usd: number
+  simulation_time_s: number
+  wall_seconds: number
+  real_time_factor: number
+  compute_ms: number | null
+  error: string | null
+}
+
+export interface BenchmarkReport {
+  format_version: number
+  name: string
+  manifest: BenchmarkManifest
+  started_at: string
+  completed_at: string
+  wall_seconds: number
+  cancelled: boolean
+  runs: BenchmarkRun[]
+  aggregates: BenchmarkAggregate[]
+}
+
 export interface PlaybackSignalPlan {
   node_id: number
   offset_s: number

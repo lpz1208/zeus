@@ -18,6 +18,7 @@ interface MapWorkbenchProps {
   library: MapLibraryApi
   references: ReferenceLibraryApi
   onEnterAgent(): void
+  onEnterBenchmark(): void
 }
 
 /**
@@ -25,7 +26,9 @@ interface MapWorkbenchProps {
  * inspector panel and the reset-on-map-change choreography, and wires the
  * full MapCanvas surface.
  */
-export function MapWorkbench({ library, references, onEnterAgent }: MapWorkbenchProps) {
+export function MapWorkbench({
+  library, references, onEnterAgent, onEnterBenchmark,
+}: MapWorkbenchProps) {
   const [panel, setPanel] = useState<InspectorPanel>('details')
   const intake = useMapIntake({
     hasActiveMap: Boolean(library.activeMap),
@@ -71,6 +74,7 @@ export function MapWorkbench({ library, references, onEnterAgent }: MapWorkbench
         serviceOnline={library.serviceOnline}
         agentEnabled={Boolean(library.activeMap)}
         onEnterAgent={onEnterAgent}
+        onEnterBenchmark={onEnterBenchmark}
       />
 
       <LeftRail

@@ -32,6 +32,7 @@ type Config struct {
 	DataDir         string
 	ZeusMap         string
 	WebDir          string
+	BenchmarkURL    string
 	CmdLimit        time.Duration
 	ImportWorkers   int
 	SimulateWorkers int
@@ -64,6 +65,9 @@ type Server struct {
 	// pending waits; authoritative simulation state remains in the C++ worker.
 	decisions       *DecisionCoordinator
 	decisionWallTTL time.Duration
+	// benchmarkProxy exposes the separately scaled Python job service through
+	// the control plane so browsers use one origin and one API boundary.
+	benchmarkProxy http.Handler
 }
 
 type APIError struct {
@@ -379,6 +383,7 @@ func main() {
 	flag.StringVar(&config.DataDir, "data-dir", "data", "persistent data directory")
 	flag.StringVar(&config.ZeusMap, "zeus-map", "build/zeus-map", "path to zeus-map executable")
 	flag.StringVar(&config.WebDir, "web-dir", "apps/web/dist", "built web application directory")
+	flag.StringVar(&config.BenchmarkURL, "benchmark-url", defaultBenchmarkURL, "upstream Benchmark Job Service URL")
 	flag.DurationVar(&config.CmdLimit, "command-timeout", 2*time.Minute, "C++ map command timeout")
 	flag.IntVar(&config.ImportWorkers, "import-workers", 2, "maximum concurrent map imports")
 	flag.IntVar(&config.SimulateWorkers, "simulate-workers", 2, "maximum concurrent simulations")
@@ -428,6 +433,9 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 	if config.AgentDecisionWallTTL <= 0 {
 		config.AgentDecisionWallTTL = 5 * time.Minute
 	}
+	if config.BenchmarkURL == "" {
+		config.BenchmarkURL = defaultBenchmarkURL
+	}
 	simSlots := config.SimulateWorkers
 	if simSlots <= 0 {
 		simSlots = 2
@@ -445,6 +453,7 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 		},
 		decisions:       NewDecisionCoordinator(),
 		decisionWallTTL: config.AgentDecisionWallTTL,
+		benchmarkProxy:  newBenchmarkProxy(config.BenchmarkURL, logger),
 	}
 }
 
@@ -512,6 +521,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/maps/{id}/agent/snapshots/{snapshot}", s.handleDeleteAgentSnapshot)
 	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/result", s.handleAgentSessionResult)
 	mux.HandleFunc("DELETE /api/maps/{id}/agent/sessions/{session}", s.handleCloseAgentSession)
+	mux.Handle("/api/benchmarks", s.benchmarkProxy)
+	mux.Handle("/api/benchmarks/", s.benchmarkProxy)
 	mux.Handle("/", spaHandler(s.config.WebDir))
 	return requestLogger(s.logger, mux)
 }

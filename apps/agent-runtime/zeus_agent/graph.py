@@ -11,8 +11,9 @@ guard -> act -> advance ... until the run finishes or the cap hits.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
-from typing import Callable, Mapping, TypedDict
+from typing import Callable, Mapping, Sequence, TypedDict
 
 from zeus_agent.client import (
     AgentToolRegistry,
@@ -64,6 +65,8 @@ class AgentState(TypedDict, total=False):
     model_latency_ms: float
     model_input_tokens: int
     model_output_tokens: int
+    node_latency_ms: dict[str, float]
+    route_tool_calls: int
     last_action: ActionRequest | None
     action_ack: object | None
     max_iterations: int
@@ -129,12 +132,23 @@ def make_nodes(
     policy: Policy | None = None,
     config: GuardConfig | None = None,
     model: ModelProvider | None = None,
+    algorithms: Sequence[str] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Node]:
     """Builds the node table; dependencies close over the client."""
     policy = policy or RulePolicy()
     config = config or GuardConfig()
+    algorithm_filter = (
+        None if algorithms is None else tuple(dict.fromkeys(algorithms))
+    )
 
     def advance(state: dict) -> dict:
+        if should_cancel and should_cancel():
+            return {
+                "done": True,
+                "action_error": "cancelled",
+                "events": [*state.get("events", []), "advance:cancelled"],
+            }
         if state.get("iterations", 0) >= state.get("max_iterations", 100):
             return {
                 "done": True,
@@ -177,24 +191,39 @@ def make_nodes(
         # Deterministic tool selection: the full registry, or the fallback
         # set when the registry is unreachable. The policy stays in charge
         # of which candidate actually wins.
+        if algorithm_filter == ():
+            return {
+                "selected_algorithms": [],
+                "tool_registry": None,
+                "events": [*state.get("events", []), "tools:"],
+            }
+        registry = state.get("tool_registry")
         try:
-            registry = client.tools()
-            algorithms = [
+            registry = registry or client.tools()
+            available = [
                 a.algorithm_id for a in registry.algorithms
             ] or list(FALLBACK_ALGORITHMS)
         except EnvironmentError:
             registry = None
-            algorithms = list(FALLBACK_ALGORITHMS)
+            available = list(FALLBACK_ALGORITHMS)
+        selected = (
+            available
+            if algorithm_filter is None
+            else [algorithm for algorithm in algorithm_filter if algorithm in available]
+        )
         return {
-            "selected_algorithms": algorithms,
+            "selected_algorithms": selected,
             "tool_registry": registry,
-            "events": [*state.get("events", []), f"tools:{','.join(algorithms)}"],
+            "events": [*state.get("events", []), f"tools:{','.join(selected)}"],
         }
 
     def plan(state: dict) -> dict:
-        algorithms = state.get("selected_algorithms") or list(FALLBACK_ALGORITHMS)
+        selected = state.get("selected_algorithms")
+        plan_algorithms = (
+            selected if selected is not None else list(FALLBACK_ALGORITHMS)
+        )
         candidates: list[RouteCandidate] = []
-        for algorithm in algorithms:
+        for algorithm in plan_algorithms:
             try:
                 candidates.append(client.plan(
                     state["session_id"], state.get("vehicle_id", 0), algorithm))
@@ -204,6 +233,9 @@ def make_nodes(
                     ok=False, reason=error.message))
         return {
             "candidates": candidates,
+            "route_tool_calls": (
+                state.get("route_tool_calls", 0) + len(plan_algorithms)
+            ),
             "events": [
                 *state.get("events", []),
                 f"plan:{sum(1 for c in candidates if c.ok)}/{len(candidates)} ok",
@@ -300,7 +332,11 @@ def make_nodes(
         if not state.get("decision_id"):
             # No open barrier (e.g. the run just finished): nothing to submit.
             return {"events": [*state.get("events", []), "act:idle"]}
-        decision = state["decision"]
+        cancelled = bool(should_cancel and should_cancel())
+        decision = (
+            Decision("keep_route", reason="benchmark_cancelled")
+            if cancelled else state["decision"]
+        )
         observation = state["observation"]
         request = ActionRequest(
             decision_id=state["decision_id"],
@@ -357,12 +393,29 @@ def make_nodes(
             "decision_id": None,
             "last_action": request,
             "action_ack": ack,
-            "action_error": None,
+            "action_error": "cancelled" if cancelled else None,
+            "done": cancelled,
             "events": [*state.get("events", []), f"act:{decision.kind}"],
         }
 
-    return {name: node for name, node in zip(NODE_ORDER, (
-        advance, observe, select_tools, plan, compare, decide, guard, act))}
+    def timed(name: str, node: Node) -> Node:
+        def invoke(state: dict) -> dict:
+            started = time.monotonic()
+            result = node(state)
+            latency = dict(state.get("node_latency_ms", {}))
+            latency[name] = latency.get(name, 0.0) + (
+                time.monotonic() - started
+            ) * 1000.0
+            result["node_latency_ms"] = latency
+            return result
+
+        return invoke
+
+    return {
+        name: timed(name, node)
+        for name, node in zip(NODE_ORDER, (
+            advance, observe, select_tools, plan, compare, decide, guard, act))
+    }
 
 
 def run_nodes(

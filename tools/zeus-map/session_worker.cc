@@ -984,8 +984,23 @@ private:
         out << "{\"ok\": true"
             << ", \"arrived\": " << result.stats.arrived
             << ", \"vehicles\": " << result.stats.vehicles_total
+            << ", \"unroutable\": " << result.stats.unroutable
+            << ", \"waitingAtEnd\": " << result.stats.waiting_at_end
+            << ", \"drivingAtEnd\": " << result.stats.driving_at_end
             << ", \"avgTravelS\": " << jsonNumber(result.stats.average_travel_s)
+            << ", \"minTravelS\": " << jsonNumber(result.stats.min_travel_s)
+            << ", \"maxTravelS\": " << jsonNumber(result.stats.max_travel_s)
+            << ", \"totalDistanceM\": " << jsonNumber(result.stats.total_distance_m)
             << ", \"ticks\": " << result.stats.ticks_executed
+            << ", \"samples\": " << result.stats.sample_count
+            << ", \"routePlans\": " << result.stats.route_plans
+            << ", \"controlEvents\": " << result.stats.control_events_applied
+            << ", \"rerouteAttempts\": " << result.stats.reroute_attempts
+            << ", \"rerouteSucceeded\": " << result.stats.reroute_succeeded
+            << ", \"rerouteFailed\": " << result.stats.reroute_failed
+            << ", \"barrierWaitMs\": " << jsonNumber(result.stats.barrier_wait_ms)
+            << ", \"computeMs\": " << jsonNumber(result.stats.compute_ms)
+            << ", \"deadlock\": " << (result.stats.deadlock ? "true" : "false")
             << ", \"trajectory\": " << jsonString(fields[2])
             << ", \"playback\": " << jsonString(fields[3]) << "}";
         return 0;

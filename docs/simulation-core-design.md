@@ -422,7 +422,7 @@ Session 已通过 `zeus-map session-worker <map.zmap>` 常驻进程边界暴露�
 引擎在每个已提交边界发布 `TickSnapshot`（热边状态、agent 车辆位置/路线/ETA、decision_due 及原因），
 `step_event` 推进到决策事件（agent 路线失效或周期扫描）后暂停；`commit` 在下一 tick 边界从车辆实时位置确定性重规划并换路，`keep` 是版本校验的确认。
 Go 控制面以 `SessionWorkerManager` 复用 worker 进程，`/api/maps/{id}/agent/sessions/*` 端点驱动请求式决策环，并与 `DecisionCoordinator` 的 state version/TTL 校验对接。动作先由 C++ 权威环境确认，再原子关闭 Go 决策屏障；Worker 拒绝时屏障保持可重试。墙上超时会实际提交版本校验的 keep fallback，Session 在活动决策解决前禁止继续 step。
-进程内 Snapshot/Restore 已通过确定性重放实现：暂停边界记录配置、需求、控制、信号、目标 tick 和 Agent 动作日志，恢复时创建独立 Session 并在原 tick 重放动作；该实现支持同 Worker 生命周期内分叉，但尚不跨 Worker 重启持久化。进程内 BARRIER 阻塞模式仍未实现。
+Snapshot/Restore 已通过确定性重放和版本化 JSON 文件实现：暂停边界记录地图、请求、目标 tick 和 Agent 动作日志，恢复时创建独立 Session 并在原 tick 重放动作；控制服务或 Worker 重启后可从地图数据目录重新加载。进程内 BARRIER 阻塞模式仍未实现。
 
 ## 16. 已知简化
 
@@ -435,7 +435,7 @@ Go 控制面以 `SessionWorkerManager` 复用 worker 进程，`/api/maps/{id}/ag
 
 ## 17. 后续优先级
 
-1. 将进程内重放快照扩展为带版本、校验和与地图哈希的持久化文件，并增加 gRPC 边界与 worker 内阻塞式 BARRIER 决策模式（当前为请求驱动异步环）。
+1. 为持久化重放快照增加内容校验和，并增加 gRPC 边界与 worker 内阻塞式 BARRIER 决策模式（当前为请求驱动异步环）。
 2. Observation、Action、Tool 与 DecisionTrace 的 Protobuf 生成代码接入（协议已定义，帧协议先行）。
 3. 增加路线稳定性窗口、重规划冷却时间，并支持替代道路恢复后的受控全局收益扫描；规则策略作为 Navigation Agent 的确定性回归基线。
 4. Protobuf/WebSocket 降采样实时帧与分块回放文件。

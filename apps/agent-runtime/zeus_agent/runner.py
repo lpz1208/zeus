@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Sequence
 
 from zeus_agent.client import (
     CreateSessionRequest,
@@ -64,11 +65,15 @@ class EpisodeTrace:
     model_latency_ms: float = 0.0
     model_input_tokens: int = 0
     model_output_tokens: int = 0
+    decision_latency_ms: float = 0.0
+    route_tool_calls: int = 0
     model_rationale: str = ""
     model_error: str | None = None
     graph_events: list[str] = field(default_factory=list)
     final_observation: VehicleObservation | None = None
     error: str | None = None
+    environment_result: dict | None = None
+    result_error: str | None = None
 
     def summary(self) -> str:
         lines = [
@@ -123,6 +128,9 @@ def run_episode(
     thread_id: str | None = None,
     resume: bool = False,
     interrupt_after: str | None = None,
+    algorithm_ids: Sequence[str] | None = None,
+    collect_result: bool = False,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> EpisodeTrace:
     """Runs one full episode: create -> decision loop -> final observation.
 
@@ -199,7 +207,13 @@ def run_episode(
             stack.enter_context(DecisionTraceStore(trace_path))
             if trace_path else None
         )
-        nodes = make_nodes(client, policy, model=model)
+        nodes = make_nodes(
+            client,
+            policy,
+            model=model,
+            algorithms=algorithm_ids,
+            should_cancel=should_cancel,
+        )
         graph = None
         graph_config = {
             "configurable": {"thread_id": run_thread_id},
@@ -328,6 +342,11 @@ def run_episode(
                 trace.ticks = final.tick
             except EnvironmentError as error:
                 trace.error = trace.error or error.message
+            if collect_result and trace.finished:
+                try:
+                    trace.environment_result = client.result(trace.session_id)
+                except EnvironmentError as error:
+                    trace.result_error = error.message
             close_session = not trace.interrupted
             trace.wall_seconds = time.monotonic() - started
 
@@ -372,6 +391,14 @@ def _populate_trace(trace: EpisodeTrace, state: dict) -> None:
     trace.model_latency_ms = state.get("model_latency_ms", 0.0)
     trace.model_input_tokens = state.get("model_input_tokens", 0)
     trace.model_output_tokens = state.get("model_output_tokens", 0)
+    node_latency = state.get("node_latency_ms", {})
+    trace.decision_latency_ms = sum(
+        float(node_latency.get(name, 0.0))
+        for name in (
+            "observe", "select_tools", "plan", "compare", "decide", "guard", "act"
+        )
+    )
+    trace.route_tool_calls = state.get("route_tool_calls", 0)
     trace.model_rationale = state.get("model_rationale", "")
     trace.model_error = state.get("model_error")
     trace.graph_events = list(state.get("events", []))

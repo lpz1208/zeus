@@ -60,9 +60,47 @@ printf 'reset\ts1\t900\t1\t30\t1.4\t2.0\t0\t1.25\t0\tod.csv\t\t\nstep_event\ts1\
   | ./build/zeus-map session-worker city.zmap
 ```
 
-HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v1` 四算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界还可创建进程内快照，并通过确定性动作重放恢复成独立 Session，用于实验分叉；跨 Worker 重启的持久化快照仍在后续计划中。
+HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v1` 四算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界可创建带版本的持久化快照，并通过确定性动作重放恢复成独立 Session；快照落在地图数据目录中，控制服务或 Worker 重启后仍可恢复。
 
 `apps/agent-runtime` 提供 A2 单导航智能体闭环（Python，uv 管理）：`EnvironmentClient` HTTP 传输抽象、`RulePolicy` 确定性基线、LangGraph 八节点主决策图（纯循环仅作故障兜底）、Action Guard、Gymnasium 风格适配器，以及严格 JSON 输出的 Chat Completions 兼容 `ModelProvider`。模型只能选择环境签发的 `candidateId`，失败时确定性降级为规则策略。运行时支持 SQLite Checkpointer、稳定 `thread_id` 中断/恢复，以及可查询的 Observation→Tools→Decision→Guard→Action DecisionTrace。`make agent-runtime-test` 跑单测；起服务后 `make agent-runtime-e2e` 在真实地图上验证封路→失效→重规划→到达全链路。
+
+批量评测入口按清单运行“场景 × 策略 × 重复次数”，首批策略包含固定算法、事件触发的单算法动态重规划、规则 Agent 和模型 Agent；版本化报告内嵌原始清单，记录成功率、旅行时间、路线长度、重规划、路线工具调用、拥堵暴露、节点级决策延迟、实时倍率、token 与可配置模型费用，并导出 JSON 和逐次运行 CSV：
+
+```bash
+cd apps/agent-runtime
+cp examples/benchmark.example.json /tmp/zeus-benchmark.json
+# 编辑 mapId、OD、控制事件；若保留 model-agent，还需配置下方三个模型变量。
+uv run python -m zeus_agent.benchmark_cli \
+  --manifest /tmp/zeus-benchmark.json \
+  --output /tmp/zeus-benchmark-report.json \
+  --csv /tmp/zeus-benchmark-runs.csv
+```
+
+前端或其他客户端应通过持久化任务服务运行长实验，而不是直接启动 CLI。任务服务默认监听 `127.0.0.1:8090`，使用 SQLite 保存清单、进度、取消状态和报告，并通过受限线程池控制并发；Go 控制面默认把同源 `/api/benchmarks` 代理到该服务：
+
+```bash
+# 先在另一个终端运行 make run
+make agent-benchmark-service
+
+curl -X POST http://127.0.0.1:8080/api/benchmarks \
+  -H 'Content-Type: application/json' \
+  --data-binary @apps/agent-runtime/examples/benchmark.example.json
+```
+
+任务 API：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/benchmarks` | 校验清单并创建异步任务 |
+| `GET` | `/api/benchmarks?limit=50` | 查询最近任务 |
+| `GET` | `/api/benchmarks/{id}` | 查询状态与运行进度 |
+| `GET` | `/api/benchmarks/{id}/result` | 获取完成或已取消任务的报告 |
+| `POST` | `/api/benchmarks/{id}/cancel` | 请求安全边界取消 |
+| `GET` | `/health` | 服务健康检查 |
+
+服务重启时，未完成任务会从头重新排队，以保证每次策略对照使用完整一致的 Episode；运行中取消会在当前安全决策边界生效。若正等待模型响应，最长等待时间由 `--model-timeout` 限制。可用 `--workers` 和 `--max-pending` 控制同时运行数与队列容量。
+
+Web 顶栏的 `BENCH` 工作区使用同源 `/api/benchmarks`，可编辑多场景与四类策略，查看场景 × 策略进度、取消任务、浏览历史和聚合指标，并下载 JSON/CSV 报告。Go 服务可用 `--benchmark-url` 覆盖上游地址；只有需要绕过控制面调试时，才使用前端环境变量 `VITE_BENCHMARK_BASE_URL` 直连任务服务。
 
 默认 CLI 使用 LangGraph + 规则基线；接兼容模型服务时只从环境变量读取密钥：
 
@@ -91,7 +129,7 @@ uv run python -m zeus_agent.trace \
   --db .runs/traces.sqlite --thread-id experiment-01 --node decide
 ```
 
-这里持久化的是 Agent 图状态；当前环境 Session 仍由常驻 C++ Worker 持有，因此跨 Worker 重启恢复还需要后续的环境快照文件。
+Agent 图状态和环境快照分开持久化：LangGraph SQLite 保存决策节点，控制面保存带地图标识、请求、动作日志和目标 tick 的环境快照；恢复时若原 Session 已丢失，会从环境快照确定性重建。
 
 ## OSM 转向限制
 

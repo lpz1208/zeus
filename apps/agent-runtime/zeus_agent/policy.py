@@ -82,3 +82,46 @@ class RulePolicy:
             valid,
             key=lambda c: (c.time_s, c.length_m or float("inf"), c.candidate_id),
         )
+
+
+@dataclass(frozen=True)
+class FixedRoutePolicy:
+    """Static baseline: keep the route selected at session creation."""
+
+    def decide(
+        self,
+        observation: VehicleObservation,
+        candidates: Sequence[RouteCandidate],
+        tools: AgentToolRegistry | None,
+    ) -> Decision:
+        del observation, candidates, tools
+        return Decision("keep_route", reason="fixed_route_baseline")
+
+
+@dataclass(frozen=True)
+class ReactiveAlgorithmPolicy:
+    """Traditional baseline: re-run one algorithm only after invalidation."""
+
+    algorithm: str = "astar"
+
+    def decide(
+        self,
+        observation: VehicleObservation,
+        candidates: Sequence[RouteCandidate],
+        tools: AgentToolRegistry | None,
+    ) -> Decision:
+        del tools
+        if not observation.route_invalidated:
+            return Decision("keep_route", reason="reactive_wait")
+        candidate = next(
+            (item for item in candidates
+             if item.ok and item.algorithm == self.algorithm),
+            None,
+        )
+        if candidate is None:
+            return Decision("keep_route", reason="reactive_no_candidate")
+        return Decision(
+            "commit_route",
+            candidate_id=candidate.candidate_id,
+            reason="reactive_invalidation",
+        )

@@ -11,6 +11,9 @@ import type {
   AgentStepResponse,
   AgentToolRegistry,
   AgentVehicleObservation,
+  BenchmarkJob,
+  BenchmarkManifest,
+  BenchmarkReport,
   ImportJob,
   InspectResult,
   IssueGeoJSON,
@@ -30,6 +33,10 @@ import type {
   SimulateResponse,
 } from './types'
 
+const benchmarkBaseUrl = (
+  import.meta.env.VITE_BENCHMARK_BASE_URL || ''
+).replace(/\/$/, '')
+
 async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init)
   if (!response.ok) {
@@ -46,7 +53,37 @@ async function request<T>(input: RequestInfo | URL, init?: RequestInit): Promise
   return response.json() as Promise<T>
 }
 
+function benchmarkRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  return request(`${benchmarkBaseUrl}${path}`, init)
+}
+
 export const api = {
+  listBenchmarkJobs(limit = 50): Promise<BenchmarkJob[]> {
+    return benchmarkRequest(`/api/benchmarks?limit=${encodeURIComponent(limit)}`)
+  },
+
+  getBenchmarkJob(id: string): Promise<BenchmarkJob> {
+    return benchmarkRequest(`/api/benchmarks/${encodeURIComponent(id)}`)
+  },
+
+  createBenchmarkJob(manifest: BenchmarkManifest): Promise<BenchmarkJob> {
+    return benchmarkRequest('/api/benchmarks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(manifest),
+    })
+  },
+
+  cancelBenchmarkJob(id: string): Promise<BenchmarkJob> {
+    return benchmarkRequest(`/api/benchmarks/${encodeURIComponent(id)}/cancel`, {
+      method: 'POST',
+    })
+  },
+
+  getBenchmarkReport(id: string): Promise<BenchmarkReport> {
+    return benchmarkRequest(`/api/benchmarks/${encodeURIComponent(id)}/result`)
+  },
+
   listMaps(): Promise<MapRecord[]> {
     return request('/api/maps')
   },
