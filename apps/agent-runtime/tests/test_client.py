@@ -27,7 +27,7 @@ def make_client(environment: FakeEnvironment):
 
 def test_tools_registry_parses(fake_client):
     registry = fake_client.tools()
-    assert registry.registry_version == "routing-tools-v1"
+    assert registry.registry_version == "routing-tools-v2"
     assert [a.algorithm_id for a in registry.algorithms] == ["dijkstra", "astar"]
 
 
@@ -70,10 +70,31 @@ def test_plan_candidate_round_trip(fake_client):
     fake_client.create_session(CreateSessionRequest(
         vehicles=[AgentVehicleSpec(from_lon=1, from_lat=2, to_lon=3, to_lat=4, agent=True)]))
     fake_client.step_until_event("ses_test")
-    candidate = fake_client.plan("ses_test", 0, "astar")
+    candidates = fake_client.plan("ses_test", 0, "astar")
+    assert len(candidates) == 1
+    candidate = candidates[0]
     assert candidate.ok and candidate.candidate_id == "cand-astar"
     assert candidate.based_on_state_version == 2
     assert candidate.time_s == 300.0
+
+
+def test_plan_returns_k_shortest_alternatives(fake_environment):
+    client = make_client(fake_environment)
+    client.create_session(CreateSessionRequest(
+        vehicles=[AgentVehicleSpec(from_lon=1, from_lat=2, to_lon=3, to_lat=4, agent=True)]))
+    client.step_until_event("ses_test")
+
+    candidates = client.plan("ses_test", 0, "kshortest", k_paths=3)
+
+    assert len(candidates) == 2
+    assert candidates[0].candidate_id == "cand-kshortest"
+    assert candidates[0].algorithm == "kshortest"
+    assert candidates[0].time_s == 450.0
+    assert candidates[1].candidate_id == "cand-kshortest-alt"
+    assert candidates[1].time_s == 600.0
+    assert candidates[1].edges == [7, 9, 99]
+    # The request carried the candidate count in camelCase.
+    assert fake_environment.last_plan_body.get("kPaths") == 3
 
 
 def test_action_request_uses_camel_aliases(fake_environment):

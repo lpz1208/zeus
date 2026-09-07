@@ -1115,6 +1115,8 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 | 2026-08-30 | 单 Agent 提供 Gymnasium 风格适配，多 Agent 提供 PettingZoo Parallel 风格适配；权威内部协议仍为 gRPC + Protobuf | 目标架构已确定，待实施 |
 | 2026-08-30 | Agent Environment v1 Protobuf 与 Go `DecisionCoordinator` 已落地：区分仿真/墙上时间，支持 Barrier、state version、TTL、超时 fallback 和并发关闭回收；尚未接入 C++ 逐 tick Session | 部分已实现 |
 | 2026-08-30 | C++ `SimulationSession` 以 tick 边界控制器封装原确定性内核，已支持 reset、step、observe、run-to-end、pause、close、单调 state version 和部分结果；墙上屏障等待不计入 compute_ms | 已实现进程内 API，待接 Worker 协议 |
+| 2026-09-06 | 工程加固第一批：GitHub Actions CI、前端依赖精确锁定、Go 控制面 job 保留期回收与 agent 会话 idle 清扫、result 内联大小上限、Gym 适配器首步基线修复与模型瞬时错误指数退避重试 | 已实现 |
+| 2026-09-07 | 第五算法 Yen K 最短路（loopless，禁边 overlay + spur 伪起点携带根前缀代价；registry 升级 routing-tools-v2）与搜索 settle 序列记录全链路落地：plan 一次登记多条可提交候选、route 响应带 alternatives、Web 两工作台支持多候选对比与搜索波前动画回放 | 已实现 |
 
 ## 23. 变更记录
 
@@ -1146,3 +1148,4 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 | 2026-08-30 | 0.24 | 项目升级为地理空间导航智能体环境；增加 LangGraph Agent Runtime、算法 Tool Registry、动态切换安全门、有状态 Environment、分层多智能体与实施路线图 |
 | 2026-08-30 | 0.25 | 新增 Agent Environment v1 Protobuf 和 Go 决策屏障协调器，建立仿真时间/墙上时间分离、状态版本与有效期校验、超时 fallback 及并发回收基础 |
 | 2026-08-30 | 0.26 | 新增 C++ Stateful SimulationSession 与 tick 边界控制器，在保持一次性 run 兼容的同时支持逐步推进、暂停观察、单调版本、取消回收和 barrier/compute 耗时分离 |
+| 2026-09-07 | 0.27 | 新增 Yen K 最短路（第五算法，loopless 禁边 overlay + spur 伪起点携带根前缀代价，registry 升 v2）与搜索 settle trace 全链路：plan 多候选、route alternatives、Web 多候选对比与搜索波前动画 |

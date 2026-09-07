@@ -10,6 +10,7 @@ export const algorithmLabels: Record<RouteAlgorithm, string> = {
   astar: 'A*',
   bidijkstra: 'Bi-Dijkstra',
   biastar: 'Bi-A*',
+  kshortest: 'K-Shortest',
 }
 
 export function formatTime(seconds: number): string {

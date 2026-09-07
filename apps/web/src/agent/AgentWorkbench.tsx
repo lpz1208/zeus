@@ -60,6 +60,18 @@ export function AgentWorkbench({
     return agent.previewRoute
   }, [agent.candidates, agent.selectedCandidate, agent.session, agent.observation, agent.previewRoute, data])
 
+  // Unselected plan candidates render as ghost routes beside the selection,
+  // capped so a k-shortest batch cannot flood the map.
+  const candidateGhosts = useMemo<GeoJSON.FeatureCollection<GeoJSON.LineString> | null>(() => {
+    if (agent.candidates.length < 2) return null
+    const features = agent.candidates
+      .filter((item) => item.ok && item.edges?.length &&
+        item.candidateId !== agent.selectedCandidate)
+      .slice(0, 6)
+      .flatMap((item) => routeForEdges(data, item.edges)?.features ?? [])
+    return features.length ? { type: 'FeatureCollection', features } : null
+  }, [agent.candidates, agent.selectedCandidate, data])
+
   return (
     <main className="agent-shell">
       <header className="agent-topbar">
@@ -106,6 +118,9 @@ export function AgentWorkbench({
           routeStart={agent.origin}
           routeEnd={agent.destination}
           routeData={selectedRoute}
+          routeAlternativesData={candidateGhosts}
+          searchTrace={agent.searchTrace}
+          searchTraceProgress={agent.tracePlayback.progress}
           trajectoryData={null}
           vehicleFrame={agentFrame}
           junctionPickMode={false}

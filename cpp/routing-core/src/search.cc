@@ -23,6 +23,42 @@ double edgeCost(const SearchQuery& query, zeus::map::EdgeIndex edge_index,
     return edgeCostSeconds(edge) * factor;
 }
 
+// Search-trace recording: settle events are appended in order while the
+// sequence stays under twice the display budget; compactTrace then stride
+// samples anything above the budget down to it, always keeping the final
+// settle so the animation ends on the goal. True settle ordinals are kept so
+// the frontend can label progress against the total.
+constexpr std::size_t kTraceBudget = 20000;
+
+void recordSettle(std::vector<SearchTraceStep>& trace, std::uint64_t order,
+                  std::uint32_t node, double f, double g) {
+    if (trace.size() >= 2 * kTraceBudget) {
+        return;
+    }
+    SearchTraceStep step;
+    step.order = static_cast<std::uint32_t>(order);
+    step.node = node;
+    step.f = std::isfinite(f) ? f : 0.0;
+    step.g = std::isfinite(g) ? g : 0.0;
+    trace.push_back(step);
+}
+
+std::vector<SearchTraceStep> compactTrace(std::vector<SearchTraceStep> trace) {
+    if (trace.size() <= kTraceBudget) {
+        return trace;
+    }
+    std::vector<SearchTraceStep> compact;
+    compact.reserve(kTraceBudget + 1);
+    const std::size_t stride = (trace.size() + kTraceBudget - 1) / kTraceBudget;
+    for (std::size_t i = 0; i < trace.size(); i += stride) {
+        compact.push_back(trace[i]);
+    }
+    if (compact.back().order != trace.back().order) {
+        compact.push_back(trace.back());
+    }
+    return compact;
+}
+
 }  // namespace
 
 SearchOutput runShortestPathSearch(
@@ -111,6 +147,10 @@ SearchOutput runShortestPathSearch(
         }
         closed[node] = 1;
         ++output.expanded_nodes;
+        if (query.record_trace) {
+            recordSettle(output.trace, output.expanded_nodes,
+                         static_cast<std::uint32_t>(node), f, dist[node]);
+        }
 
         if (goal_at[node] != query.goals.size()) {
             const double total = dist[node] + goal_suffix[node];
@@ -144,6 +184,7 @@ SearchOutput runShortestPathSearch(
     }
 
     if (!output.found) {
+        output.trace = compactTrace(std::move(output.trace));
         return output;
     }
 
@@ -159,6 +200,7 @@ SearchOutput runShortestPathSearch(
         node = runtime.edge(edge_index).from;
     }
     std::reverse(output.node_edges.begin(), output.node_edges.end());
+    output.trace = compactTrace(std::move(output.trace));
     return output;
 }
 
@@ -237,6 +279,10 @@ SearchOutput runTurnAwareSearch(
         closed[incoming_edge] = 1;
         ++output.expanded_nodes;
         const zeus::map::NodeIndex node = data.edges[incoming_edge].to;
+        if (query.record_trace) {
+            recordSettle(output.trace, output.expanded_nodes,
+                         static_cast<std::uint32_t>(node), f, dist[incoming_edge]);
+        }
 
         for (const std::size_t goal_index : goals_at[node]) {
             const SearchEndpoint& goal = query.goals[goal_index];
@@ -273,6 +319,7 @@ SearchOutput runTurnAwareSearch(
     }
 
     if (!output.found) {
+        output.trace = compactTrace(std::move(output.trace));
         return output;
     }
     const zeus::map::EdgeIndex start_edge = query.starts[output.start_index].edge;
@@ -285,6 +332,7 @@ SearchOutput runTurnAwareSearch(
         edge = predecessor[edge];
     }
     std::reverse(output.node_edges.begin(), output.node_edges.end());
+    output.trace = compactTrace(std::move(output.trace));
     return output;
 }
 

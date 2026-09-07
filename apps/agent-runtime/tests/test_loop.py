@@ -134,3 +134,25 @@ def test_episode_cancellation_resolves_barrier_and_closes_session():
     assert not trace.finished
     assert environment.session_closed
     assert environment.keeps == 1
+
+
+def test_kshortest_plan_expands_multiple_candidates(fake_environment):
+    """One kshortest tool call surfaces all alternatives as candidates."""
+    from zeus_agent.graph import make_nodes
+
+    client = client_for(fake_environment)
+    client.create_session(CreateSessionRequest(
+        vehicles=[AgentVehicleSpec(from_lon=1, from_lat=2, to_lon=3, to_lat=4, agent=True)]))
+    client.step_until_event("ses_test")
+    nodes = make_nodes(client)
+
+    state = nodes["plan"]({
+        "session_id": "ses_test",
+        "vehicle_id": 0,
+        "selected_algorithms": ["kshortest"],
+    })
+
+    candidate_ids = [candidate.candidate_id for candidate in state["candidates"]]
+    assert candidate_ids == ["cand-kshortest", "cand-kshortest-alt"]
+    assert state["route_tool_calls"] == 1
+    assert fake_environment.last_plan_body.get("kPaths") == 3

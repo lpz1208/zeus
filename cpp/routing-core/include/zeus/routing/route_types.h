@@ -18,6 +18,7 @@ enum class Algorithm : std::uint8_t {
     kAStar = 1,
     kBidirectionalDijkstra = 2,
     kBidirectionalAStar = 3,
+    kKShortest = 4,
 };
 
 // Stable metadata exposed to navigation agents. Algorithms remain ordinary
@@ -77,6 +78,11 @@ struct RouteRequest {
     Algorithm algorithm = Algorithm::kDijkstra;
     double max_snap_distance_m = 100.0;
     std::size_t max_match_candidates = 8;
+    // Number of route candidates requested from k-shortest selection; clamped
+    // to [1, 8]. Values above 1 only take effect for Algorithm::kKShortest.
+    int k_paths = 1;
+    // Record the settle sequence of the underlying search for visualization.
+    bool record_trace = false;
     // Exact directed positions bypass map matching. Dynamic simulation
     // rerouting uses origin_position so a vehicle cannot jump to a nearby or
     // reverse edge when its route changes.
@@ -105,6 +111,26 @@ struct RouteStatistics {
     double compute_ms = 0.0;
 };
 
+// One candidate of a k-shortest selection. When non-empty,
+// RouteResult::alternatives holds every candidate including the best one, so
+// alternatives.front() mirrors RouteResult::path.
+struct RouteAlternative {
+    RoutePath path;
+    double time_s = 0.0;
+    double length_m = 0.0;
+    std::uint64_t expanded_nodes = 0;  // search effort attributed to this path
+};
+
+// One settled search state, in settle order. Node-state searches record the
+// settled node directly; edge-state searches record edges[edge].to so the
+// trace is a uniform node sequence for visualization.
+struct SearchTraceStep {
+    std::uint32_t order = 0;  // 1-based settle ordinal
+    std::uint32_t node = 0;
+    double f = 0.0;
+    double g = 0.0;
+};
+
 enum class RouteFailure : std::uint8_t {
     kNone = 0,
     kEmptyMap,
@@ -127,6 +153,12 @@ struct RouteResult {
     RouteEndpointMatch destination;
     RoutePath path;
     RouteStatistics stats;
+    // All k-shortest candidates (alternatives.front() == path); empty unless
+    // the request asked for more than one path.
+    std::vector<RouteAlternative> alternatives;
+    // Settle sequence of the search that produced `path`; empty unless the
+    // request set record_trace.
+    std::vector<SearchTraceStep> search_trace;
 };
 
 }  // namespace zeus::routing

@@ -20,6 +20,7 @@ from zeus_agent.client import (
     EnvironmentClient,
     EnvironmentError,
     FALLBACK_ALGORITHMS,
+    KSHORTEST_K,
     ActionRequest,
     RouteCandidate,
     StepResponse,
@@ -225,8 +226,12 @@ def make_nodes(
         candidates: list[RouteCandidate] = []
         for algorithm in plan_algorithms:
             try:
-                candidates.append(client.plan(
-                    state["session_id"], state.get("vehicle_id", 0), algorithm))
+                # k-shortest returns one candidate per path; everything else
+                # returns exactly one.
+                candidates.extend(client.plan(
+                    state["session_id"], state.get("vehicle_id", 0), algorithm,
+                    k_paths=(
+                        KSHORTEST_K if algorithm == "kshortest" else 1)))
             except EnvironmentError as error:
                 candidates.append(RouteCandidate(
                     candidate_id=f"failed-{algorithm}", algorithm=algorithm,
@@ -252,11 +257,13 @@ def make_nodes(
         candidates = state.get("candidates", [])
         registry = state.get("tool_registry")
         if model is not None:
+            model_started = time.monotonic()
             try:
                 response = model.decide(DecisionRequest(
                     observation=observation,
                     candidates=candidates,
                     tools=registry,
+                    should_cancel=should_cancel,
                     context=(
                         "The C++ environment is paused at a decision boundary. "
                         "The submitted action must be safe for the current state version."
@@ -290,6 +297,14 @@ def make_nodes(
                     "model_failures": state.get("model_failures", 0) + 1,
                     "model_error": str(error),
                     "model_rationale": "",
+                    "model_name": getattr(error, "model", "") or state.get("model_name", ""),
+                    "model_latency_ms": (
+                        state.get("model_latency_ms", 0.0)
+                        + (time.monotonic() - model_started) * 1000.0),
+                    "model_input_tokens": (
+                        state.get("model_input_tokens", 0) + getattr(error, "input_tokens", 0)),
+                    "model_output_tokens": (
+                        state.get("model_output_tokens", 0) + getattr(error, "output_tokens", 0)),
                     "events": [
                         *state.get("events", []),
                         f"decide:model_fallback:{type(error).__name__}:{decision.kind}",

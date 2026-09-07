@@ -18,7 +18,7 @@ import pytest
 from zeus_agent.client import HttpEnvironmentClient
 
 TOOLS = {
-    "registryVersion": "routing-tools-v1",
+    "registryVersion": "routing-tools-v2",
     "algorithms": [
         {"algorithmId": "dijkstra", "algorithmVersion": "1", "searchDirection": "forward"},
         {"algorithmId": "astar", "algorithmVersion": "1", "searchDirection": "forward"},
@@ -197,8 +197,9 @@ class FakeEnvironment:
         if tail == "ses_test/plan" and method == "POST":
             algorithm = body.get("algorithm", "dijkstra")
             self.planned_algorithms.append(algorithm)
+            self.last_plan_body = body
             best = algorithm == "astar"
-            return httpx.Response(200, json={
+            response = {
                 "candidateId": f"cand-{algorithm}",
                 "vehicleId": 0,
                 "algorithm": algorithm,
@@ -209,7 +210,26 @@ class FakeEnvironment:
                 "lengthM": 5000.0 if best else 6000.0,
                 "expandedNodes": 10,
                 "edges": [7, 8, 99] if best else [7, 12, 99],
-            })
+            }
+            # k-shortest requests surface their alternatives array.
+            if body.get("kPaths", 1) > 1:
+                response["alternatives"] = [
+                    {
+                        "candidateId": f"cand-{algorithm}",
+                        "timeS": response["timeS"],
+                        "lengthM": response["lengthM"],
+                        "expandedNodes": 10,
+                        "edges": response["edges"],
+                    },
+                    {
+                        "candidateId": f"cand-{algorithm}-alt",
+                        "timeS": 600.0,
+                        "lengthM": 7000.0,
+                        "expandedNodes": 14,
+                        "edges": [7, 9, 99],
+                    },
+                ]
+            return httpx.Response(200, json=response)
 
         if tail == "ses_test/step" and method == "POST":
             self.version += 1

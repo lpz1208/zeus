@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
+import { useTracePlayback } from '../hooks/useTracePlayback'
 import type {
   AgentRouteCandidate,
   AgentSessionCreated,
@@ -10,6 +11,7 @@ import type {
   MapRecord,
   RouteAlgorithm,
   RouteGeoJSON,
+  SearchTrace,
 } from '../types'
 import { algorithmLabels, formatTime } from './agentGeo'
 
@@ -38,7 +40,7 @@ export interface TimelineEvent {
 }
 
 const FALLBACK_ALGORITHMS: RouteAlgorithm[] = [
-  'dijkstra', 'astar', 'bidijkstra', 'biastar',
+  'dijkstra', 'astar', 'bidijkstra', 'biastar', 'kshortest',
 ]
 
 /**
@@ -60,6 +62,7 @@ export function useAgentSession(activeMap: MapRecord | null) {
   const [decisionId, setDecisionId] = useState<string | null>(null)
   const [candidates, setCandidates] = useState<AgentRouteCandidate[]>([])
   const [selectedCandidate, setSelectedCandidate] = useState<string | null>(null)
+  const [searchTrace, setSearchTrace] = useState<SearchTrace | null>(null)
   const [snapshots, setSnapshots] = useState<AgentSnapshot[]>([])
   const [timeline, setTimeline] = useState<TimelineEvent[]>([])
   const [tab, setTab] = useState<InspectorTab>('observation')
@@ -225,10 +228,28 @@ export function useAgentSession(activeMap: MapRecord | null) {
     setError('')
     try {
       const planned = await Promise.all(algorithms.map((item) => (
-        api.planAgentRoute(activeMap.id, session, agentVehicleId, item)
+        api.planAgentRoute(activeMap.id, session, agentVehicleId, item, {
+          kPaths: item === 'kshortest' ? 3 : 1,
+          recordTrace: true,
+        })
       )))
-      setCandidates(planned)
-      const best = planned
+      // k-shortest responses flatten their alternatives into the shared
+      // candidate list; every alternative is its own committable candidateId.
+      const flattened = planned.flatMap((item) => [
+        item,
+        ...(item.alternatives?.slice(1) ?? []).map((alternative) => ({
+          ...item,
+          candidateId: alternative.candidateId,
+          timeS: alternative.timeS,
+          lengthM: alternative.lengthM,
+          expandedNodes: alternative.expandedNodes,
+          edges: alternative.edges,
+          alternatives: undefined,
+        })),
+      ])
+      setCandidates(flattened)
+      setSearchTrace(planned.find((item) => item.searchTrace)?.searchTrace ?? null)
+      const best = flattened
         .filter((item) => item.ok && item.timeS !== undefined)
         .sort((left, right) => (left.timeS ?? Infinity) - (right.timeS ?? Infinity))[0]
       setSelectedCandidate(best?.candidateId ?? null)
@@ -236,7 +257,7 @@ export function useAgentSession(activeMap: MapRecord | null) {
         'tool',
         algorithms.length > 1 ? 'Tool comparison' : `Tool · ${algorithmLabels[algorithms[0]]}`,
         best
-          ? `${planned.length} candidates · best ${algorithmLabels[best.algorithm]} / ${formatTime(best.timeS ?? 0)}`
+          ? `${flattened.length} candidates · best ${algorithmLabels[best.algorithm]} / ${formatTime(best.timeS ?? 0)}`
           : 'no valid route candidate',
       )
       setTab('tools')
@@ -352,6 +373,8 @@ export function useAgentSession(activeMap: MapRecord | null) {
     }
   }
 
+  const tracePlayback = useTracePlayback(searchTrace)
+
   return {
     // mission setup
     origin, destination, algorithm, durationSeconds, decisionIntervalSeconds,
@@ -360,7 +383,7 @@ export function useAgentSession(activeMap: MapRecord | null) {
     registry, selectableAlgorithms,
     // live session
     session, state, observation, decisionId, agentVehicleId,
-    candidates, selectedCandidate,
+    candidates, selectedCandidate, searchTrace, tracePlayback,
     selectCandidate: setSelectedCandidate,
     snapshots, timeline, tab, setTab,
     busy, error,

@@ -989,3 +989,54 @@
   .map-legend { max-width: calc(100% - 36px); overflow: hidden; }
   .map-instruction { right: 12px; bottom: 57px; }
 }
+
+/* --- K 最短路候选与搜索过程回放 ------------------------------------ */
+.wb-k-input {
+  width: 52px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--paper); font-size: 11px; font-weight: 700;
+  font-family: inherit; color: var(--ink);
+}
+.wb-alts { margin-top: 12px; }
+.wb-alts-label {
+  font-size: 9.5px; letter-spacing: 0.12em; color: var(--quiet);
+  font-weight: 700; margin-bottom: 6px;
+}
+.wb-alts-list { display: flex; flex-direction: column; gap: 4px; }
+.wb-alt {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--paper); cursor: pointer; font-family: inherit;
+  color: var(--ink); text-align: left;
+}
+.wb-alt.is-active { border-color: #7c3aed; background: rgba(124, 58, 237, 0.08); }
+.wb-alt-index { font-size: 10px; font-weight: 800; color: #7c3aed; min-width: 24px; }
+.wb-alt-metrics { flex: 1; font-size: 11px; font-weight: 700; }
+.wb-alt-nodes { font-size: 10px; color: var(--quiet); }
+
+.wb-trace {
+  margin-top: 12px; padding: 10px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--paper);
+}
+.wb-trace-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.wb-trace-title {
+  font-size: 9.5px; letter-spacing: 0.12em; color: var(--quiet); font-weight: 700;
+}
+.wb-trace-sampled {
+  font-size: 9px; padding: 1px 6px; border-radius: 999px;
+  background: rgba(245, 158, 11, 0.15); color: #b45309; font-weight: 700;
+}
+.wb-trace-controls { display: flex; align-items: center; gap: 8px; }
+.wb-trace-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--paper); color: var(--ink); cursor: pointer;
+}
+.wb-trace-range { flex: 1; accent-color: #7c3aed; }
+.wb-trace-speeds { display: flex; gap: 3px; }
+.wb-trace-speed {
+  padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--paper); font-size: 10px; font-weight: 700;
+  color: var(--quiet); cursor: pointer; font-family: inherit;
+}
+.wb-trace-speed.is-active { border-color: #7c3aed; color: #7c3aed; }
+.wb-trace-meta { margin-top: 6px; font-size: 10px; color: var(--quiet); }

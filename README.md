@@ -1,16 +1,20 @@
 # Zeus
 
-Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。当前仓库已完成作为 Agent Environment 基础的地图引擎、四算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线，按车辆、道路和路口编排控制事件，配置转向级信号相位与独立饱和放行率，运行多车仿真并通过时间滑块回放车辆轨迹。封路、限速、降容和可选的周期拥堵扫描会更新动态路由权重并重规划受影响车辆，路段还可配置密度插值的出口放行间隔。
+[![CI](https://github.com/lpz1208/zeus/actions/workflows/ci.yml/badge.svg)](https://github.com/lpz1208/zeus/actions/workflows/ci.yml)
 
-平台已经把同步仿真演进为有状态 Environment：Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A* 和双向搜索作为 Tools 动态选择，并通过带状态版本的 Action 提交路线。LLM 不替代路径算法，也不进入逐 tick 热路径；D* Lite、K 最短路和时间依赖路由仍在后续计划中。
+Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。当前仓库已完成作为 Agent Environment 基础的地图引擎、五算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线（Yen K 最短路一次产出多条可对比候选，搜索扩展过程可动画回放），按车辆、道路和路口编排控制事件，配置转向级信号相位与独立饱和放行率，运行多车仿真并通过时间滑块回放车辆轨迹。封路、限速、降容和可选的周期拥堵扫描会更新动态路由权重并重规划受影响车辆，路段还可配置密度插值的出口放行间隔。
+
+平台已经把同步仿真演进为有状态 Environment：Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A*、双向搜索和 Yen K 最短路作为 Tools 动态选择，并通过带状态版本的 Action 提交路线；任意算法的搜索 settle 序列可记录并在 Web 以波前动画回放。LLM 不替代路径算法，也不进入逐 tick 热路径；D* Lite 和时间依赖路由仍在后续计划中。
 
 ## 快速启动
 
-环境需要 C++20、CMake、GDAL/OGR、Boost、Go、Node.js 和 Protobuf 编译器。
+环境需要 C++20、CMake、GDAL/OGR、Boost、Go、Node.js、curl 和 Protobuf 编译器。
 
 ```bash
 make run
 ```
+
+该命令构建并监管 Go 控制面与 Python Benchmark Job Service；任一进程异常退出会停止另一进程，`Ctrl-C` 会统一优雅关闭。
 
 然后访问：
 
@@ -60,9 +64,9 @@ printf 'reset\ts1\t900\t1\t30\t1.4\t2.0\t0\t1.25\t0\tod.csv\t\t\nstep_event\ts1\
   | ./build/zeus-map session-worker city.zmap
 ```
 
-HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v1` 四算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界可创建带版本的持久化快照，并通过确定性动作重放恢复成独立 Session；快照落在地图数据目录中，控制服务或 Worker 重启后仍可恢复。
+HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选（可带 `kPaths` 与 `recordTrace`，K 最短路一次返回多条各自可提交的候选）、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v2` 五算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界可创建带版本的持久化快照，并通过确定性动作重放恢复成独立 Session；快照落在地图数据目录中，控制服务或 Worker 重启后仍可恢复。
 
-`apps/agent-runtime` 提供 A2 单导航智能体闭环（Python，uv 管理）：`EnvironmentClient` HTTP 传输抽象、`RulePolicy` 确定性基线、LangGraph 八节点主决策图（纯循环仅作故障兜底）、Action Guard、Gymnasium 风格适配器，以及严格 JSON 输出的 Chat Completions 兼容 `ModelProvider`。模型只能选择环境签发的 `candidateId`，失败时确定性降级为规则策略。运行时支持 SQLite Checkpointer、稳定 `thread_id` 中断/恢复，以及可查询的 Observation→Tools→Decision→Guard→Action DecisionTrace。`make agent-runtime-test` 跑单测；起服务后 `make agent-runtime-e2e` 在真实地图上验证封路→失效→重规划→到达全链路。
+`apps/agent-runtime` 提供 A2 单导航智能体闭环（Python，uv 管理）：`EnvironmentClient` HTTP 传输抽象、`RulePolicy` 确定性基线、LangGraph 八节点主决策图（纯循环仅作故障兜底）、Action Guard、Gymnasium 风格适配器，以及严格 JSON 输出的 Chat Completions 兼容 `ModelProvider`。模型只能选择环境签发的 `candidateId`，失败时确定性降级为规则策略。成功和失败尝试中供应商已返回的 token 用量都会累计，失败耗时也进入模型延迟统计；未返回用量的超时请求无法推算实际计费。运行时支持 SQLite Checkpointer、稳定 `thread_id` 中断/恢复，以及可查询的 Observation→Tools→Decision→Guard→Action DecisionTrace。`make agent-runtime-test` 跑单测；起服务后 `make agent-runtime-e2e` 在真实地图上验证封路→失效→重规划→到达全链路。
 
 批量评测入口按清单运行“场景 × 策略 × 重复次数”，首批策略包含固定算法、事件触发的单算法动态重规划、规则 Agent 和模型 Agent；版本化报告内嵌原始清单，记录成功率、旅行时间、路线长度、重规划、路线工具调用、拥堵暴露、节点级决策延迟、实时倍率、token 与可配置模型费用，并导出 JSON 和逐次运行 CSV：
 
@@ -79,7 +83,10 @@ uv run python -m zeus_agent.benchmark_cli \
 前端或其他客户端应通过持久化任务服务运行长实验，而不是直接启动 CLI。任务服务默认监听 `127.0.0.1:8090`，使用 SQLite 保存清单、进度、取消状态和报告，并通过受限线程池控制并发；Go 控制面默认把同源 `/api/benchmarks` 代理到该服务：
 
 ```bash
-# 先在另一个终端运行 make run
+# 分步部署时先在另一个终端只运行 Go 控制面
+make run-control
+
+# 当前终端运行独立 Benchmark Job Service
 make agent-benchmark-service
 
 curl -X POST http://127.0.0.1:8080/api/benchmarks \
@@ -98,9 +105,11 @@ curl -X POST http://127.0.0.1:8080/api/benchmarks \
 | `POST` | `/api/benchmarks/{id}/cancel` | 请求安全边界取消 |
 | `GET` | `/health` | 服务健康检查 |
 
-服务重启时，未完成任务会从头重新排队，以保证每次策略对照使用完整一致的 Episode；运行中取消会在当前安全决策边界生效。若正等待模型响应，最长等待时间由 `--model-timeout` 限制。可用 `--workers` 和 `--max-pending` 控制同时运行数与队列容量。
+服务正常停机或异常退出后，未完成且未经用户取消的任务会在重启时从头重新排队，以保证每次策略对照使用完整一致的 Episode；用户取消会持久化，重启后不会执行。统一启动会等待控制 API 就绪后恢复评测，关闭时先停止评测并释放 Session，再关闭控制服务。运行中取消会中断模型请求或重试退避，并在当前安全决策边界生效。`--model-timeout` 是单次模型决策的总时间预算，包含所有请求、重试和退避（默认 60 秒）。可用 `--workers` 和 `--max-pending` 控制同时运行数与队列容量。
 
 Web 顶栏的 `BENCH` 工作区使用同源 `/api/benchmarks`，可编辑多场景与四类策略，查看场景 × 策略进度、取消任务、浏览历史和聚合指标，并下载 JSON/CSV 报告。Go 服务可用 `--benchmark-url` 覆盖上游地址；只有需要绕过控制面调试时，才使用前端环境变量 `VITE_BENCHMARK_BASE_URL` 直连任务服务。
+
+`make run` 的本地监管参数均可通过环境变量覆盖：`ZEUS_ADDR`、`ZEUS_CONTROL_BASE_URL`、`ZEUS_DATA_DIR`、`ZEUS_BENCHMARK_HOST`、`ZEUS_BENCHMARK_PORT`、`ZEUS_BENCHMARK_DB`、`ZEUS_BENCHMARK_WORKERS`、`ZEUS_BENCHMARK_MAX_PENDING` 和 `ZEUS_BENCHMARK_MODEL_TIMEOUT`。模型密钥仍只从服务进程环境读取。
 
 默认 CLI 使用 LangGraph + 规则基线；接兼容模型服务时只从环境变量读取密钥：
 

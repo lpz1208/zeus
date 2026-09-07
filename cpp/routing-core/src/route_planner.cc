@@ -5,6 +5,9 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
+
+#include "zeus/routing/kshortest.h"
 
 namespace zeus::routing {
 namespace {
@@ -189,6 +192,7 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
     SearchQuery query;
     query.algorithm = request.algorithm;
     query.overlay = request.overlay;
+    query.record_trace = request.record_trace;
 
     const auto costFactor = [&](zeus::map::EdgeIndex edge) {
         return request.overlay == nullptr ? 1.0 : request.overlay->edgeCostFactor(edge);
@@ -259,7 +263,72 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
         }
     }
 
-    const SearchOutput search = runtime_.hasTurnTransitions()
+    // K-shortest selection assembles its own result (best path plus the
+    // full candidate list) and never mixes with the single-path search below.
+    if (request.algorithm == Algorithm::kKShortest && request.k_paths > 1) {
+        const KShortestResult selection =
+            runKShortestPaths(runtime_, query, max_speed_mps_, request.k_paths);
+        const bool use_search =
+            selection.found && !selection.paths.empty() &&
+            selection.paths.front().total_time_s < direct.time_s;
+        if (!use_search && direct.time_s == kInfinity) {
+            result.failure = RouteFailure::kUnreachable;
+            result.message = "no path connects the matched origin and destination edges";
+            result.stats.expanded_nodes = selection.total_expanded_nodes;
+            return result;
+        }
+        if (use_search) {
+            result.alternatives.reserve(selection.paths.size());
+            for (const KShortestPath& candidate : selection.paths) {
+                const SearchEndpoint& start = query.starts[candidate.start_index];
+                const SearchEndpoint& goal = query.goals[candidate.goal_index];
+                RouteAlternative alternative;
+                alternative.path.edges.push_back(start.edge);
+                alternative.path.edges.insert(
+                    alternative.path.edges.end(), candidate.middle_edges.begin(),
+                    candidate.middle_edges.end());
+                if (goal.edge != start.edge || !candidate.middle_edges.empty()) {
+                    alternative.path.edges.push_back(goal.edge);
+                }
+                alternative.path.start_offset_m = start.offset_s;
+                alternative.path.end_offset_m = goal.offset_s;
+                alternative.time_s = candidate.total_time_s;
+                alternative.length_m = start.extra_length_m + goal.extra_length_m;
+                for (const zeus::map::EdgeIndex edge_index : candidate.middle_edges) {
+                    alternative.length_m += runtime_.edge(edge_index).length_m;
+                }
+                alternative.expanded_nodes = candidate.expanded_nodes;
+                result.alternatives.push_back(std::move(alternative));
+            }
+            result.path = result.alternatives.front().path;
+            result.stats.time_s = result.alternatives.front().time_s;
+            result.stats.length_m = result.alternatives.front().length_m;
+        } else {
+            const SearchEndpoint& start = query.starts[direct.start_index];
+            const SearchEndpoint& goal = query.goals[direct.goal_index];
+            RouteAlternative alternative;
+            alternative.path.edges.push_back(start.edge);
+            alternative.path.start_offset_m = start.offset_s;
+            alternative.path.end_offset_m = goal.offset_s;
+            alternative.time_s = direct.time_s;
+            alternative.length_m = direct.length_m;
+            result.path = alternative.path;
+            result.stats.time_s = direct.time_s;
+            result.stats.length_m = direct.length_m;
+            result.alternatives.push_back(std::move(alternative));
+        }
+        result.stats.expanded_nodes = selection.total_expanded_nodes;
+        if (request.record_trace) {
+            result.search_trace = std::move(selection.first_search.trace);
+        }
+        result.ok = true;
+        const auto k_end = std::chrono::steady_clock::now();
+        result.stats.compute_ms =
+            std::chrono::duration<double, std::milli>(k_end - start_time).count();
+        return result;
+    }
+
+    SearchOutput search = runtime_.hasTurnTransitions()
                                     ? runTurnAwareSearch(
                                           runtime_, query, max_speed_mps_, direct.time_s)
                                     : isBidirectional(request.algorithm)
@@ -305,6 +374,9 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
     }
 
     result.stats.expanded_nodes = search.expanded_nodes;
+    if (request.record_trace) {
+        result.search_trace = std::move(search.trace);
+    }
     result.ok = true;
     const auto end_time = std::chrono::steady_clock::now();
     result.stats.compute_ms = std::chrono::duration<double, std::milli>(end_time - start_time)

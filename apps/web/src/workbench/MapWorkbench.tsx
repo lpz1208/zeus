@@ -37,7 +37,7 @@ export function MapWorkbench({
     markServiceOnline: library.markOnline,
   })
   const interaction = useMapInteraction(library.activeMap)
-  const routeSim = useRouteSimulation(library.activeMap, {
+  const routeSim = useRouteSimulation(library.activeMap, library.roadData, {
     onRouteReady: () => setPanel('route'),
   })
   const playback = usePlayback(routeSim.simResult)
@@ -102,7 +102,10 @@ export function MapWorkbench({
         routeMode={routeSim.routeMode}
         routeStart={routeSim.routeStart}
         routeEnd={routeSim.routeEnd}
-        routeData={routeSim.routeResult?.geojson ?? null}
+        routeData={routeSim.routeMainData}
+        routeAlternativesData={routeSim.routeGhostData}
+        searchTrace={routeSim.routeResult?.searchTrace ?? null}
+        searchTraceProgress={routeSim.tracePlayback.progress}
         trajectoryData={routeSim.simResult?.geojson ?? null}
         vehicleFrame={vehicleFrame}
         junctionPickMode={routeSim.junctionPickMode}

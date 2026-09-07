@@ -22,12 +22,14 @@
 #include "zeus/map/map_validator.h"
 #include "zeus/map/osm_road_preprocessor.h"
 #include "zeus/map/shapefile_importer.h"
+#include "zeus/routing/kshortest.h"
 #include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
 
 #include "session_worker.h"
 #include "simulate_io.h"
+#include "trace_json.h"
 #include "zeus/simulation/simulation_engine.h"
 
 namespace {
@@ -259,6 +261,14 @@ int executeRoute(
     if (const auto found = options.find("max-distance"); found != options.end()) {
         request.max_snap_distance_m = std::stod(found->second);
     }
+    if (const auto found = options.find("k"); found != options.end() && !found->second.empty()) {
+        request.k_paths = std::clamp(std::stoi(found->second), 1,
+                                     zeus::routing::kMaxKPaths);
+    }
+    if (const auto found = options.find("trace-output");
+        found != options.end() && !found->second.empty()) {
+        request.record_trace = true;
+    }
 
     const zeus::routing::RouteResult result = planner.plan(request);
     output << std::fixed << std::setprecision(3);
@@ -294,6 +304,32 @@ int executeRoute(
            << "time_s=" << result.stats.time_s << '\n'
            << "expanded_nodes=" << result.stats.expanded_nodes << '\n'
            << "compute_ms=" << result.stats.compute_ms << '\n';
+    if (!result.alternatives.empty()) {
+        output << "alternatives=" << result.alternatives.size() << '\n';
+        for (std::size_t i = 0; i < result.alternatives.size(); ++i) {
+            const zeus::routing::RouteAlternative& alternative = result.alternatives[i];
+            output << "alt." << i << "=time_s:" << alternative.time_s
+                   << ",length_m:" << alternative.length_m
+                   << ",expanded_nodes:" << alternative.expanded_nodes
+                   << ",edges:";
+            for (std::size_t e = 0; e < alternative.path.edges.size(); ++e) {
+                if (e > 0) {
+                    output << ',';
+                }
+                output << alternative.path.edges[e];
+            }
+            output << '\n';
+        }
+    }
+    if (const auto found = options.find("trace-output");
+        found != options.end() && !found->second.empty()) {
+        std::ofstream trace_file(found->second);
+        if (!trace_file) {
+            throw std::runtime_error("cannot open trace output file: " + found->second);
+        }
+        zeus::writeSearchTrace(trace_file, result.search_trace);
+        output << "trace_output=" << found->second << '\n';
+    }
     if (const auto found_output = options.find("output");
         found_output != options.end() && !found_output->second.empty()) {
         const std::size_t features = zeus::routing::RouteGeoJsonExporter::save(
@@ -316,8 +352,8 @@ int runRouteWorker(const zeus::map::MapRuntime& runtime) {
         int exit_code = 1;
         try {
             const std::vector<std::string> fields = splitTabs(line);
-            if (fields.size() != 7) {
-                throw std::invalid_argument("route worker request must contain 7 tab fields");
+            if (fields.size() != 9) {
+                throw std::invalid_argument("route worker request must contain 9 tab fields");
             }
             Options options;
             options["lon"] = fields[0];
@@ -328,6 +364,12 @@ int runRouteWorker(const zeus::map::MapRuntime& runtime) {
             options["max-distance"] = fields[5];
             if (!fields[6].empty()) {
                 options["output"] = fields[6];
+            }
+            if (!fields[7].empty()) {
+                options["k"] = fields[7];
+            }
+            if (!fields[8].empty()) {
+                options["trace-output"] = fields[8];
             }
             exit_code = executeRoute(runtime, planner, options, payload);
         } catch (const std::exception& error) {

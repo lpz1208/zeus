@@ -2,7 +2,7 @@
 
 > 文档状态：目标架构，待分阶段实施
 >
-> 最后更新：2026-09-05
+> 最后更新：2026-09-07
 >
 > 关联文档：[overall-architecture.md](overall-architecture.md)、[simulation-core-design.md](simulation-core-design.md)、[routing-core-design.md](routing-core-design.md)
 
@@ -373,7 +373,7 @@ latency / token usage / failure and fallback
 
 ## 12. 分阶段实施计划
 
-### 当前落地状态（2026-09-05）
+### 当前落地状态（2026-09-07）
 
 - `zeus-map session-worker <map.zmap>` 常驻进程已实现：stdin/stdout tab 帧协议（`ZEUS_SESSION_WORKER`/`ZEUS_SESSION_RESPONSE`），命令覆盖 reset、observe、agent-observe、plan、commit、keep、step、step_event、resume、run-to-end、pause、snapshot、restore、drop-snapshot、result、close、shutdown；一个进程按 session_id 承载多张会话。`resume` 非阻塞启动引擎线程，允许同一命令通道继续处理 pause/observe 和其他会话。
 - 引擎在每个已提交 tick 边界发布 `TickSnapshot`：热边（占用/容量/封闭/速度与路由代价因子/均速）、agent 车辆切片（位置、路线、ETA、路线失效标记）、决策事件与原因；`step_event` 推进至 agent 路线失效或周期扫描事件后暂停。单车 Observation 通过地图空间索引筛选车辆 2 km 内最多 64 条热边，不再按全局热边顺序截断。
@@ -391,11 +391,13 @@ latency / token usage / failure and fallback
   - Action Guard：候选 ok、basedOnStateVersion 与观察版本一致、改进比 ≥10%（路线失效豁免改进与冷却检查）、提交冷却仅在自愿切换之间生效；提交失败确定性 fallback 为 keep_route；
   - Gymnasium 风格 `ZeusEnv`（reset/step，reward=ETA 减少量，惰性接入 gymnasium）与 `python -m zeus_agent.run` CLI；
   - Benchmark phase 1 已交付：JSON 清单定义场景、控制事件、固定种子、策略与重复次数；顺序运行 fixed、reactive、rule_agent、model_agent 四类策略，限制固定/反应式基线的算法工具集合；读取 C++ 权威结果与 playback edge KPI，按节点计时并聚合成功率、旅行时间、路线长度、重规划、路线工具调用、拥堵暴露、决策/模型延迟、实时倍率、token 和配置化费用，导出内嵌清单的版本化 JSON 与逐次运行 CSV。
-  - Benchmark Job Service 已交付：标准库 HTTP API 提交/列表/状态/结果/取消，SQLite 持久化清单、进度与报告，线程池限制并发和队列容量；运行中取消在决策安全边界提交 keep 并关闭 Session，排队任务可无执行取消；服务重启后未完成任务从头重新排队，模型密钥只从服务进程环境变量读取。
+  - Benchmark Job Service 已交付：标准库 HTTP API 提交/列表/状态/结果/取消，SQLite 持久化清单、进度与报告，线程池限制并发和队列容量；运行中取消在决策安全边界提交 keep 并关闭 Session，排队任务可无执行取消；服务停机只中断执行，保留未完成任务供重启后从头重新排队；用户取消会持久化且不恢复。模型密钥只从服务进程环境变量读取。
   - Go 控制面 Benchmark 同源代理已交付：`/api/benchmarks` 与全部任务子路径保留方法、查询、请求体、状态码和响应头转发到可配置上游；连接失败返回稳定 `502` JSON，非法配置返回 `503`，浏览器默认不再跨域直连 `8090`。
+  - 本地统一启动与健康聚合已交付：`make run` 监管 Go/Python 双进程，任一异常退出会回收另一进程，启动时等待 Go 控制 API 就绪再恢复任务；信号退出时 Benchmark Manager 先中断模型等待并在安全边界释放 Session，保留任务供重启恢复，然后关闭 Go 控制服务；`/api/health` 保持控制面 liveness，并独立报告 Benchmark readiness。端口、SQLite、Worker/队列容量和模型超时均可用环境变量配置。
   - Benchmark Web 工作台已交付：可视化组合多场景、OD、道路/车辆控制事件、重复次数和四类策略；异步提交后轮询任务、显示场景 × 策略进度矩阵、取消运行和浏览历史，完成报告提供跨策略聚合图表、逐次运行证据及 JSON/CSV 下载。已用真实任务服务验证提交→运行→取消/完成链路，并通过 1440/760/390 px 响应式冒烟。
   - 51 个单元测试（httpx.MockTransport 脚本化假环境，含 409→fallback、模型非法候选/非法 JSON、模型失败规则降级、LangGraph 与显式纯循环路径、SQLite 节点中断→跨调用恢复且不重复 Session/动作、DecisionTrace 去重与 thread_id 防碰撞、四策略评测矩阵、任务持久化/取消/恢复和 HTTP 生命周期）；e2e 封路场景在真实武汉地图通过：252 边路线 t=1517s 封中段边 → observe 后持久化中断 → 重新打开 SQLite 恢复 → 四算法比较 → commit → 4567 tick 到达，78 次决策、约 5.5s 墙钟，审计链完整。
-- 尚未实现：Benchmark 统一鉴权、用户级配额与进程监管、跨进程分布式任务调度、场景种子驱动的随机事件生成、路线抖动与无效动作等二阶段指标、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码/gRPC 接入、生产模型供应商的在线验收与密钥管理、D* Lite 与 K 最短路（比较器已算法无关）。
+- 2026-09-07 起第五算法 Yen K 最短路已接入 `routing-tools-v2`：plan 命令支持 `kPaths`/`recordTrace`，一次调用为每条候选登记独立 candidateId（compare/guard/模型提示均按候选泛化，无需感知算法差异），Python `client.plan` 返回候选列表、决策图自动展平；搜索 settle 序列可随 plan 响应内嵌 `searchTrace`，Web Agent 工作台支持多候选同屏与搜索波前动画。
+- 尚未实现：Benchmark 统一鉴权、用户级配额与生产级容器监管、跨进程分布式任务调度、场景种子驱动的随机事件生成、路线抖动与无效动作等二阶段指标、worker 内阻塞式 BARRIER 决策模式（现为请求驱动异步环）、Protobuf 生成代码/gRPC 接入、生产模型供应商的在线验收与密钥管理、D* Lite 与时间依赖路由。
 
 ### 2026-08-30 之前的状态（历史）
 

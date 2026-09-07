@@ -11,6 +11,7 @@ import {
   Wrench,
   Zap,
 } from 'lucide-react'
+import { TracePanel } from '../components/TracePanel'
 import type { AgentSessionApi } from './useAgentSession'
 import { algorithmLabels, formatTime } from './agentGeo'
 
@@ -91,24 +92,39 @@ export function AgentInspector({ agent }: { agent: AgentSessionApi }) {
             {candidates.length > 0 && (
               <section className="agent-candidates">
                 <div className="agent-section-label"><Route size={13} /><span>候选路线</span><small>{candidates.filter((item) => item.ok).length} VALID</small></div>
-                {candidates.map((candidate) => (
-                  <button
-                    type="button"
-                    className={`agent-candidate ${agent.selectedCandidate === candidate.candidateId ? 'is-selected' : ''}`}
-                    key={candidate.candidateId}
-                    disabled={!candidate.ok}
-                    onClick={() => agent.selectCandidate(candidate.candidateId)}
-                  >
-                    <span className="agent-candidate__check">{agent.selectedCandidate === candidate.candidateId ? <Check size={11} /> : null}</span>
-                    <span><strong>{algorithmLabels[candidate.algorithm]}</strong><small>{candidate.candidateId}</small></span>
-                    {candidate.ok
-                      ? <><b>{formatTime(candidate.timeS ?? 0)}</b><em>{((candidate.lengthM ?? 0) / 1000).toFixed(2)} km</em></>
-                      : <em>{candidate.reason}</em>}
-                  </button>
-                ))}
+                {candidates.map((candidate) => {
+                  // Same-algorithm k-shortest candidates get a rank suffix so
+                  // the labels stay distinguishable in the list.
+                  const sameAlgorithmCount = candidates.filter(
+                    (item) => item.algorithm === candidate.algorithm && item.ok,
+                  ).length
+                  const rank = candidates
+                    .filter((item) => item.algorithm === candidate.algorithm && item.ok)
+                    .findIndex((item) => item.candidateId === candidate.candidateId)
+                  const label = sameAlgorithmCount > 1 && candidate.ok
+                    ? `${algorithmLabels[candidate.algorithm]} #${rank + 1}`
+                    : algorithmLabels[candidate.algorithm]
+                  return (
+                    <button
+                      type="button"
+                      className={`agent-candidate ${agent.selectedCandidate === candidate.candidateId ? 'is-selected' : ''}`}
+                      key={candidate.candidateId}
+                      disabled={!candidate.ok}
+                      onClick={() => agent.selectCandidate(candidate.candidateId)}
+                    >
+                      <span className="agent-candidate__check">{agent.selectedCandidate === candidate.candidateId ? <Check size={11} /> : null}</span>
+                      <span><strong>{label}</strong><small>{candidate.candidateId}</small></span>
+                      {candidate.ok
+                        ? <><b>{formatTime(candidate.timeS ?? 0)}</b><em>{((candidate.lengthM ?? 0) / 1000).toFixed(2)} km</em></>
+                        : <em>{candidate.reason}</em>}
+                    </button>
+                  )
+                })}
                 <p className="agent-candidates__hint">通过地图上的决策横幅提交所选候选。</p>
               </section>
             )}
+
+            <TracePanel trace={agent.searchTrace} playback={agent.tracePlayback} />
           </>
         )}
 

@@ -194,9 +194,9 @@ POST /api/maps/{id}/route
 
 ## 9. 下一步
 
-现有四算法已接入 `routing-tools-v1` Navigation Tool Registry：C++ 注册表统一声明算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性、精确性和启发式能力；Agent Session 的候选 ID 与独立 Action Guard 提交流程也已贯通。
+现有五算法（Dijkstra、A\*、双向 Dijkstra、双向 A\*、Yen K 最短路）已接入 `routing-tools-v2` Navigation Tool Registry：C++ 注册表统一声明算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性、精确性和启发式能力；Agent Session 的候选 ID 与独立 Action Guard 提交流程也已贯通。K 最短路在边态图上以"根路径末边 + 前缀代价（含转向罚时）"为 spur 伪起点、以禁边 overlay 实现 loopless Yen 语义（禁入根节点集 + 禁当前分叉边；B 堆按 (时间, 边序列) 确定性排序；K 上限 8、spur 搜索预算防爆）；一次 plan 为每条候选登记独立 candidateId，compare/guard 无需感知算法差异。前向搜索可按请求记录 settle 序列（order/nodeId/f/g；2 万步预算内全录、超限等距采样并强制保留末步），经 plan 响应内嵌 `searchTrace` 或 route 命令 trace 文件输出，Web 两处工作台以波前动画回放。
 
-1. 增加 K Shortest Paths，并按动态重规划研究需要评估 D* Lite、LPA* 和时间依赖路由的实现顺序。
+1. 按动态重规划研究需要评估 D* Lite、LPA* 和时间依赖路由的实现顺序。
 2. 支持 via-way、conditional restriction 和车型 AccessMask。
 3. restriction-safe 双向 edge-state 搜索，以及 ALT landmark 预处理。
 4. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。

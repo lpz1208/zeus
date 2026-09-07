@@ -213,6 +213,40 @@ class RouteCandidate(CamelModel):
     edges: list[int] = Field(default_factory=list)
 
 
+# Candidate count requested from k-shortest selection when the decision graph
+# selects that algorithm.
+KSHORTEST_K = 3
+
+
+class PlanAlternative(CamelModel):
+    """One k-shortest alternative inside a plan response."""
+
+    candidate_id: str
+    time_s: float | None = None
+    length_m: float | None = None
+    expanded_nodes: int | None = None
+    edges: list[int] = Field(default_factory=list)
+
+
+class PlanResponse(CamelModel):
+    """Plan response: the best candidate at top level, plus the k-shortest
+    alternatives array when the environment produced more than one path."""
+
+    candidate_id: str | None = None
+    vehicle_id: int = 0
+    algorithm: str = "dijkstra"
+    effective_algorithm: str | None = None
+    based_on_state_version: int | None = None
+    ok: bool = True
+    reason: str | None = None
+    message: str | None = None
+    time_s: float | None = None
+    length_m: float | None = None
+    expanded_nodes: int | None = None
+    edges: list[int] = Field(default_factory=list)
+    alternatives: list[PlanAlternative] = Field(default_factory=list)
+
+
 class StepResponse(CamelModel):
     state: SessionState
     decision_id: str | None = None
@@ -270,7 +304,9 @@ class EnvironmentClient(Protocol):
     def create_session(self, request: CreateSessionRequest) -> SessionState: ...
     def observe(self, session_id: str) -> SessionObservation: ...
     def observe_vehicle(self, session_id: str, vehicle_id: int) -> VehicleObservation: ...
-    def plan(self, session_id: str, vehicle_id: int, algorithm: str) -> RouteCandidate: ...
+    def plan(
+        self, session_id: str, vehicle_id: int, algorithm: str, *, k_paths: int = 1,
+    ) -> list[RouteCandidate]: ...
     def step(self, session_id: str, ticks: int = 1) -> StepResponse: ...
     def step_until_event(self, session_id: str, max_ticks: int = 100_000) -> StepResponse: ...
     def submit_action(self, session_id: str, action: ActionRequest) -> ActionAck: ...
@@ -354,13 +390,51 @@ class HttpEnvironmentClient:
             self._request(
                 "GET", f"{self._prefix}/sessions/{session_id}/agent/{vehicle_id}").json())
 
-    def plan(self, session_id: str, vehicle_id: int, algorithm: str) -> RouteCandidate:
-        return RouteCandidate.model_validate(
+    def plan(
+        self, session_id: str, vehicle_id: int, algorithm: str, *, k_paths: int = 1,
+    ) -> list[RouteCandidate]:
+        """Plan with one algorithm and return every candidate it produced.
+
+        A k-shortest selection yields one RouteCandidate per path (each with
+        its own environment-issued candidateId); every other algorithm yields
+        exactly one.
+        """
+        response = PlanResponse.model_validate(
             self._request(
                 "POST",
                 f"{self._prefix}/sessions/{session_id}/plan",
-                payload=AgentPlanRequest(vehicle_id=vehicle_id, algorithm=algorithm),
+                payload=AgentPlanRequest(
+                    vehicle_id=vehicle_id, algorithm=algorithm, k_paths=k_paths),
             ).json())
+        shared = {
+            "vehicle_id": response.vehicle_id,
+            "algorithm": response.algorithm,
+            "effective_algorithm": response.effective_algorithm,
+            "based_on_state_version": response.based_on_state_version,
+            "ok": response.ok,
+            "reason": response.reason,
+            "message": response.message,
+        }
+        if not response.alternatives:
+            return [RouteCandidate.model_validate({
+                **shared,
+                "candidate_id": response.candidate_id or "",
+                "time_s": response.time_s,
+                "length_m": response.length_m,
+                "expanded_nodes": response.expanded_nodes,
+                "edges": response.edges,
+            })]
+        return [
+            RouteCandidate.model_validate({
+                **shared,
+                "candidate_id": item.candidate_id,
+                "time_s": item.time_s,
+                "length_m": item.length_m,
+                "expanded_nodes": item.expanded_nodes,
+                "edges": item.edges,
+            })
+            for item in response.alternatives
+        ]
 
     def step(self, session_id: str, ticks: int = 1) -> StepResponse:
         return StepResponse.model_validate(
@@ -417,6 +491,8 @@ class HttpEnvironmentClient:
 class AgentPlanRequest(CamelModel):
     vehicle_id: int
     algorithm: str
+    # Candidate count for k-shortest selection; other algorithms ignore it.
+    k_paths: int = 1
 
 
 class AgentStepRequest(CamelModel):

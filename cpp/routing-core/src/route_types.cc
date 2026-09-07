@@ -8,7 +8,7 @@
 namespace zeus::routing {
 namespace {
 
-constexpr std::array<AlgorithmCapability, 4> kCapabilities = {{
+constexpr std::array<AlgorithmCapability, 5> kCapabilities = {{
     {Algorithm::kDijkstra, "1", "forward", true, false, false, false,
      true, true, false},
     {Algorithm::kAStar, "1", "forward", true, false, false, false,
@@ -17,6 +17,8 @@ constexpr std::array<AlgorithmCapability, 4> kCapabilities = {{
      false, false, true, true, false},
     {Algorithm::kBidirectionalAStar, "1", "bidirectional", true, false,
      false, false, true, true, true},
+    {Algorithm::kKShortest, "1", "forward", true, false, true, false,
+     true, true, false},
 }};
 
 }  // namespace
@@ -29,6 +31,8 @@ const char* algorithmName(Algorithm algorithm) {
             return "bidijkstra";
         case Algorithm::kBidirectionalAStar:
             return "biastar";
+        case Algorithm::kKShortest:
+            return "kshortest";
         case Algorithm::kDijkstra:
             break;
     }
@@ -56,6 +60,11 @@ bool parseAlgorithm(const std::string& value, Algorithm& algorithm) {
     }
     if (normalized == "biastar" || normalized == "bidirectional-astar") {
         algorithm = Algorithm::kBidirectionalAStar;
+        return true;
+    }
+    if (normalized == "kshortest" || normalized == "k-shortest" ||
+        normalized == "kshortest-paths" || normalized == "yen") {
+        algorithm = Algorithm::kKShortest;
         return true;
     }
     return false;

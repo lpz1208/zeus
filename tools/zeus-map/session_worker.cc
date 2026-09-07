@@ -15,12 +15,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "zeus/routing/kshortest.h"
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
 #include "zeus/simulation/simulation_engine.h"
 #include "zeus/simulation/simulation_session.h"
 
 #include "simulate_io.h"
+#include "trace_json.h"
 
 namespace zeus::cli {
 namespace {
@@ -228,7 +230,7 @@ private:
             if (fields.size() != 1) {
                 throw std::invalid_argument("tools requires 1 tab field");
             }
-            payload << "{\"registryVersion\": \"routing-tools-v1\", \"algorithms\": ";
+            payload << "{\"registryVersion\": \"routing-tools-v2\", \"algorithms\": ";
             writeAlgorithmCapabilities(payload);
             payload << "}";
             return 0;
@@ -597,8 +599,8 @@ private:
     }
 
     int commandPlan(const std::vector<std::string>& fields, std::ostringstream& out) {
-        if (fields.size() != 4) {
-            throw std::invalid_argument("plan requires 4 tab fields");
+        if (fields.size() != 6) {
+            throw std::invalid_argument("plan requires 6 tab fields");
         }
         WorkerSession& entry = requireSession(fields[1]);
         const std::uint32_t vehicle_id = parseUint(fields[2]);
@@ -609,6 +611,13 @@ private:
         if (!zeus::routing::parseAlgorithm(fields[3], algorithm)) {
             throw std::invalid_argument("unknown routing algorithm: " + fields[3]);
         }
+        // fields[4]: candidate count (empty/0 -> 1); fields[5]: trace flag.
+        int k_paths = 1;
+        if (!fields[4].empty()) {
+            k_paths = std::clamp(std::stoi(fields[4]), 1,
+                                 zeus::routing::kMaxKPaths);
+        }
+        const bool record_trace = fields[5] == "1";
         const zeus::simulation::SimulationSessionState state = entry.session->observe();
         const zeus::simulation::TickSnapshot snapshot = entry.session->snapshot();
         const zeus::simulation::AgentVehicleState* agent =
@@ -634,6 +643,8 @@ private:
         request.destination = entry.demands[vehicle_id].destination;
         request.algorithm = algorithm;
         request.overlay = &overlay;
+        request.k_paths = k_paths;
+        request.record_trace = record_trace;
         request.destination_position = zeus::routing::RoutePosition{
             agent->destination_edge, agent->route_end_offset_m};
         if (agent->state == zeus::simulation::VehicleState::kDriving) {
@@ -674,7 +685,51 @@ private:
             }
             out << planned.path.edges[i];
         }
-        out << "]}";
+        out << "]";
+        // Every k-shortest candidate becomes its own registered candidateId so
+        // commit_route can target any of them; the first reuses the top-level
+        // id that was registered above.
+        if (!planned.alternatives.empty()) {
+            out << ", \"alternatives\": [";
+            for (std::size_t i = 0; i < planned.alternatives.size(); ++i) {
+                const zeus::routing::RouteAlternative& alternative =
+                    planned.alternatives[i];
+                std::string alternative_id = candidate_id;
+                if (i > 0) {
+                    alternative_id =
+                        "cand-" + std::to_string(entry.next_candidate++);
+                    Candidate registered;
+                    registered.vehicle_id = vehicle_id;
+                    registered.algorithm = algorithm;
+                    registered.based_on_state_version = state.state_version;
+                    registered.time_s = alternative.time_s;
+                    registered.length_m = alternative.length_m;
+                    registered.edges = alternative.path.edges;
+                    entry.candidates[alternative_id] = registered;
+                }
+                if (i > 0) {
+                    out << ", ";
+                }
+                out << "{\"candidateId\": " << jsonString(alternative_id)
+                    << ", \"timeS\": " << jsonNumber(alternative.time_s)
+                    << ", \"lengthM\": " << jsonNumber(alternative.length_m)
+                    << ", \"expandedNodes\": " << alternative.expanded_nodes
+                    << ", \"edges\": [";
+                for (std::size_t e = 0; e < alternative.path.edges.size(); ++e) {
+                    if (e > 0) {
+                        out << ", ";
+                    }
+                    out << alternative.path.edges[e];
+                }
+                out << "]}";
+            }
+            out << "]";
+        }
+        if (record_trace && !planned.search_trace.empty()) {
+            out << ", \"searchTrace\": ";
+            zeus::writeSearchTrace(out, planned.search_trace);
+        }
+        out << "}";
         return 0;
     }
 

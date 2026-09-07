@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api'
+import { routeForEdges } from '../agent/agentGeo'
+import { useTracePlayback, type TracePlaybackApi } from '../hooks/useTracePlayback'
 import type {
   MapRecord,
+  RoadGeoJSON,
   RouteAlgorithm,
+  RouteGeoJSON,
   RouteResponse,
   SimulateResponse,
   SimulationControls,
@@ -63,6 +67,18 @@ export interface RouteSimApi {
   toggleRouteMode(): void
   handleRoutePoint(longitude: number, latitude: number): void
   setRouteAlgorithm(algorithm: RouteAlgorithm): void
+  /** Candidate count for the kshortest selection. */
+  routeK: number
+  setRouteK(k: number): void
+  /** Selected k-shortest alternative (0 = best). */
+  selectedAltIndex: number
+  selectAlternative(index: number): void
+  /** GeoJSON drawn as the primary route, alternative-selection aware. */
+  routeMainData: RouteGeoJSON | null
+  /** Ghost geometry of the unselected alternatives. */
+  routeGhostData: GeoJSON.FeatureCollection<GeoJSON.LineString> | null
+  /** Search expansion replay clock for the latest result. */
+  tracePlayback: TracePlaybackApi
   clearRoute(): void
   runSimulation(): Promise<void>
   resetForMapChange(): void
@@ -79,6 +95,7 @@ export interface RouteSimApi {
  */
 export function useRouteSimulation(
   activeMap: MapRecord | null,
+  roadData: RoadGeoJSON,
   options: { onRouteReady(): void },
 ): RouteSimApi {
   const onRouteReadyRef = useRef(options.onRouteReady)
@@ -86,6 +103,8 @@ export function useRouteSimulation(
 
   const [routeMode, setRouteMode] = useState(false)
   const [routeAlgorithm, setRouteAlgorithmState] = useState<RouteAlgorithm>('dijkstra')
+  const [routeK, setRouteKState] = useState(3)
+  const [selectedAltIndex, setSelectedAltIndex] = useState(0)
   const [routeStart, setRouteStart] = useState<[number, number] | null>(null)
   const [routeEnd, setRouteEnd] = useState<[number, number] | null>(null)
   const [routeResult, setRouteResult] = useState<RouteResponse | null>(null)
@@ -129,6 +148,8 @@ export function useRouteSimulation(
         toLat: to[1],
         algorithm,
         maxDistance: 100,
+        kPaths: algorithm === 'kshortest' ? routeKRef.current : undefined,
+        recordTrace: true,
       })
       setRouteResult(result)
       onRouteReadyRef.current()
@@ -144,6 +165,8 @@ export function useRouteSimulation(
   // any new OD drops the route and the simulation result).
   const algorithmRef = useRef(routeAlgorithm)
   algorithmRef.current = routeAlgorithm
+  const routeKRef = useRef(routeK)
+  routeKRef.current = routeK
   const startRef = useRef(routeStart)
   startRef.current = routeStart
   const endRef = useRef(routeEnd)
@@ -168,6 +191,39 @@ export function useRouteSimulation(
       void computeRoute(startRef.current, endRef.current, algorithm)
     }
   }
+
+  const setRouteK = (k: number) => {
+    const clamped = Math.max(1, Math.min(8, Math.round(k) || 1))
+    setRouteKState(clamped)
+    setSimResult(null)
+    if (algorithmRef.current === 'kshortest' && startRef.current && endRef.current) {
+      void computeRoute(startRef.current, endRef.current, algorithmRef.current)
+    }
+  }
+
+  // New results reset the alternative selection and the trace clock (the
+  // useTracePlayback [trace] effect handles the clock).
+  useEffect(() => {
+    setSelectedAltIndex(0)
+  }, [routeResult])
+
+  const alternatives = routeResult?.ok ? routeResult.alternatives : undefined
+  const routeMainData = useMemo(() => {
+    if (!routeResult?.ok) return null
+    if (!alternatives?.length) return routeResult.geojson ?? null
+    const selected = alternatives[Math.min(selectedAltIndex, alternatives.length - 1)]
+    return routeForEdges(roadData, selected.edges) ?? routeResult.geojson ?? null
+  }, [alternatives, roadData, routeResult, selectedAltIndex])
+
+  const routeGhostData = useMemo(() => {
+    if (!alternatives || alternatives.length < 2) return null
+    const features = alternatives
+      .filter((_, index) => index !== selectedAltIndex)
+      .flatMap((alternative) => routeForEdges(roadData, alternative.edges)?.features ?? [])
+    return features.length ? { type: 'FeatureCollection' as const, features } : null
+  }, [alternatives, roadData, selectedAltIndex])
+
+  const tracePlayback = useTracePlayback(routeResult?.searchTrace ?? null)
 
   const runSimulation = async () => {
     if (!activeMap || !routeStart || !routeEnd) return
@@ -240,7 +296,9 @@ export function useRouteSimulation(
   }
 
   return {
-    routeMode, routeAlgorithm, routeStart, routeEnd, routeResult, routeBusy,
+    routeMode, routeAlgorithm, routeK, setRouteK, routeStart, routeEnd, routeResult, routeBusy,
+    selectedAltIndex, selectAlternative: setSelectedAltIndex,
+    routeMainData, routeGhostData, tracePlayback,
     simConfig, patchSimConfig, simResult, simBusy, simControls, scenarioDirty,
     applyControls, junctionPickMode, setJunctionPickMode, selectedControlNodeId,
     selectJunction, toggleRouteMode, handleRoutePoint, setRouteAlgorithm,

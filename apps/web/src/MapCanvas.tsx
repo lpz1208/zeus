@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import {
   LngLatBounds,
   Map as MapLibreMap,
@@ -21,6 +21,7 @@ import type {
   RoadGeoJSON,
   RoadProperties,
   RouteGeoJSON,
+  SearchTrace,
   TrajectoryGeoJSON,
   VehicleFrameGeoJSON,
 } from './types'
@@ -43,6 +44,12 @@ interface MapCanvasProps {
   routeStart: [number, number] | null
   routeEnd: [number, number] | null
   routeData: RouteGeoJSON | null
+  /** Unselected k-shortest alternatives drawn as ghost routes under the route. */
+  routeAlternativesData: GeoJSON.FeatureCollection<GeoJSON.LineString> | null
+  /** Recorded search settle sequence; null hides the expansion layer. */
+  searchTrace: SearchTrace | null
+  /** Fraction of trace steps revealed, in [0, 1]. */
+  searchTraceProgress: number
   trajectoryData: TrajectoryGeoJSON | null
   vehicleFrame: VehicleFrameGeoJSON
   junctionPickMode: boolean
@@ -158,6 +165,9 @@ export function MapCanvas({
   routeStart,
   routeEnd,
   routeData,
+  routeAlternativesData,
+  searchTrace,
+  searchTraceProgress,
   trajectoryData,
   vehicleFrame,
   junctionPickMode,
@@ -398,6 +408,18 @@ export function MapCanvas({
           'line-opacity': 0.45,
         },
       })
+      map.addSource('route-alts', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+      map.addLayer({
+        id: 'route-alts',
+        type: 'line',
+        source: 'route-alts',
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': '#94a3b8',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 8, 3, 16, 7],
+          'line-opacity': 0.4,
+        },
+      })
       map.addSource('route', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
       map.addLayer({
         id: 'route-casing',
@@ -437,6 +459,21 @@ export function MapCanvas({
           'icon-ignore-placement': true,
           'icon-rotation-alignment': 'map',
           'icon-rotate': ['match', ['get', 'DIRECTION'], 'reverse', 180, 0],
+        },
+      })
+      map.addSource('search-trace', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+      map.addLayer({
+        id: 'search-trace',
+        type: 'circle',
+        source: 'search-trace',
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 8, 2, 16, 4.5],
+          'circle-color': [
+            'interpolate', ['linear'],
+            ['/', ['get', 'ORDER'], ['max', ['get', 'TOTAL'], 1]],
+            0, '#38bdf8', 1, '#7c3aed',
+          ],
+          'circle-opacity': 0.8,
         },
       })
       map.addSource('nodes', { type: 'geojson', data: nodeDataRef.current })
@@ -741,6 +778,61 @@ export function MapCanvas({
     if (map.isStyleLoaded()) update()
     else map.once('load', update)
   }, [routeData])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const update = () => {
+      const source = map.getSource('route-alts') as GeoJSONSource | undefined
+      source?.setData(routeAlternativesData ?? { type: 'FeatureCollection', features: [] })
+    }
+    if (map.isStyleLoaded()) update()
+    else map.once('load', update)
+  }, [routeAlternativesData])
+
+  // nodeId -> position lookup so settle steps project onto the map without a
+  // server round trip; rebuilt whenever the published map changes.
+  const nodePointIndex = useMemo(() => {
+    const index = new Map<number, [number, number]>()
+    for (const feature of nodeData.features) {
+      const position = feature.geometry.coordinates
+      if (Array.isArray(position) && position.length === 2) {
+        index.set(feature.properties.NODE_INDEX, [position[0], position[1]])
+      }
+    }
+    return index
+  }, [nodeData])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const revealed = searchTrace
+      ? Math.max(1, Math.floor(searchTraceProgress * searchTrace.steps.length))
+      : 0
+    const features: GeoJSON.Feature<GeoJSON.Point>[] = []
+    if (searchTrace) {
+      for (const step of searchTrace.steps.slice(0, revealed)) {
+        const position = nodePointIndex.get(step.nodeId)
+        if (!position) continue
+        features.push({
+          type: 'Feature',
+          properties: {
+            ORDER: step.order,
+            TOTAL: searchTrace.stepCount,
+            F: step.f,
+            G: step.g,
+          },
+          geometry: { type: 'Point', coordinates: position },
+        })
+      }
+    }
+    const update = () => {
+      const source = map.getSource('search-trace') as GeoJSONSource | undefined
+      source?.setData({ type: 'FeatureCollection', features })
+    }
+    if (map.isStyleLoaded()) update()
+    else map.once('load', update)
+  }, [searchTrace, searchTraceProgress, nodePointIndex])
 
   useEffect(() => {
     const map = mapRef.current

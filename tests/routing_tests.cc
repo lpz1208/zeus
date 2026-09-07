@@ -601,12 +601,14 @@ void runTurnPenaltyTest() {
 
 void runAlgorithmCapabilityRegistryTest() {
     const auto capabilities = zeus::routing::algorithmCapabilities();
-    require(capabilities.size() == 4, "tool registry exposes all four algorithms");
+    require(capabilities.size() == 5, "tool registry exposes all five algorithms");
     for (const zeus::routing::AlgorithmCapability& capability : capabilities) {
+        const bool expects_k =
+            capability.algorithm == zeus::routing::Algorithm::kKShortest;
         require(capability.version != nullptr && capability.deterministic &&
                     capability.exact && capability.supports_dynamic_weights &&
                     !capability.supports_incremental_repair &&
-                    !capability.supports_k_candidates &&
+                    capability.supports_k_candidates == expects_k &&
                     !capability.supports_time_dependency,
                 "baseline capability flags match implemented search semantics");
         require(zeus::routing::algorithmCapability(capability.algorithm) == &capability,
@@ -622,6 +624,124 @@ void runAlgorithmCapabilityRegistryTest() {
     require(bidijkstra != nullptr && !bidijkstra->uses_heuristic &&
                 std::string(bidijkstra->search_direction) == "bidirectional",
             "bidirectional Dijkstra advertises its search direction");
+    const auto* kshortest = zeus::routing::algorithmCapability(
+        zeus::routing::Algorithm::kKShortest);
+    require(kshortest != nullptr && kshortest->supports_k_candidates &&
+                !kshortest->uses_heuristic &&
+                std::string(kshortest->search_direction) == "forward",
+            "k-shortest advertises multi-candidate forward search");
+    zeus::routing::Algorithm parsed = zeus::routing::Algorithm::kDijkstra;
+    require(zeus::routing::parseAlgorithm("kshortest", parsed) &&
+                parsed == zeus::routing::Algorithm::kKShortest &&
+                std::string(zeus::routing::algorithmName(parsed)) == "kshortest",
+            "k-shortest parses and names round-trip");
+    require(zeus::routing::parseAlgorithm("yen", parsed) &&
+                parsed == zeus::routing::Algorithm::kKShortest,
+            "k-shortest accepts its alias");
+}
+
+void runKShortestTest() {
+    // The detour fixture offers exactly two s-t paths: the selection must
+    // return what the graph has, not what was asked for.
+    {
+        Fixture fixture = makeDetourFixture(5.0);
+        PlanSetup setup(fixture.data);
+        zeus::routing::RouteRequest request =
+            makeRequest({-50.0, 1.0}, {150.0, 1.0}, zeus::routing::Algorithm::kKShortest);
+        request.k_paths = 4;
+        const zeus::routing::RouteResult result = setup.planner->plan(request);
+        require(result.ok, "k-shortest route succeeds");
+        require(result.alternatives.size() == 2,
+                "k-shortest returns the two distinct paths the graph offers");
+        require(result.alternatives.front().path.edges ==
+                    std::vector<zeus::map::EdgeIndex>({0, 2, 3, 4}),
+                "k-shortest first candidate is the plain shortest path");
+        require(result.alternatives.back().path.edges ==
+                    std::vector<zeus::map::EdgeIndex>({0, 1, 4}),
+                "k-shortest second candidate is the slow shortcut");
+        require(result.path.edges == result.alternatives.front().path.edges,
+                "best path mirrors the first alternative");
+        require(result.alternatives.front().time_s <= result.alternatives.back().time_s,
+                "k-shortest candidates are ordered by travel time");
+
+        const zeus::routing::RouteResult plain = setup.planner->plan(
+            makeRequest({-50.0, 1.0}, {150.0, 1.0}));
+        require(near(result.stats.time_s, plain.stats.time_s) &&
+                    near(result.alternatives.front().time_s, plain.stats.time_s),
+                "k-shortest first candidate matches the plain shortest time");
+
+        const zeus::routing::RouteResult again = setup.planner->plan(request);
+        require(again.alternatives.size() == result.alternatives.size(),
+                "k-shortest candidate count is deterministic");
+        for (std::size_t i = 0; i < result.alternatives.size(); ++i) {
+            require(again.alternatives[i].path.edges ==
+                        result.alternatives[i].path.edges &&
+                        near(again.alternatives[i].time_s,
+                             result.alternatives[i].time_s),
+                    "k-shortest candidates are deterministic");
+        }
+
+        zeus::routing::RouteRequest traced = request;
+        traced.record_trace = true;
+        const zeus::routing::RouteResult traced_result = setup.planner->plan(traced);
+        require(traced_result.ok && !traced_result.search_trace.empty(),
+                "recorded search trace is returned");
+        bool ordered = true;
+        for (std::size_t i = 1; i < traced_result.search_trace.size(); ++i) {
+            ordered = ordered && traced_result.search_trace[i].order >
+                                     traced_result.search_trace[i - 1].order;
+        }
+        require(ordered, "trace steps are in strictly increasing settle order");
+    }
+
+    // k = 1 degrades to the plain single-path search.
+    {
+        Fixture fixture = makeDetourFixture(5.0);
+        PlanSetup setup(fixture.data);
+        zeus::routing::RouteRequest request =
+            makeRequest({-50.0, 1.0}, {150.0, 1.0}, zeus::routing::Algorithm::kKShortest);
+        request.k_paths = 1;
+        const zeus::routing::RouteResult result = setup.planner->plan(request);
+        require(result.ok && result.alternatives.empty(),
+                "k=1 k-shortest behaves like a plain search without alternatives");
+        require(result.path.edges == std::vector<zeus::map::EdgeIndex>({0, 2, 3, 4}),
+                "k=1 k-shortest finds the plain shortest path");
+    }
+
+    // Turn-restricted maps route k-shortest through the edge-state search.
+    {
+        Fixture fixture = makeTurnFixture(true);
+        PlanSetup setup(fixture.data);
+        zeus::routing::RouteRequest request =
+            makeRequest({-90.0, 1.0}, {190.0, 1.0}, zeus::routing::Algorithm::kKShortest);
+        request.k_paths = 3;
+        const zeus::routing::RouteResult result = setup.planner->plan(request);
+        require(result.ok && !result.alternatives.empty(),
+                "turn-restricted k-shortest succeeds");
+        require(result.alternatives.front().path.edges ==
+                    std::vector<zeus::map::EdgeIndex>({0, 2, 3, 4}),
+                "turn-restricted k-shortest respects the prohibited transition");
+    }
+
+    // Unreachable destinations return a first-class failure.
+    {
+        Fixture fixture;
+        const zeus::map::NodeIndex a = fixture.addNode(0.0, 0.0);
+        const zeus::map::NodeIndex b = fixture.addNode(100.0, 0.0);
+        const zeus::map::NodeIndex c = fixture.addNode(0.0, 1000.0);
+        const zeus::map::NodeIndex d = fixture.addNode(100.0, 1000.0);
+        fixture.addEdge(a, b, 30.0);
+        fixture.addEdge(c, d, 30.0);
+        PlanSetup setup(fixture.data);
+        zeus::routing::RouteRequest request =
+            makeRequest({0.0, 0.0}, {100.0, 1000.0}, zeus::routing::Algorithm::kKShortest);
+        request.k_paths = 3;
+        const zeus::routing::RouteResult result = setup.planner->plan(request);
+        require(!result.ok && result.alternatives.empty(),
+                "unreachable k-shortest request fails without alternatives");
+        require(result.failure == zeus::routing::RouteFailure::kUnreachable,
+                "unreachable k-shortest reports the unreachable failure");
+    }
 }
 
 }  // namespace
@@ -646,6 +766,7 @@ int main() {
         runTurnRestrictionTest();
         runTurnPenaltyTest();
         runAlgorithmCapabilityRegistryTest();
+        runKShortestTest();
         std::cout << "all routing tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -8,6 +8,7 @@ import {
   Zap,
 } from 'lucide-react'
 import type { MapLibraryApi } from '../../hooks/useMapLibrary'
+import { TracePanel } from '../../components/TracePanel'
 import type { RouteSimApi } from '../useRouteSimulation'
 import { formatDuration, formatNumber, routeFailureLabel } from '../format'
 
@@ -18,7 +19,11 @@ interface RouteStageProps {
 
 export function RouteStage({ library, routeSim }: RouteStageProps) {
   const { activeMap } = library
-  const { routeMode, routeAlgorithm, routeStart, routeEnd, routeResult, routeBusy } = routeSim
+  const {
+    routeMode, routeAlgorithm, routeK, routeStart, routeEnd, routeResult, routeBusy,
+    selectedAltIndex, tracePlayback,
+  } = routeSim
+  const alternatives = routeResult?.ok ? routeResult.alternatives : undefined
   return (
     <section className="wb-section wb-route">
       <div className="section-label">
@@ -45,8 +50,22 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
             <option value="astar">A*</option>
             <option value="bidijkstra">BI-DIJKSTRA</option>
             <option value="biastar">BI-A*</option>
+            <option value="kshortest">K-SHORTEST</option>
           </select>
         </label>
+        {routeAlgorithm === 'kshortest' && (
+          <label className="wb-algo" title="K 最短路候选条数（1-8）">
+            <span>K</span>
+            <input
+              className="wb-k-input"
+              type="number"
+              min={1}
+              max={8}
+              value={routeK}
+              onChange={(event) => routeSim.setRouteK(Number(event.target.value))}
+            />
+          </label>
+        )}
         {(routeStart || routeEnd || routeResult) && (
           <button type="button" className="wb-route-clear" onClick={routeSim.clearRoute}>
             <X size={13} /> 清除
@@ -87,6 +106,28 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
                 <small>偏移 {routeResult.destination.offsetS.toFixed(1)} m · 距路 {routeResult.destination.distance.toFixed(1)} m · 置信 {Math.round(routeResult.destination.confidence * 100)}%</small>
               </div>
             </div>
+            {alternatives && alternatives.length > 1 && (
+              <div className="wb-alts">
+                <div className="wb-alts-label">候选路线（{alternatives.length}）</div>
+                <div className="wb-alts-list">
+                  {alternatives.map((alternative, index) => (
+                    <button
+                      key={index}
+                      type="button"
+                      className={`wb-alt ${index === selectedAltIndex ? 'is-active' : ''}`}
+                      onClick={() => routeSim.selectAlternative(index)}
+                    >
+                      <span className="wb-alt-index">#{index + 1}</span>
+                      <span className="wb-alt-metrics">
+                        {formatDuration(alternative.timeS)} · {(alternative.lengthM / 1000).toFixed(2)} km
+                      </span>
+                      <span className="wb-alt-nodes">{formatNumber(alternative.expandedNodes)} 节点</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <TracePanel trace={routeResult.searchTrace ?? null} playback={tracePlayback} />
           </>
         ) : (
           <div className="wb-route-state is-failed">

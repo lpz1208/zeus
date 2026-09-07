@@ -25,6 +25,8 @@ struct SearchQuery {
     std::vector<SearchEndpoint> goals;
     Algorithm algorithm = Algorithm::kDijkstra;
     const RoutingOverlay* overlay = nullptr;
+    // Record the settle sequence into SearchOutput::trace for visualization.
+    bool record_trace = false;
 };
 
 struct SearchOutput {
@@ -34,6 +36,9 @@ struct SearchOutput {
     std::size_t goal_index = 0;
     std::vector<zeus::map::EdgeIndex> node_edges;
     std::uint64_t expanded_nodes = 0;
+    // Settle sequence (bounded and possibly stride-sampled) when the query
+    // asked for record_trace.
+    std::vector<SearchTraceStep> trace;
 };
 
 // Multi-source multi-goal shortest path over the runtime CSR graph. Dijkstra
