@@ -9,10 +9,12 @@ deterministic Action Guard remains authoritative.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 import time
 from dataclasses import dataclass, field
-from typing import Literal, Mapping, Protocol, Sequence
+from typing import Awaitable, Callable, Literal, Mapping, Protocol, Sequence
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -31,6 +33,7 @@ class DecisionRequest:
     candidates: Sequence[RouteCandidate]
     tools: AgentToolRegistry | None = None
     context: str = ""
+    should_cancel: Callable[[], bool] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -48,7 +51,34 @@ class ModelProvider(Protocol):
 
 
 class ModelProviderError(RuntimeError):
-    """Provider transport, protocol or structured-output failure."""
+    """Failure with observed usage, including unsuccessful model attempts."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.model = ""
+        self.latency_ms = 0.0
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+
+@dataclass
+class _Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def add(self, body: object) -> None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict):
+            return
+        for source, target in (("prompt_tokens", "input_tokens"),
+                               ("completion_tokens", "output_tokens")):
+            value = usage.get(source)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                setattr(self, target, getattr(self, target) + value)
+
+
+class _TransientModelError(ModelProviderError):
+    """Retryable failure: transport glitch, HTTP 429/5xx, or malformed output."""
 
 
 class _DecisionEnvelope(BaseModel):
@@ -71,6 +101,7 @@ class _DecisionEnvelope(BaseModel):
 def _decision_payload(request: DecisionRequest) -> dict:
     """Bounded, provider-neutral prompt payload; no raw world dump."""
     observation = request.observation
+    hidden_candidates = max(0, len(request.candidates) - 16)
     return {
         "task": (
             "Select one environment-issued route candidate or keep the current "
@@ -118,7 +149,8 @@ def _decision_payload(request: DecisionRequest) -> dict:
                 "failure_reason": candidate.reason,
             }
             for candidate in request.candidates[:16]
-        ],
+        ] + ([f"...and {hidden_candidates} more candidates"]
+             if hidden_candidates else []),
         "tools": [
             {
                 "algorithm_id": capability.algorithm_id,
@@ -149,79 +181,158 @@ class OpenAICompatibleModelProvider:
     that accept ``POST /chat/completions`` and return
     ``choices[0].message.content``. Secrets are injected by the caller and are
     never read from project files or written to traces.
+
+    Transient failures are retried within one wall-clock deadline, including
+    request time and backoff. Cancellation aborts pending network IO as well
+    as backoff. The public interface stays synchronous; each decision owns
+    an async client reused across its attempts and closed on every exit.
+    Per-decision clients also keep concurrent benchmark jobs independent.
     """
 
-    api_key: str
+    api_key: str = field(repr=False)
     model: str
     base_url: str = "https://api.openai.com/v1"
     timeout_seconds: float = 60.0
     temperature: float = 0.0
-    transport: httpx.BaseTransport | None = None
+    transport: httpx.AsyncBaseTransport | None = None
+    max_retries: int = 2
+    retry_backoff_seconds: float = 1.0
+    sleep: Callable[[float], Awaitable[None]] = field(default=asyncio.sleep, repr=False)
 
     def decide(self, request: DecisionRequest) -> DecisionResponse:
+        started = time.monotonic()
+        usage = _Usage()
+        try:
+            response = asyncio.run(self._bounded_decide(request, usage))
+        except ModelProviderError as error:
+            error.model = self.model
+            error.latency_ms = (time.monotonic() - started) * 1000.0
+            error.input_tokens = usage.input_tokens
+            error.output_tokens = usage.output_tokens
+            raise
+        response.latency_ms = (time.monotonic() - started) * 1000.0
+        response.input_tokens = usage.input_tokens
+        response.output_tokens = usage.output_tokens
+        return response
+
+    async def _bounded_decide(self, request: DecisionRequest, usage: _Usage) -> DecisionResponse:
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ModelProviderError("model decision deadline exceeded")
+        if request.should_cancel and request.should_cancel():
+            raise ModelProviderError("model decision cancelled")
+
+        async def cancellation() -> None:
+            while not request.should_cancel():
+                await asyncio.sleep(0.05)
+            raise ModelProviderError("model decision cancelled")
+
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                pending = [asyncio.create_task(self._retry(request, usage))]
+                if request.should_cancel:
+                    pending.append(asyncio.create_task(cancellation()))
+                try:
+                    done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    # Prefer cancellation if completion and cancellation coincide.
+                    if len(pending) == 2 and pending[1] in done:
+                        await pending[1]
+                    return await pending[0]
+                finally:
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+        except TimeoutError as error:
+            raise ModelProviderError("model decision deadline exceeded") from error
+
+    async def _retry(self, request: DecisionRequest, usage: _Usage) -> DecisionResponse:
+        async with httpx.AsyncClient(
+            base_url=self.base_url.rstrip("/"),
+            timeout=self.timeout_seconds,
+            transport=self.transport,
+        ) as client:
+            attempts = max(0, self.max_retries) + 1
+            for attempt in range(attempts):
+                if request.should_cancel and request.should_cancel():
+                    raise ModelProviderError("model decision cancelled")
+                try:
+                    return await self._attempt(client, request, usage)
+                except _TransientModelError:
+                    if attempt == attempts - 1:
+                        raise
+                    await self.sleep(self.retry_backoff_seconds * (2 ** attempt))
+        raise ModelProviderError("model decision exhausted retries")
+
+    def close(self) -> None:
+        """Compatibility hook; decision-scoped clients are already closed."""
+
+    async def _attempt(
+        self, client: httpx.AsyncClient, request: DecisionRequest, usage: _Usage,
+    ) -> DecisionResponse:
         allowed_candidates = {
             candidate.candidate_id
             for candidate in request.candidates
             if candidate.ok
         }
-        started = time.monotonic()
         try:
-            with httpx.Client(
-                base_url=self.base_url.rstrip("/"),
-                timeout=self.timeout_seconds,
-                transport=self.transport,
-            ) as client:
-                response = client.post(
-                    "/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "temperature": self.temperature,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a navigation decision policy. Return one "
-                                    "JSON object only. You may select only a candidate_id "
-                                    "present in the request. Environment guards are final."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": json.dumps(
-                                    _decision_payload(request),
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                ),
-                            },
-                        ],
-                    },
-                )
+            response = await client.post(
+                "/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "temperature": self.temperature,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a navigation decision policy. Return one "
+                                "JSON object only. You may select only a candidate_id "
+                                "present in the request. Environment guards are final."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                _decision_payload(request),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ],
+                },
+            )
         except httpx.HTTPError as error:
-            raise ModelProviderError(f"model transport failed: {error}") from error
-        latency_ms = (time.monotonic() - started) * 1000.0
+            raise _TransientModelError(
+                f"model transport failed: {error}") from error
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        # Account before validating status, output schema or candidate ids.
+        usage.add(body)
+        if response.status_code == 429 or response.status_code >= 500:
+            raise _TransientModelError(
+                f"model HTTP {response.status_code}: {response.text[:300]}")
         if response.status_code >= 400:
             raise ModelProviderError(
                 f"model HTTP {response.status_code}: {response.text[:300]}")
         try:
-            body = response.json()
             raw = body["choices"][0]["message"]["content"]
             if not isinstance(raw, str):
                 raise TypeError("message content is not text")
             envelope = _DecisionEnvelope.model_validate_json(raw)
         except (KeyError, IndexError, TypeError, ValueError, ValidationError) as error:
-            raise ModelProviderError(f"invalid structured model response: {error}") from error
+            raise _TransientModelError(
+                f"invalid structured model response: {error}") from error
         if (
             envelope.action == "commit_route"
             and envelope.candidate_id not in allowed_candidates
         ):
             raise ModelProviderError(
                 f"model selected unknown candidate {envelope.candidate_id!r}")
-        usage = body.get("usage") or {}
         return DecisionResponse(
             decision=Decision(
                 kind=envelope.action,
@@ -230,9 +341,6 @@ class OpenAICompatibleModelProvider:
             ),
             rationale=envelope.rationale,
             model=str(body.get("model") or self.model),
-            latency_ms=latency_ms,
-            input_tokens=int(usage.get("prompt_tokens") or 0),
-            output_tokens=int(usage.get("completion_tokens") or 0),
         )
 
 

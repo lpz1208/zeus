@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -43,19 +44,38 @@ type jobEntry struct {
 	subscribers map[chan ImportJob]struct{}
 }
 
+const (
+	// defaultJobRetention is how long a terminal job stays queryable after it
+	// finished; SSE consumers have long received the final snapshot by then.
+	defaultJobRetention = time.Hour
+	// maxTerminalJobEntries is the backstop cap when traffic outpaces the
+	// retention window, so the registry cannot grow without bound.
+	maxTerminalJobEntries = 256
+)
+
 type JobManager struct {
-	mu      sync.RWMutex
-	entries map[string]*jobEntry
-	workers chan struct{}
+	mu          sync.RWMutex
+	entries     map[string]*jobEntry
+	workers     chan struct{}
+	retention   time.Duration
+	maxTerminal int
+	// now is swappable so sweep tests do not depend on wall-clock sleeps.
+	now func() time.Time
 }
 
-func NewJobManager(maxWorkers int) *JobManager {
+func NewJobManager(maxWorkers int, retention time.Duration) *JobManager {
 	if maxWorkers <= 0 {
 		maxWorkers = 1
 	}
+	if retention <= 0 {
+		retention = defaultJobRetention
+	}
 	return &JobManager{
-		entries: make(map[string]*jobEntry),
-		workers: make(chan struct{}, maxWorkers),
+		entries:     make(map[string]*jobEntry),
+		workers:     make(chan struct{}, maxWorkers),
+		retention:   retention,
+		maxTerminal: maxTerminalJobEntries,
+		now:         func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -72,6 +92,7 @@ func (m *JobManager) Submit(work importWork) ImportJob {
 	}
 	m.mu.Lock()
 	m.entries[entry.job.ID] = entry
+	m.sweepLocked(now)
 	initial := cloneJob(entry.job)
 	m.mu.Unlock()
 
@@ -132,13 +153,45 @@ func (m *JobManager) finish(id string, status JobStatus, record *MapRecord, err 
 }
 
 func (m *JobManager) Get(id string) (ImportJob, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sweepLocked(m.now())
 	entry, ok := m.entries[id]
 	if !ok {
 		return ImportJob{}, false
 	}
 	return cloneJob(entry.job), true
+}
+
+// sweepLocked drops terminal entries older than the retention window and, as
+// a backstop, the oldest terminal entries beyond the cap. Callers must hold
+// m.mu for writing. Removed entries keep their subscribers' unsubscribe
+// closures safe through the exists guard in Subscribe.
+func (m *JobManager) sweepLocked(now time.Time) {
+	type agedEntry struct {
+		id        string
+		updatedAt time.Time
+	}
+	var retained []agedEntry
+	for id, entry := range m.entries {
+		if !terminalJob(entry.job.Status) {
+			continue
+		}
+		if now.Sub(entry.job.UpdatedAt) > m.retention {
+			delete(m.entries, id)
+			continue
+		}
+		retained = append(retained, agedEntry{id: id, updatedAt: entry.job.UpdatedAt})
+	}
+	if len(retained) <= m.maxTerminal {
+		return
+	}
+	sort.Slice(retained, func(i, j int) bool {
+		return retained[i].updatedAt.Before(retained[j].updatedAt)
+	})
+	for _, victim := range retained[:len(retained)-m.maxTerminal] {
+		delete(m.entries, victim.id)
+	}
 }
 
 func (m *JobManager) Cancel(id string) (ImportJob, bool) {

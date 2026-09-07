@@ -116,7 +116,8 @@ class BenchmarkJobStore:
                 (job_id, created_at, total_runs, manifest_json),
             )
         job = self.get(job_id)
-        assert job is not None
+        if job is None:
+            raise BenchmarkJobNotFound(job_id)
         return job
 
     def get(self, job_id: str) -> BenchmarkJob | None:
@@ -192,7 +193,8 @@ class BenchmarkJobStore:
                         (job_id,),
                     )
         job = self.get(job_id)
-        assert job is not None
+        if job is None:
+            raise BenchmarkJobNotFound(job_id)
         return job
 
     def finish(
@@ -275,6 +277,7 @@ class BenchmarkJobManager:
             max_workers=max_workers, thread_name_prefix="zeus-benchmark"
         )
         self._lock = threading.Lock()
+        self._stopping = threading.Event()
         self._events: dict[str, threading.Event] = {}
         self._futures: dict[str, Future] = {}
         if recover:
@@ -288,6 +291,8 @@ class BenchmarkJobManager:
         ):
             raise ValueError("model_agent strategy requires a configured model provider")
         with self._lock:
+            if self._stopping.is_set():
+                raise RuntimeError("benchmark manager is shutting down")
             if self.store.active_count() >= self.max_pending:
                 raise BenchmarkQueueFull("benchmark queue is full")
             job = self.store.create(manifest)
@@ -306,13 +311,17 @@ class BenchmarkJobManager:
         )
 
     def _execute(self, job_id: str, event: threading.Event) -> None:
+        if self._stopping.is_set():
+            self._forget(job_id)
+            return
         if not self.store.claim(job_id):
             self._forget(job_id)
             return
         successful = 0
 
         def cancelled() -> bool:
-            return event.is_set() or self.store.cancel_requested(job_id)
+            return (self._stopping.is_set() or event.is_set()
+                    or self.store.cancel_requested(job_id))
 
         def progress(index: int, total: int, run: BenchmarkRun) -> None:
             nonlocal successful
@@ -332,7 +341,12 @@ class BenchmarkJobManager:
                 progress=progress,
                 should_cancel=cancelled,
             )
-            if report.cancelled or cancelled():
+            if (self._stopping.is_set() and report.cancelled
+                    and not self.store.cancel_requested(job_id)):
+                # Leave interrupted work recoverable. Shutdown is not a
+                # durable user cancellation; recover() restarts the episode.
+                return
+            if report.cancelled or self.store.cancel_requested(job_id):
                 self.store.finish(
                     job_id,
                     "cancelled",
@@ -342,6 +356,9 @@ class BenchmarkJobManager:
             else:
                 self.store.finish(job_id, "completed", report=report)
         except Exception as error:
+            if (self._stopping.is_set()
+                    and not self.store.cancel_requested(job_id)):
+                return
             status = "cancelled" if cancelled() else "failed"
             self.store.finish(job_id, status, error=str(error))
         finally:
@@ -364,7 +381,8 @@ class BenchmarkJobManager:
                     self._events.pop(job_id, None)
                     self._futures.pop(job_id, None)
         updated = self.store.get(job_id)
-        assert updated is not None
+        if updated is None:
+            raise BenchmarkJobNotFound(job_id)
         return updated
 
     def wait(self, job_id: str, timeout: float = 10.0) -> BenchmarkJob:
@@ -378,4 +396,6 @@ class BenchmarkJobManager:
         return job
 
     def close(self, wait: bool = True) -> None:
-        self._executor.shutdown(wait=wait, cancel_futures=False)
+        with self._lock:
+            self._stopping.set()
+        self._executor.shutdown(wait=wait, cancel_futures=True)

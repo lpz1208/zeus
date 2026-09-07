@@ -27,7 +27,7 @@ if [ "$1" != "route-worker" ]; then
 fi
 printf 'ZEUS_ROUTE_WORKER\t1\n'
 tab=$(printf '\t')
-while IFS="$tab" read -r from_lon from_lat to_lon to_lat algorithm max_distance output_path; do
+while IFS="$tab" read -r from_lon from_lat to_lon to_lat algorithm max_distance output_path k trace_path; do
   if [ "$algorithm" = "hang" ]; then
     continue
   fi
@@ -36,7 +36,14 @@ while IFS="$tab" read -r from_lon from_lat to_lon to_lat algorithm max_distance 
     exit_code=3
   else
     printf '{"type":"FeatureCollection","features":[]}' > "$output_path"
-    payload=$(printf 'route=ok\nalgorithm=%s\norigin.edge=1 road_id=10 source=a offset_s=1 distance=0 confidence=1\ndest.edge=2 road_id=20 source=b offset_s=2 distance=0 confidence=1\nedges=2\nlength_m=100\ntime_s=10\nexpanded_nodes=3\ncompute_ms=0.5\nworker_pid=%s' "$algorithm" "$$")
+    payload=$(printf 'route=ok\nalgorithm=%s\norigin.edge=1 road_id=10 source=a offset_s=1 distance=0 confidence=1\ndest.edge=2 road_id=20 source=b offset_s=2 distance=0 confidence=1\nedges=2\nlength_m=100\ntime_s=10\nexpanded_nodes=3\ncompute_ms=0.5\nworker_k=%s\nworker_pid=%s' "$algorithm" "$k" "$$")
+    if [ "$k" != "" ] && [ "$k" != "1" ]; then
+      payload=$(printf '%s\nalternatives=2\nalt.0=time_s:10,length_m:100,expanded_nodes:3,edges:1,2\nalt.1=time_s:20,length_m:200,expanded_nodes:5,edges:1,3' "$payload")
+    fi
+    if [ "$trace_path" != "" ]; then
+      printf '{"stepCount":2,"sampled":false,"steps":[{"order":1,"nodeId":7,"f":1.0,"g":0.0},{"order":2,"nodeId":8,"f":2.0,"g":1.0}]}' > "$trace_path"
+      payload=$(printf '%s\ntrace_output=%s' "$payload" "$trace_path")
+    fi
     exit_code=0
   fi
   size=$(printf '%s' "$payload" | wc -c | tr -d ' ')
@@ -197,3 +204,83 @@ func TestRouteHandlerUsesPersistentWorker(t *testing.T) {
 }
 
 func floatPointer(value float64) *float64 { return &value }
+
+func TestRouteWorkerRequestEncodesKAndTraceFields(t *testing.T) {
+	encoded, err := encodeRouteWorkerRequest(RouteWorkerRequest{
+		FromLon: 1, FromLat: 2, ToLon: 3, ToLat: 4,
+		Algorithm: "kshortest", MaxDistance: 100,
+		OutputPath: "/tmp/out.geojson", KPaths: 3, TracePath: "/tmp/trace.json",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Split(encoded, "\t")
+	if len(fields) != 9 || fields[7] != "3" || fields[8] != "/tmp/trace.json" {
+		t.Fatalf("unexpected encoded request: %q", encoded)
+	}
+
+	clamped, err := encodeRouteWorkerRequest(RouteWorkerRequest{
+		FromLon: 1, FromLat: 2, ToLon: 3, ToLat: 4,
+		Algorithm: "kshortest", MaxDistance: 100,
+		OutputPath: "/tmp/out.geojson", KPaths: 99,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fields := strings.Split(clamped, "\t"); fields[7] != "8" {
+		t.Fatalf("k was not clamped to 8: %q", clamped)
+	}
+}
+
+func TestRouteHandlerReturnsAlternativesAndTrace(t *testing.T) {
+	dataDir := t.TempDir()
+	mapID := "map_k_test"
+	mapDir := filepath.Join(dataDir, "maps", mapID)
+	if err := os.MkdirAll(mapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveJSONFile(filepath.Join(mapDir, "record.json"), MapRecord{ID: mapID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mapDir, "map.zmap"), []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(Config{
+		DataDir: dataDir, WebDir: t.TempDir(), ZeusMap: createFakeRouteWorker(t),
+		CmdLimit: time.Second, RouteWorkerMaps: 2,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer server.Close()
+	if err := server.ensureDirectories(); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := json.Marshal(RouteRequest{
+		FromLon: floatPointer(1), FromLat: floatPointer(2),
+		ToLon: floatPointer(3), ToLat: floatPointer(4),
+		Algorithm: "kshortest", KPaths: 3, RecordTrace: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/maps/"+mapID+"/route", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("k-shortest route failed: %d %s", response.Code, response.Body.String())
+	}
+	var parsed RouteResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Alternatives) != 2 ||
+		parsed.Alternatives[0].TimeS != 10 || parsed.Alternatives[1].TimeS != 20 ||
+		len(parsed.Alternatives[1].Edges) != 2 || parsed.Alternatives[1].Edges[1] != 3 {
+		t.Fatalf("alternatives were not parsed: %#v", parsed.Alternatives)
+	}
+	if !strings.Contains(string(parsed.SearchTrace), `"stepCount":2`) {
+		t.Fatalf("search trace was not inlined: %s", parsed.SearchTrace)
+	}
+}

@@ -1,7 +1,7 @@
 # Zeus Web 地图工作台
 
 > 状态：地图、Agent 与 Benchmark 工作台已实现
-> 最后更新：2026-09-05
+> 最后更新：2026-09-07
 
 ## 1. 定位
 
@@ -134,6 +134,8 @@ GeoJSON 输入要求根对象可被 GDAL 识别为矢量数据集，道路几何
 make run
 ```
 
+`make run` 会同时启动并监管 Go 控制面和 Python Benchmark Job Service；任一子进程退出都会终止整组服务，`Ctrl-C` 会向两者发送终止信号并等待清理完成。只启动控制面时使用 `make run-control`。
+
 页面地址：
 
 ```text
@@ -154,13 +156,15 @@ http://127.0.0.1:8080
 npm --prefix apps/web run dev
 ```
 
-Vite 会将 `/api` 代理到 `127.0.0.1:8080`，其中 `/api/benchmarks` 再由 Go 控制面转发到 Benchmark Job Service。
-
-运行 BENCH 工作台前另开终端启动持久化评测任务服务：
+Vite 会将 `/api` 代理到 `127.0.0.1:8080`，其中 `/api/benchmarks` 再由 Go 控制面转发到 Benchmark Job Service。分步开发时分别运行：
 
 ```bash
+make run-control
 make agent-benchmark-service
+npm --prefix apps/web run dev
 ```
+
+`GET /api/health` 始终报告控制面存活状态，并以 `ready` 和 `benchmark.status` 区分任务服务的 `online`、`unavailable` 或 `misconfigured` 状态；依赖不可用不会把控制面误报为宕机。
 
 ## 6. 数据目录
 
@@ -223,14 +227,14 @@ data/
 9. 尚未实现用户、项目和权限系统。
 10. 前端 MapLibre 目前打入主包，后续可按路由或模块进行代码分割。
 11. 仿真端点当前同步内联完整回放，受 40 万周期样本预算保护；十万级实时运行需要异步 Worker、分块回放和 WebSocket 二进制帧。
-12. Benchmark Job Service 已通过 Go 控制面提供同源反向代理，但仍是独立 Python 进程；尚未实现统一鉴权、用户级配额、自动进程监管和跨进程分布式调度。
+12. Benchmark Job Service 已通过 Go 控制面提供同源反向代理，`make run` 提供本地双进程监管；生产环境仍需容器编排或系统级守护，且尚未实现统一鉴权、用户级配额和跨进程分布式调度。
 13. Benchmark 清单会记录随机种子，但种子驱动的随机事故/拥堵生成器与路线抖动、无效动作等二阶段指标尚未实现。
 
 ## 9. 下一步
 
 1. 会话级暂停、单步、事件推进与恢复运行已随 Agent 会话交付；剩余部分是传统批量仿真的异步 run、分块回放和实时二进制帧。
 2. Agent 调试时间线已随 Agent 工作台交付（观察/工具/Guard/动作按仿真时间记录并带状态版本徽章）；剩余部分是 LLM Reasoning Summary 展示与决策回放。
-3. 为 Benchmark Job Service 增加统一鉴权、用户级配额和进程监管，并为长实验增加分布式调度、实时事件流和报告路由级代码分割。
+3. 为 Benchmark Job Service 增加统一鉴权和用户级配额，并为生产部署增加容器级监管、分布式调度、实时事件流和报告路由级代码分割。
 4. 为已实现的转向级信号相位增加冲突组、从转向车道数自动推导流率、自动配时，以及替代道路恢复后的重规划冷却与收益扫描。
 5. 增加问题筛选、批量确认、修复操作及版本差异对比。
 6. 将任务状态和地图元数据迁移到 PostgreSQL，并接入持久化工作队列。

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev libboost-dev protobuf-compiler
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/control-server/go.mod
+          cache-dependency-path: apps/control-server/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/agent-runtime/uv.lock
+
+      - name: Install web dependencies
+        run: npm --prefix apps/web ci
+
+      - name: Build and test all components
+        run: make test
+
+      - name: Go tests with race detector
+        run: cd apps/control-server && go test -race ./...

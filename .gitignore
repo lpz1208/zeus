@@ -12,3 +12,4 @@
 *.py[cod]
 *.zmap
 .DS_Store
+apps/control-server/build/

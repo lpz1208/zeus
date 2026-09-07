@@ -136,3 +136,60 @@ func TestBenchmarkProxyRejectsInvalidConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestHealthReportsBenchmarkDependency(t *testing.T) {
+	tests := []struct {
+		name       string
+		transport  http.RoundTripper
+		wantReady  bool
+		wantStatus string
+	}{
+		{
+			name: "online",
+			transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.String() != "http://benchmark.test/health" {
+					t.Fatalf("unexpected health URL: %s", request.URL)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				}, nil
+			}),
+			wantReady:  true,
+			wantStatus: "online",
+		},
+		{
+			name: "unreachable",
+			transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, errors.New("connection refused")
+			}),
+			wantStatus: "unavailable",
+		},
+		{
+			name: "invalid payload",
+			transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"ok":false}`)),
+				}, nil
+			}),
+			wantStatus: "unavailable",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := benchmarkProxyTestServer(t, "http://benchmark.test")
+			server.benchmarkHealth.client.Transport = test.transport
+			request := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+			response := httptest.NewRecorder()
+			server.routes().ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK ||
+				strings.Contains(response.Body.String(), `"ready":true`) != test.wantReady ||
+				!strings.Contains(response.Body.String(), `"status":"`+test.wantStatus+`"`) {
+				t.Fatalf("unexpected response %d: %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}

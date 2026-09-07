@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -43,6 +44,15 @@ type Config struct {
 	// AgentDecisionWallTTL bounds real-time agent reasoning. Simulation time
 	// does not advance while a request-driven decision is pending.
 	AgentDecisionWallTTL time.Duration
+	// JobRetentionTTL is how long finished import jobs stay queryable before
+	// the registry sweeps them.
+	JobRetentionTTL time.Duration
+	// AgentSessionIdleTTL bounds how long an untouched agent session stays
+	// registered before the sweeper closes and drops it.
+	AgentSessionIdleTTL time.Duration
+	// AgentResultMaxBytes caps the inline result payload an agent session can
+	// return; larger artifacts are refused instead of being read into memory.
+	AgentResultMaxBytes int64
 }
 
 type Server struct {
@@ -67,7 +77,12 @@ type Server struct {
 	decisionWallTTL time.Duration
 	// benchmarkProxy exposes the separately scaled Python job service through
 	// the control plane so browsers use one origin and one API boundary.
-	benchmarkProxy http.Handler
+	benchmarkProxy  http.Handler
+	benchmarkHealth *benchmarkHealthChecker
+	// agentSessionSweeperStop halts the idle-session sweeper on Close;
+	// closeOnce makes the shutdown path safe to call twice (defer + signal).
+	agentSessionSweeperStop chan struct{}
+	closeOnce               sync.Once
 }
 
 type APIError struct {
@@ -248,6 +263,11 @@ type RouteRequest struct {
 	ToLat       *float64 `json:"toLat"`
 	Algorithm   string   `json:"algorithm"`
 	MaxDistance float64  `json:"maxDistance"`
+	// KPaths requests k-shortest candidates (clamped to [1,8]); only the
+	// kshortest selection produces more than one alternative.
+	KPaths int `json:"kPaths"`
+	// RecordTrace returns the search settle sequence for visualization.
+	RecordTrace bool `json:"recordTrace"`
 }
 
 type RouteMatch struct {
@@ -257,6 +277,13 @@ type RouteMatch struct {
 	OffsetS    float64 `json:"offsetS"`
 	Distance   float64 `json:"distance"`
 	Confidence float64 `json:"confidence"`
+}
+
+type RouteAlternative struct {
+	TimeS         float64  `json:"timeS"`
+	LengthM       float64  `json:"lengthM"`
+	ExpandedNodes int64    `json:"expandedNodes"`
+	Edges         []uint32 `json:"edges"`
 }
 
 type RouteResponse struct {
@@ -275,6 +302,11 @@ type RouteResponse struct {
 	ExpandedNodes      int64           `json:"expandedNodes"`
 	ComputeMs          float64         `json:"computeMs"`
 	GeoJSON            json.RawMessage `json:"geojson,omitempty"`
+	// Alternatives lists every k-shortest candidate including the best one;
+	// omitted for single-path requests.
+	Alternatives []RouteAlternative `json:"alternatives,omitempty"`
+	// SearchTrace carries the settle sequence when the request recorded it.
+	SearchTrace json.RawMessage `json:"searchTrace,omitempty"`
 }
 
 var routeMatchPattern = regexp.MustCompile(
@@ -390,6 +422,9 @@ func main() {
 	flag.IntVar(&config.RouteWorkerMaps, "route-worker-maps", 4, "maximum resident route map workers")
 	flag.IntVar(&config.SessionWorkerMaps, "session-worker-maps", 2, "maximum resident agent session map workers")
 	flag.DurationVar(&config.AgentDecisionWallTTL, "agent-decision-wall-ttl", 5*time.Minute, "maximum wall time for one agent decision")
+	flag.DurationVar(&config.JobRetentionTTL, "job-retention-ttl", time.Hour, "how long finished import jobs stay queryable")
+	flag.DurationVar(&config.AgentSessionIdleTTL, "agent-session-idle-ttl", 10*time.Minute, "idle time before an agent session is closed and dropped")
+	flag.Int64Var(&config.AgentResultMaxBytes, "agent-result-max-bytes", 32<<20, "maximum inline agent session result payload size")
 	flag.Parse()
 
 	server := NewServer(config, slog.Default())
@@ -436,14 +471,23 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 	if config.BenchmarkURL == "" {
 		config.BenchmarkURL = defaultBenchmarkURL
 	}
+	if config.JobRetentionTTL <= 0 {
+		config.JobRetentionTTL = defaultJobRetention
+	}
+	if config.AgentSessionIdleTTL <= 0 {
+		config.AgentSessionIdleTTL = 10 * time.Minute
+	}
+	if config.AgentResultMaxBytes <= 0 {
+		config.AgentResultMaxBytes = 32 << 20
+	}
 	simSlots := config.SimulateWorkers
 	if simSlots <= 0 {
 		simSlots = 2
 	}
-	return &Server{
+	server := &Server{
 		config:         config,
 		logger:         logger,
-		jobs:           NewJobManager(config.ImportWorkers),
+		jobs:           NewJobManager(config.ImportWorkers, config.JobRetentionTTL),
 		simSlots:       make(chan struct{}, simSlots),
 		routeWorkers:   NewRouteWorkerManager(config.ZeusMap, config.CmdLimit, config.RouteWorkerMaps),
 		sessionWorkers: NewSessionWorkerManager(config.ZeusMap, 10*config.CmdLimit, config.SessionWorkerMaps),
@@ -451,22 +495,31 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 			sessions:  make(map[string]agentSessionEntry),
 			snapshots: make(map[string]agentSnapshotEntry),
 		},
-		decisions:       NewDecisionCoordinator(),
-		decisionWallTTL: config.AgentDecisionWallTTL,
-		benchmarkProxy:  newBenchmarkProxy(config.BenchmarkURL, logger),
+		decisions:               NewDecisionCoordinator(),
+		decisionWallTTL:         config.AgentDecisionWallTTL,
+		benchmarkProxy:          newBenchmarkProxy(config.BenchmarkURL, logger),
+		benchmarkHealth:         newBenchmarkHealthChecker(config.BenchmarkURL),
+		agentSessionSweeperStop: make(chan struct{}),
 	}
+	go server.agentSessionSweepLoop()
+	return server
 }
 
 func (s *Server) Close() {
-	if s.decisions != nil {
-		s.decisions.Close()
-	}
-	if s.sessionWorkers != nil {
-		s.sessionWorkers.Close()
-	}
-	if s.routeWorkers != nil {
-		s.routeWorkers.Close()
-	}
+	s.closeOnce.Do(func() {
+		if s.agentSessionSweeperStop != nil {
+			close(s.agentSessionSweeperStop)
+		}
+		if s.decisions != nil {
+			s.decisions.Close()
+		}
+		if s.sessionWorkers != nil {
+			s.sessionWorkers.Close()
+		}
+		if s.routeWorkers != nil {
+			s.routeWorkers.Close()
+		}
+	})
 }
 
 func (s *Server) ensureDirectories() error {
@@ -509,26 +562,32 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/maps/{id}/simulate", s.handleSimulate)
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions", s.handleCreateAgentSession)
 	mux.HandleFunc("GET /api/maps/{id}/agent/tools", s.handleAgentTools)
-	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}", s.handleObserveAgentSession)
-	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/agent/{vehicle}", s.handleAgentObserveVehicle)
-	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/plan", s.handleAgentPlan)
-	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/step", s.handleAgentStep)
-	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/actions", s.handleAgentAction)
-	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/run", s.handleAgentRunToEnd)
-	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/pause", s.handleAgentPause)
-	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/snapshots", s.handleCreateAgentSnapshot)
+	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}", s.withAgentSession(s.handleObserveAgentSession))
+	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/agent/{vehicle}", s.withAgentSession(s.handleAgentObserveVehicle))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/plan", s.withAgentSession(s.handleAgentPlan))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/step", s.withAgentSession(s.handleAgentStep))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/actions", s.withAgentSession(s.handleAgentAction))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/run", s.withAgentSession(s.handleAgentRunToEnd))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/pause", s.withAgentSession(s.handleAgentPause))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/snapshots", s.withAgentSession(s.handleCreateAgentSnapshot))
 	mux.HandleFunc("POST /api/maps/{id}/agent/snapshots/{snapshot}/restore", s.handleRestoreAgentSnapshot)
 	mux.HandleFunc("DELETE /api/maps/{id}/agent/snapshots/{snapshot}", s.handleDeleteAgentSnapshot)
-	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/result", s.handleAgentSessionResult)
-	mux.HandleFunc("DELETE /api/maps/{id}/agent/sessions/{session}", s.handleCloseAgentSession)
+	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/result", s.withAgentSession(s.handleAgentSessionResult))
+	mux.HandleFunc("DELETE /api/maps/{id}/agent/sessions/{session}", s.withAgentSession(s.handleCloseAgentSession))
 	mux.Handle("/api/benchmarks", s.benchmarkProxy)
 	mux.Handle("/api/benchmarks/", s.benchmarkProxy)
 	mux.Handle("/", spaHandler(s.config.WebDir))
 	return requestLogger(s.logger, mux)
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "zeus-control-server"})
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	benchmark := s.benchmarkHealth.check(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"ready":     benchmark.OK,
+		"service":   "zeus-control-server",
+		"benchmark": benchmark,
+	})
 }
 
 func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
@@ -1166,9 +1225,10 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		algorithm = "dijkstra"
 	}
 	if algorithm != "dijkstra" && algorithm != "astar" &&
-		algorithm != "bidijkstra" && algorithm != "biastar" {
+		algorithm != "bidijkstra" && algorithm != "biastar" &&
+		algorithm != "kshortest" {
 		writeError(w, http.StatusBadRequest,
-			"algorithm must be dijkstra, astar, bidijkstra or biastar")
+			"algorithm must be dijkstra, astar, bidijkstra, biastar or kshortest")
 		return
 	}
 	maxDistance := request.MaxDistance
@@ -1177,6 +1237,13 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	if maxDistance > 1000 {
 		maxDistance = 1000
+	}
+	kPaths := request.KPaths
+	if kPaths < 1 {
+		kPaths = 1
+	}
+	if kPaths > 8 {
+		kPaths = 8
 	}
 
 	outputFile, err := os.CreateTemp("", "zeus-route-*.geojson")
@@ -1191,6 +1258,23 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.Remove(outputPath)
 
+	tracePath := ""
+	if request.RecordTrace {
+		traceFile, traceErr := os.CreateTemp("", "zeus-trace-*.json")
+		if traceErr != nil {
+			writeError(w, http.StatusInternalServerError,
+				"create trace output: "+traceErr.Error())
+			return
+		}
+		tracePath = traceFile.Name()
+		if err := traceFile.Close(); err != nil {
+			writeError(w, http.StatusInternalServerError,
+				"close trace output: "+err.Error())
+			return
+		}
+		defer os.Remove(tracePath)
+	}
+
 	workerResult, err := s.routeWorkers.Route(r.Context(), record.Runtime, RouteWorkerRequest{
 		FromLon:     *request.FromLon,
 		FromLat:     *request.FromLat,
@@ -1199,6 +1283,8 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		Algorithm:   algorithm,
 		MaxDistance: maxDistance,
 		OutputPath:  outputPath,
+		KPaths:      kPaths,
+		TracePath:   tracePath,
 	})
 	if err != nil {
 		status := http.StatusUnprocessableEntity
@@ -1222,6 +1308,11 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	if geojson, readErr := os.ReadFile(outputPath); readErr == nil && json.Valid(geojson) {
 		response.GeoJSON = json.RawMessage(geojson)
+	}
+	if tracePath != "" {
+		if trace, readErr := os.ReadFile(tracePath); readErr == nil && json.Valid(trace) {
+			response.SearchTrace = json.RawMessage(trace)
+		}
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -2122,9 +2213,55 @@ func parseRoute(output string) RouteResponse {
 			} else {
 				response.Destination = candidate
 			}
+		default:
+			// alt.<i>=time_s:..,length_m:..,expanded_nodes:..,edges:e0,e1,..
+			if index, found := strings.CutPrefix(key, "alt."); found {
+				position, err := strconv.Atoi(index)
+				if err != nil || position < 0 {
+					continue
+				}
+				alternative := parseRouteAlternative(value)
+				for len(response.Alternatives) <= position {
+					response.Alternatives = append(response.Alternatives, RouteAlternative{})
+				}
+				response.Alternatives[position] = alternative
+			}
 		}
 	}
 	return response
+}
+
+// parseRouteAlternative decodes one comma-separated alt line emitted by the
+// C++ route command; the edges list is last so it is cut off before the
+// scalar fields are split. Malformed fields keep their zero values.
+func parseRouteAlternative(value string) RouteAlternative {
+	var alternative RouteAlternative
+	head, edgeList, hasEdges := strings.Cut(value, ",edges:")
+	for _, field := range strings.Split(head, ",") {
+		name, raw, ok := strings.Cut(field, ":")
+		if !ok {
+			continue
+		}
+		switch name {
+		case "time_s":
+			alternative.TimeS, _ = strconv.ParseFloat(raw, 64)
+		case "length_m":
+			alternative.LengthM, _ = strconv.ParseFloat(raw, 64)
+		case "expanded_nodes":
+			alternative.ExpandedNodes, _ = strconv.ParseInt(raw, 10, 64)
+		}
+	}
+	if hasEdges {
+		for _, part := range strings.Split(edgeList, ",") {
+			edge, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
+			if err != nil {
+				alternative.Edges = nil
+				break
+			}
+			alternative.Edges = append(alternative.Edges, uint32(edge))
+		}
+	}
+	return alternative
 }
 
 func allowedUploadExtension(extension string) bool {

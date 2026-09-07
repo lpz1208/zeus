@@ -15,6 +15,15 @@ interface BenchmarkWorkbenchProps {
 export function BenchmarkWorkbench({ maps, activeMap, onExit }: BenchmarkWorkbenchProps) {
   const jobs = useBenchmarkJobs()
   const running = jobs.jobs.filter((job) => ['queued', 'running'].includes(job.status)).length
+  const serviceLabel = jobs.serviceStatus === 'online'
+    ? 'ONLINE'
+    : jobs.serviceStatus === 'checking'
+      ? 'CHECKING'
+      : jobs.serviceStatus === 'misconfigured'
+        ? 'CONFIG ERROR'
+        : jobs.serviceStatus === 'control-offline'
+          ? 'CONTROL OFFLINE'
+          : 'NOT READY'
 
   return (
     <main className="bench-shell">
@@ -33,7 +42,7 @@ export function BenchmarkWorkbench({ maps, activeMap, onExit }: BenchmarkWorkben
         </div>
         <div className="bench-runtime">
           <i className={jobs.serviceOnline ? 'is-online' : ''} />
-          <span><small>JOB SERVICE</small><strong>{jobs.serviceOnline ? 'ONLINE' : 'OFFLINE'}</strong></span>
+          <span><small>JOB SERVICE</small><strong>{serviceLabel}</strong></span>
           <b>{running} ACTIVE</b>
         </div>
       </header>

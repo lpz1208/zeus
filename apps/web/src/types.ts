@@ -1,5 +1,17 @@
 export type Severity = 'info' | 'warning' | 'error' | 'fatal'
 
+export type DependencyStatus = 'online' | 'unavailable' | 'misconfigured'
+
+export interface ControlHealth {
+  ok: boolean
+  ready: boolean
+  service: string
+  benchmark: {
+    ok: boolean
+    status: DependencyStatus
+  }
+}
+
 export interface InspectResult {
   uploadId: string
   sourceFile: string
@@ -164,7 +176,12 @@ export interface QueryRequest {
   limit: number
 }
 
-export type RouteAlgorithm = 'dijkstra' | 'astar' | 'bidijkstra' | 'biastar'
+export type RouteAlgorithm =
+  | 'dijkstra'
+  | 'astar'
+  | 'bidijkstra'
+  | 'biastar'
+  | 'kshortest'
 
 export interface RouteMatch {
   edge: number
@@ -182,6 +199,30 @@ export interface RouteRequest {
   toLat: number
   algorithm: RouteAlgorithm
   maxDistance: number
+  /** Candidate count for kshortest; omitted means a single path. */
+  kPaths?: number
+  /** Return the search settle sequence for visualization. */
+  recordTrace?: boolean
+}
+
+export interface RouteAlternative {
+  timeS: number
+  lengthM: number
+  expandedNodes: number
+  edges: number[]
+}
+
+export interface SearchTraceStep {
+  order: number
+  nodeId: number
+  f: number
+  g: number
+}
+
+export interface SearchTrace {
+  stepCount: number
+  sampled: boolean
+  steps: SearchTraceStep[]
 }
 
 export interface RouteResponse {
@@ -198,6 +239,9 @@ export interface RouteResponse {
   expandedNodes: number
   computeMs: number
   geojson?: RouteGeoJSON
+  /** Every k-shortest candidate including the best one. */
+  alternatives?: RouteAlternative[]
+  searchTrace?: SearchTrace
 }
 
 export interface RouteProperties {
@@ -709,6 +753,17 @@ export interface AgentRouteCandidate {
   lengthM?: number
   expandedNodes?: number
   edges?: number[]
+  /** k-shortest alternatives; each carries its own candidateId. */
+  alternatives?: AgentRouteAlternative[]
+  searchTrace?: SearchTrace
+}
+
+export interface AgentRouteAlternative {
+  candidateId: string
+  timeS: number
+  lengthM: number
+  expandedNodes: number
+  edges: number[]
 }
 
 export interface AgentActionRequest {

@@ -1,5 +1,6 @@
 .PHONY: build build-map build-server build-web test test-proto run clean \
-	agent-runtime-setup agent-runtime-test agent-runtime-e2e agent-benchmark-service
+	run-control agent-runtime-setup agent-runtime-test agent-runtime-e2e \
+	agent-benchmark-service
 
 build: build-map build-server build-web
 
@@ -38,8 +39,11 @@ agent-runtime-e2e:
 agent-benchmark-service:
 	cd apps/agent-runtime && UV_CACHE_DIR=$(CURDIR)/.cache/uv uv run python -m zeus_agent.benchmark_service --base-url http://127.0.0.1:8080 --db $(CURDIR)/data/benchmarks.sqlite
 
-run: build
+run-control: build
 	./build/zeus-server --addr 127.0.0.1:8080 --data-dir data --zeus-map ./build/zeus-map --web-dir ./apps/web/dist
+
+run: build
+	./scripts/run-stack.sh
 
 clean:
 	cmake -E remove_directory build

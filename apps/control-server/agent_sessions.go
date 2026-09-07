@@ -53,6 +53,9 @@ type agentSessionEntry struct {
 	stepSecond     float64
 	activeDecision string
 	request        AgentSessionRequest
+	// lastActive drives the idle sweeper; refreshed by every registry access.
+	lastActive time.Time
+	inFlight   int
 }
 
 type agentSnapshotEntry struct {
@@ -91,20 +94,67 @@ type agentSessionRegistry struct {
 func (r *agentSessionRegistry) add(id string, entry agentSessionEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	entry.lastActive = time.Now().UTC()
 	r.sessions[id] = entry
 }
 
+// get also refreshes the idle clock: every command path resolves the entry
+// through here before touching the worker, so lastActive tracks real use.
 func (r *agentSessionRegistry) get(id string) (agentSessionEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, ok := r.sessions[id]
-	return entry, ok
+	if !ok {
+		return agentSessionEntry{}, false
+	}
+	entry.lastActive = time.Now().UTC()
+	r.sessions[id] = entry
+	return entry, true
 }
 
 func (r *agentSessionRegistry) remove(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.sessions, id)
+}
+
+// acquire and takeIdle share one lock: a request either pins a live session
+// before reclamation, or observes that reclamation already owns it.
+func (r *agentSessionRegistry) acquire(id, mapID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.sessions[id]
+	if !ok || entry.mapID != mapID {
+		return false
+	}
+	entry.inFlight++
+	entry.lastActive = time.Now().UTC()
+	r.sessions[id] = entry
+	return true
+}
+
+func (r *agentSessionRegistry) release(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.sessions[id]
+	if !ok {
+		return
+	}
+	entry.inFlight--
+	entry.lastActive = time.Now().UTC()
+	r.sessions[id] = entry
+}
+
+func (s *Server) withAgentSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("session")
+		if !s.agentSessions.acquire(id, r.PathValue("id")) {
+			writeError(w, http.StatusNotFound, "unknown agent session")
+			return
+		}
+		defer s.agentSessions.release(id)
+		next(w, r)
+	}
 }
 
 func (r *agentSessionRegistry) beginDecision(id, decisionID string) error {
@@ -118,6 +168,7 @@ func (r *agentSessionRegistry) beginDecision(id, decisionID string) error {
 		return fmt.Errorf("decision %s is still pending", entry.activeDecision)
 	}
 	entry.activeDecision = decisionID
+	entry.lastActive = time.Now().UTC()
 	r.sessions[id] = entry
 	return nil
 }
@@ -130,7 +181,40 @@ func (r *agentSessionRegistry) clearDecision(id, decisionID string) {
 		return
 	}
 	entry.activeDecision = ""
+	entry.lastActive = time.Now().UTC()
 	r.sessions[id] = entry
+}
+
+// collectIdle returns the IDs of sessions idle beyond ttl that have no open
+// decision barrier. It only collects; callers perform worker IO outside the
+// registry lock. Sessions skipped for a pending barrier are re-examined on
+// the next sweep once the decision wall-TTL resolves them.
+func (r *agentSessionRegistry) collectIdle(now time.Time, ttl time.Duration) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var idle []string
+	for id, entry := range r.sessions {
+		if entry.activeDecision != "" || entry.inFlight > 0 {
+			continue
+		}
+		if now.Sub(entry.lastActive) > ttl {
+			idle = append(idle, id)
+		}
+	}
+	return idle
+}
+
+// Revalidate after collection and detach atomically before any worker IO.
+// Fresh requests and decisions can no longer attach to a claimed session.
+func (r *agentSessionRegistry) takeIdle(id string, now time.Time, ttl time.Duration) (agentSessionEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.sessions[id]
+	if !ok || entry.activeDecision != "" || entry.inFlight > 0 || now.Sub(entry.lastActive) <= ttl {
+		return agentSessionEntry{}, false
+	}
+	delete(r.sessions, id)
+	return entry, true
 }
 
 func (r *agentSessionRegistry) addSnapshot(id string, entry agentSnapshotEntry) {
@@ -524,6 +608,11 @@ func (s *Server) handleAgentObserveVehicle(w http.ResponseWriter, r *http.Reques
 type AgentPlanRequest struct {
 	VehicleID int    `json:"vehicleId"`
 	Algorithm string `json:"algorithm"`
+	// KPaths requests k-shortest candidates (clamped to [1,8]); only the
+	// kshortest selection returns more than one candidate.
+	KPaths int `json:"kPaths"`
+	// RecordTrace returns the search settle sequence for visualization.
+	RecordTrace bool `json:"recordTrace"`
 }
 
 func (s *Server) handleAgentPlan(w http.ResponseWriter, r *http.Request) {
@@ -536,19 +625,31 @@ func (s *Server) handleAgentPlan(w http.ResponseWriter, r *http.Request) {
 		request.Algorithm = "astar"
 	}
 	switch request.Algorithm {
-	case "dijkstra", "astar", "bidijkstra", "biastar":
+	case "dijkstra", "astar", "bidijkstra", "biastar", "kshortest":
 	default:
 		writeError(w, http.StatusBadRequest,
-			"algorithm must be dijkstra, astar, bidijkstra or biastar")
+			"algorithm must be dijkstra, astar, bidijkstra, biastar or kshortest")
 		return
 	}
 	if request.VehicleID < 0 {
 		writeError(w, http.StatusBadRequest, "vehicleId must be non-negative")
 		return
 	}
+	kPaths := request.KPaths
+	if kPaths < 1 {
+		kPaths = 1
+	}
+	if kPaths > 8 {
+		kPaths = 8
+	}
+	traceFlag := "0"
+	if request.RecordTrace {
+		traceFlag = "1"
+	}
 	s.agentSessionPassthrough(
 		w, r, "plan", r.PathValue("session"),
-		strconv.Itoa(request.VehicleID), request.Algorithm)
+		strconv.Itoa(request.VehicleID), request.Algorithm,
+		strconv.Itoa(kPaths), traceFlag)
 }
 
 type AgentStepRequest struct {
@@ -1099,6 +1200,21 @@ func (s *Server) handleAgentSessionResult(w http.ResponseWriter, r *http.Request
 	if payload == nil {
 		return
 	}
+	resultBytes, err := sumFileSize(trajectoryName, playbackName)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "result export missing")
+		return
+	}
+	if limit := s.config.AgentResultMaxBytes; limit > 0 && resultBytes > limit {
+		s.logger.Warn("agent session result exceeds inline budget",
+			slog.String("session", r.PathValue("session")),
+			slog.Int64("bytes", resultBytes),
+			slog.Int64("limit", limit))
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
+			"agent session result too large: %d bytes exceeds %d byte limit",
+			resultBytes, limit))
+		return
+	}
 	trajectoryContent, err := os.ReadFile(trajectoryName)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "trajectory export missing")
@@ -1128,4 +1244,52 @@ func (s *Server) handleCloseAgentSession(w http.ResponseWriter, r *http.Request)
 		slog.String("session", r.PathValue("session")))
 	_ = result
 	writeJSON(w, http.StatusOK, json.RawMessage(`{"closed": true}`))
+}
+
+// sumFileSize totals the byte size of the given paths without reading them
+// into memory, so oversized exports can be refused before allocation.
+func sumFileSize(paths ...string) (int64, error) {
+	var total int64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		total += info.Size()
+	}
+	return total, nil
+}
+
+// sweepIdleAgentSessions closes and drops agent sessions idle beyond the
+// configured TTL. The worker close is best-effort: the registry entry is
+// detached before worker IO, so later commands resolve to 404 unknown session.
+func (s *Server) sweepIdleAgentSessions() {
+	now := time.Now().UTC()
+	for _, sessionID := range s.agentSessions.collectIdle(now, s.config.AgentSessionIdleTTL) {
+		entry, ok := s.agentSessions.takeIdle(sessionID, now, s.config.AgentSessionIdleTTL)
+		if !ok {
+			continue // touched, pinned, closed or resolving a decision since collection
+		}
+		closeContext, cancel := context.WithTimeout(context.Background(), s.config.CmdLimit)
+		_, _ = s.sessionWorkers.Command(closeContext, entry.runtime, "close", sessionID)
+		cancel()
+		s.logger.Info("agent session reclaimed after idle",
+			slog.String("session", sessionID),
+			slog.String("map", entry.mapID))
+	}
+}
+
+// agentSessionSweepLoop periodically reclaims idle agent sessions until the
+// server shuts down.
+func (s *Server) agentSessionSweepLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.agentSessionSweeperStop:
+			return
+		case <-ticker.C:
+			s.sweepIdleAgentSessions()
+		}
+	}
 }

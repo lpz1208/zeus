@@ -386,7 +386,7 @@ func waitForTerminalJob(t *testing.T, manager *JobManager, id string) ImportJob 
 }
 
 func TestJobManagerPublishesSuccessfulResult(t *testing.T) {
-	manager := NewJobManager(1)
+	manager := NewJobManager(1, 0)
 	job := manager.Submit(func(_ context.Context, publish func(JobProgress)) (MapRecord, error) {
 		publish(JobProgress{Phase: "topology", Progress: 55, Message: "building"})
 		return MapRecord{ID: "map_test", Issues: []ValidationIssue{{Code: "TEST"}}}, nil
@@ -401,7 +401,7 @@ func TestJobManagerPublishesSuccessfulResult(t *testing.T) {
 }
 
 func TestJobManagerCancelsWork(t *testing.T) {
-	manager := NewJobManager(1)
+	manager := NewJobManager(1, 0)
 	started := make(chan struct{})
 	job := manager.Submit(func(ctx context.Context, _ func(JobProgress)) (MapRecord, error) {
 		close(started)
@@ -419,7 +419,7 @@ func TestJobManagerCancelsWork(t *testing.T) {
 }
 
 func TestJobManagerRespectsWorkerLimit(t *testing.T) {
-	manager := NewJobManager(1)
+	manager := NewJobManager(1, 0)
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	first := manager.Submit(func(_ context.Context, _ func(JobProgress)) (MapRecord, error) {
@@ -452,13 +452,115 @@ func TestJobManagerRespectsWorkerLimit(t *testing.T) {
 }
 
 func TestJobManagerReportsFailure(t *testing.T) {
-	manager := NewJobManager(1)
+	manager := NewJobManager(1, 0)
 	job := manager.Submit(func(_ context.Context, _ func(JobProgress)) (MapRecord, error) {
 		return MapRecord{}, errors.New("broken fixture")
 	})
 	completed := waitForTerminalJob(t, manager, job.ID)
 	if completed.Status != JobFailed || completed.Error != "broken fixture" {
 		t.Fatalf("unexpected failed job: %#v", completed)
+	}
+}
+
+func TestJobManagerSweepsExpiredTerminalJobs(t *testing.T) {
+	manager := NewJobManager(1, time.Minute)
+	job := manager.Submit(func(_ context.Context, _ func(JobProgress)) (MapRecord, error) {
+		return MapRecord{ID: "map_swept"}, nil
+	})
+	if completed := waitForTerminalJob(t, manager, job.ID); completed.Status != JobSucceeded {
+		t.Fatalf("job did not succeed: %#v", completed)
+	}
+	expiry := time.Now().UTC().Add(2 * time.Minute)
+	manager.mu.Lock()
+	manager.entries[job.ID].job.UpdatedAt = expiry.Add(-2 * time.Minute)
+	manager.mu.Unlock()
+
+	manager.now = func() time.Time { return expiry }
+	if _, ok := manager.Get(job.ID); ok {
+		t.Fatal("expired terminal job survived the sweep")
+	}
+}
+
+func TestJobManagerKeepsRunningJobsBeyondRetention(t *testing.T) {
+	manager := NewJobManager(1, time.Minute)
+	started := make(chan struct{})
+	job := manager.Submit(func(ctx context.Context, _ func(JobProgress)) (MapRecord, error) {
+		close(started)
+		<-ctx.Done()
+		return MapRecord{}, ctx.Err()
+	})
+	<-started
+	manager.mu.Lock()
+	manager.entries[job.ID].job.UpdatedAt = time.Now().UTC().Add(-time.Hour)
+	manager.mu.Unlock()
+
+	if _, ok := manager.Get(job.ID); !ok {
+		t.Fatal("running job was swept before the retention window")
+	}
+	manager.Cancel(job.ID)
+	if completed := waitForTerminalJob(t, manager, job.ID); completed.Status != JobCancelled {
+		t.Fatalf("job did not cancel cleanly: %#v", completed)
+	}
+}
+
+func TestJobManagerKeepsFreshTerminalJobs(t *testing.T) {
+	manager := NewJobManager(1, time.Minute)
+	job := manager.Submit(func(_ context.Context, _ func(JobProgress)) (MapRecord, error) {
+		return MapRecord{ID: "map_fresh"}, nil
+	})
+	if completed := waitForTerminalJob(t, manager, job.ID); completed.Status != JobSucceeded {
+		t.Fatalf("job did not succeed: %#v", completed)
+	}
+	if _, ok := manager.Get(job.ID); !ok {
+		t.Fatal("fresh terminal job was swept before the retention window")
+	}
+}
+
+func TestJobManagerCapsTerminalEntries(t *testing.T) {
+	manager := NewJobManager(1, time.Hour)
+	var ids []string
+	for i := 0; i < 3; i++ {
+		job := manager.Submit(func(_ context.Context, _ func(JobProgress)) (MapRecord, error) {
+			return MapRecord{ID: "map"}, nil
+		})
+		if completed := waitForTerminalJob(t, manager, job.ID); completed.Status != JobSucceeded {
+			t.Fatalf("job %d did not succeed: %#v", i, completed)
+		}
+		ids = append(ids, job.ID)
+	}
+	manager.mu.Lock()
+	manager.maxTerminal = 2
+	manager.mu.Unlock()
+
+	if _, ok := manager.Get(ids[len(ids)-1]); !ok {
+		t.Fatal("triggering Get lost a recent terminal job")
+	}
+	if _, ok := manager.Get(ids[0]); ok {
+		t.Fatal("oldest terminal job survived the cap sweep")
+	}
+	for _, id := range ids[1:] {
+		if _, ok := manager.Get(id); !ok {
+			t.Fatalf("recent terminal job %s was swept by the cap", id)
+		}
+	}
+}
+
+func TestSumFileSize(t *testing.T) {
+	dir := t.TempDir()
+	small := filepath.Join(dir, "small.json")
+	large := filepath.Join(dir, "large.geojson")
+	if err := os.WriteFile(small, make([]byte, 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(large, make([]byte, 900), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	total, err := sumFileSize(small, large)
+	if err != nil || total != 1000 {
+		t.Fatalf("unexpected total: %d, %v", total, err)
+	}
+	if _, err := sumFileSize(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("missing file should report an error")
 	}
 }
 
@@ -989,7 +1091,9 @@ func TestParseRoute(t *testing.T) {
 }
 
 func TestHealthRoute(t *testing.T) {
-	server := NewServer(Config{DataDir: t.TempDir(), WebDir: t.TempDir()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := NewServer(Config{
+		DataDir: t.TempDir(), WebDir: t.TempDir(), BenchmarkURL: "invalid://benchmark",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := server.ensureDirectories(); err != nil {
 		t.Fatal(err)
 	}
@@ -999,7 +1103,9 @@ func TestHealthRoute(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", response.Code)
 	}
-	if !strings.Contains(response.Body.String(), `"ok":true`) {
+	if !strings.Contains(response.Body.String(), `"ok":true`) ||
+		!strings.Contains(response.Body.String(), `"ready":false`) ||
+		!strings.Contains(response.Body.String(), `"status":"misconfigured"`) {
 		t.Fatalf("unexpected body: %s", response.Body.String())
 	}
 }

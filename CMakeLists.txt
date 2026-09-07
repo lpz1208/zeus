@@ -11,7 +11,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ZEUS_BUILD_TESTS "Build Zeus tests" ON)
 
-find_package(GDAL CONFIG REQUIRED)
+# Prefer GDAL's own config package; fall back to CMake's FindGDAL module for
+# distro packages that only ship gdal-config. Both define the GDAL::GDAL
+# imported target (module mode since CMake 3.14).
+find_package(GDAL CONFIG QUIET)
+if(NOT GDAL_FOUND)
+    find_package(GDAL REQUIRED)
+endif()
 find_package(Boost REQUIRED)
 
 add_library(zeus_map_engine

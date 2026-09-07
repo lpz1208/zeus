@@ -8,6 +8,7 @@ import pytest
 
 from test_benchmark_jobs import fake_client_factory, manifest
 from zeus_agent.benchmark_jobs import BenchmarkJobManager, BenchmarkJobStore
+from zeus_agent import benchmark_service
 from zeus_agent.benchmark_service import make_handler
 
 
@@ -60,3 +61,25 @@ def test_benchmark_http_lifecycle(tmp_path) -> None:
         server.server_close()
         thread.join(timeout=2.0)
         manager.close()
+
+
+def test_main_closes_manager_when_listener_creation_fails(tmp_path, monkeypatch) -> None:
+    closed = False
+
+    class FakeManager:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def fail_listener(*_args, **_kwargs):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(benchmark_service, "BenchmarkJobManager", FakeManager)
+    monkeypatch.setattr(benchmark_service, "ThreadingHTTPServer", fail_listener)
+
+    with pytest.raises(OSError, match="address already in use"):
+        benchmark_service.main(["--db", str(tmp_path / "jobs.sqlite")])
+    assert closed

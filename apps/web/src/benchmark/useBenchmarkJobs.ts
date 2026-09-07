@@ -3,6 +3,7 @@ import { api } from '../api'
 import type { BenchmarkJob, BenchmarkManifest, BenchmarkReport } from '../types'
 
 const ACTIVE_STATUSES = new Set(['queued', 'running'])
+type ServiceStatus = 'checking' | 'online' | 'unavailable' | 'misconfigured' | 'control-offline'
 
 export function useBenchmarkJobs() {
   const [jobs, setJobs] = useState<BenchmarkJob[]>([])
@@ -11,6 +12,7 @@ export function useBenchmarkJobs() {
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [serviceOnline, setServiceOnline] = useState(false)
+  const [serviceStatus, setServiceStatus] = useState<ServiceStatus>('checking')
   const [error, setError] = useState<string | null>(null)
 
   const activeJob = useMemo(
@@ -24,15 +26,31 @@ export function useBenchmarkJobs() {
       const next = await api.listBenchmarkJobs()
       setJobs(next)
       setServiceOnline(true)
+      setServiceStatus('online')
       setError(null)
       setActiveJobId((current) => (
         current && next.some((job) => job.jobId === current)
           ? current
           : next[0]?.jobId ?? null
       ))
-    } catch (cause) {
+    } catch {
       setServiceOnline(false)
-      if (!quiet) setError(cause instanceof Error ? cause.message : '评测任务服务不可用。')
+      let status: ServiceStatus = 'control-offline'
+      try {
+        const health = await api.getHealth()
+        status = health.benchmark.status
+      } catch {
+        // The control plane itself is unreachable.
+      }
+      setServiceStatus(status)
+      if (!quiet) {
+        const fallback = status === 'misconfigured'
+          ? '评测任务服务配置无效。'
+          : status === 'control-offline'
+            ? 'Zeus 控制服务不可用。'
+            : '评测任务服务尚未就绪。'
+        setError(fallback)
+      }
     } finally {
       if (!quiet) setLoading(false)
     }
@@ -70,6 +88,7 @@ export function useBenchmarkJobs() {
       setJobs((current) => [job, ...current.filter((item) => item.jobId !== job.jobId)])
       setActiveJobId(job.jobId)
       setServiceOnline(true)
+      setServiceStatus('online')
       return job
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '无法创建评测任务。')
@@ -97,6 +116,7 @@ export function useBenchmarkJobs() {
     loading,
     submitting,
     serviceOnline,
+    serviceStatus,
     error,
     setActiveJobId,
     dismissError: () => setError(null),

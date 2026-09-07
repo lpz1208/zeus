@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import signal
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -195,10 +197,13 @@ def main(argv: list[str] | None = None) -> int:
         default=os.getenv("ZEUS_MODEL_BASE_URL", "https://api.openai.com/v1"),
     )
     parser.add_argument("--api-key-env", default="ZEUS_MODEL_API_KEY")
-    parser.add_argument("--model-timeout", type=float, default=60.0)
+    parser.add_argument("--model-timeout", type=float, default=60.0,
+                        help="total seconds per model decision, including retries and backoff")
     args = parser.parse_args(argv)
     if args.workers < 1 or args.max_pending < args.workers:
         parser.error("--max-pending must be >= --workers >= 1")
+    if not math.isfinite(args.model_timeout) or args.model_timeout <= 0:
+        parser.error("--model-timeout must be finite and positive")
 
     api_key = os.getenv(args.api_key_env, "")
     model_provider = None
@@ -222,20 +227,31 @@ def main(argv: list[str] | None = None) -> int:
         max_workers=args.workers,
         max_pending=args.max_pending,
     )
-    server = ThreadingHTTPServer(
-        (args.host, args.port),
-        make_handler(manager, cors_origin=args.cors_origin),
-    )
-    print(
-        f"Zeus Benchmark Job Service listening on "
-        f"http://{args.host}:{args.port} (workers={args.workers})"
-    )
+    server: ThreadingHTTPServer | None = None
+    previous_sigterm: Any = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        server = ThreadingHTTPServer(
+            (args.host, args.port),
+            make_handler(manager, cors_origin=args.cors_origin),
+        )
+        print(
+            f"Zeus Benchmark Job Service listening on "
+            f"http://{args.host}:{args.port} (workers={args.workers})"
+        )
+
+        def terminate(_signal_number: int, _frame: Any) -> None:
+            raise KeyboardInterrupt
+
+        previous_sigterm = signal.signal(signal.SIGTERM, terminate)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
     finally:
-        server.server_close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        if server is not None:
+            server.server_close()
         manager.close()
     return 0
 

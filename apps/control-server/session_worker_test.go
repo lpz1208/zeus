@@ -61,7 +61,16 @@ while IFS="$tab" read -r command session rest; do
       payload=$(printf '{"tick":1,"simulationTimeS":1.0,"stateVersion":%s,"vehicleId":0,"state":"driving","position":{"edgeId":4,"offsetM":12.5},"destinationEdgeId":9,"remainingEtaS":42.0,"routeInvalidated":true,"remainingEdgeIds":[4,5],"nearbyRoads":[],"activeEvents":[]}' "$state_version")
       exit_code=0 ;;
     plan)
-      payload=$(printf '{"candidateId":"cand-1","vehicleId":0,"algorithm":"astar","effectiveAlgorithm":"astar","basedOnStateVersion":%s,"ok":true,"timeS":42.0,"lengthM":500.0,"expandedNodes":3,"edges":[4,5,9]}' "$state_version")
+      plan_k=$(printf '%s' "$rest" | cut -f3)
+      plan_trace=$(printf '%s' "$rest" | cut -f4)
+      payload=$(printf '{"candidateId":"cand-1","vehicleId":0,"algorithm":"astar","effectiveAlgorithm":"astar","basedOnStateVersion":%s,"ok":true,"timeS":42.0,"lengthM":500.0,"expandedNodes":3,"edges":[4,5,9]' "$state_version")
+      if [ "$plan_k" != "" ] && [ "$plan_k" != "1" ]; then
+        payload=$(printf '%s,"alternatives":[{"candidateId":"cand-1","timeS":42.0,"lengthM":500.0,"expandedNodes":3,"edges":[4,5,9]},{"candidateId":"cand-2","timeS":60.0,"lengthM":700.0,"expandedNodes":6,"edges":[4,6,9]}]' "$payload")
+      fi
+      if [ "$plan_trace" = "1" ]; then
+        payload=$(printf '%s,"searchTrace":{"stepCount":2,"sampled":false,"steps":[{"order":1,"nodeId":7,"f":1.0,"g":0.0},{"order":2,"nodeId":8,"f":2.0,"g":1.0}]}' "$payload")
+      fi
+      payload=$(printf '%s}' "$payload")
       exit_code=0 ;;
     commit|keep)
       case "$rest" in
@@ -123,7 +132,8 @@ func TestSessionWorkerManagerReusesProcess(t *testing.T) {
 		t.Fatalf("first command failed: exit=%d err=%v payload=%s",
 			first.ExitCode, err, first.Payload)
 	}
-	second, err := manager.Command(context.Background(), "map-a.zmap", "plan", "s1", "0", "astar")
+	second, err := manager.Command(
+		context.Background(), "map-a.zmap", "plan", "s1", "0", "astar", "1", "0")
 	if err != nil || second.ExitCode != 0 {
 		t.Fatalf("second command failed: exit=%d err=%v", second.ExitCode, err)
 	}
@@ -534,5 +544,174 @@ func TestAgentSessionResultInlinesExports(t *testing.T) {
 	}
 	if result["geojson"] == nil || result["playback"] == nil {
 		t.Fatalf("result missing inline exports: %v", result)
+	}
+}
+
+func TestAgentSessionSweeperReclaimsIdleSessions(t *testing.T) {
+	server, logPath := newAgentSessionTestServer(t)
+	defer server.Close()
+	status, created := agentSessionRequest(
+		t, server, http.MethodPost, "/api/maps/m1/agent/sessions",
+		`{"vehicles":[{"fromLon":1,"fromLat":2,"toLon":3,"toLat":4,"agent":true}],
+		 "durationSeconds":900,"stepSeconds":1,"sampleIntervalSeconds":15}`)
+	if status != http.StatusOK {
+		t.Fatalf("create session failed: %d %v", status, created)
+	}
+	sessionID, _ := created["sessionId"].(string)
+	if sessionID == "" {
+		t.Fatalf("missing session id: %v", created)
+	}
+
+	// Age the session beyond the idle TTL, then sweep directly: the periodic
+	// loop would need real wall-clock time to fire.
+	server.agentSessions.mu.Lock()
+	entry := server.agentSessions.sessions[sessionID]
+	entry.lastActive = time.Now().UTC().Add(-2 * server.config.AgentSessionIdleTTL)
+	server.agentSessions.sessions[sessionID] = entry
+	server.agentSessions.mu.Unlock()
+
+	server.sweepIdleAgentSessions()
+
+	server.agentSessions.mu.Lock()
+	_, present := server.agentSessions.sessions[sessionID]
+	server.agentSessions.mu.Unlock()
+	if present {
+		t.Fatal("idle session survived the sweep")
+	}
+	log := fakeSessionLog(t, logPath)
+	if !strings.Contains(log, "close\t"+sessionID) {
+		t.Fatalf("sweeper did not close the worker session: %q", log)
+	}
+	status, _ = agentSessionRequest(
+		t, server, http.MethodGet,
+		"/api/maps/m1/agent/sessions/"+sessionID, "")
+	if status != http.StatusNotFound {
+		t.Fatalf("swept session still resolvable: %d", status)
+	}
+}
+
+func TestAgentSessionSweeperSkipsPendingDecisions(t *testing.T) {
+	server, _ := newAgentSessionTestServer(t)
+	defer server.Close()
+	status, created := agentSessionRequest(
+		t, server, http.MethodPost, "/api/maps/m1/agent/sessions",
+		`{"vehicles":[{"fromLon":1,"fromLat":2,"toLon":3,"toLat":4,"agent":true}],
+		 "durationSeconds":900,"stepSeconds":1,"sampleIntervalSeconds":15}`)
+	if status != http.StatusOK {
+		t.Fatalf("create session failed: %d %v", status, created)
+	}
+	sessionID, _ := created["sessionId"].(string)
+	if err := server.agentSessions.beginDecision(sessionID, "dec_pending"); err != nil {
+		t.Fatalf("beginDecision failed: %v", err)
+	}
+
+	server.agentSessions.mu.Lock()
+	entry := server.agentSessions.sessions[sessionID]
+	entry.lastActive = time.Now().UTC().Add(-2 * server.config.AgentSessionIdleTTL)
+	server.agentSessions.sessions[sessionID] = entry
+	server.agentSessions.mu.Unlock()
+
+	server.sweepIdleAgentSessions()
+
+	server.agentSessions.mu.Lock()
+	_, present := server.agentSessions.sessions[sessionID]
+	server.agentSessions.mu.Unlock()
+	if !present {
+		t.Fatal("session with a pending decision was reclaimed by the sweeper")
+	}
+}
+
+func TestIdleCollectionRevalidatesActivityAndDecision(t *testing.T) {
+	for _, change := range []string{"request", "decision"} {
+		t.Run(change, func(t *testing.T) {
+			r := agentSessionRegistry{sessions: map[string]agentSessionEntry{
+				"s1": {mapID: "m1", lastActive: time.Now().Add(-time.Hour)},
+			}}
+			if len(r.collectIdle(time.Now(), time.Minute)) != 1 {
+				t.Fatal("expected an idle candidate")
+			}
+			if change == "request" {
+				if !r.acquire("s1", "m1") {
+					t.Fatal("request could not acquire live session")
+				}
+				r.release("s1")
+			} else if err := r.beginDecision("s1", "d1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, taken := r.takeIdle("s1", time.Now(), time.Minute); taken {
+				t.Fatal("reclaimed a session activated after collection")
+			}
+		})
+	}
+}
+
+func TestSessionRequestPinsUntilHandlerReturns(t *testing.T) {
+	s := &Server{agentSessions: agentSessionRegistry{sessions: map[string]agentSessionEntry{
+		"s1": {mapID: "m1", lastActive: time.Now().Add(-time.Hour)},
+	}}}
+	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	handler := s.withAgentSession(func(http.ResponseWriter, *http.Request) {
+		close(entered)
+		<-release
+	})
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.SetPathValue("session", "s1")
+	r.SetPathValue("id", "m1")
+	go func() {
+		defer close(done)
+		handler(httptest.NewRecorder(), r)
+	}()
+	<-entered
+	// Even a handler that exceeds the TTL must stay pinned.
+	_, taken := s.agentSessions.takeIdle("s1", time.Now().Add(time.Hour), time.Minute)
+	close(release)
+	<-done
+	if taken {
+		t.Fatal("reclaimed an in-flight request")
+	}
+	if _, taken := s.agentSessions.takeIdle("s1", time.Now(), time.Minute); taken {
+		t.Fatal("release did not refresh activity")
+	}
+	if _, taken := s.agentSessions.takeIdle("s1", time.Now().Add(time.Hour), time.Minute); !taken {
+		t.Fatal("unreferenced idle session was not reclaimed")
+	}
+	if s.agentSessions.acquire("s1", "m1") {
+		t.Fatal("new request attached after reclamation claimed the session")
+	}
+	if err := s.agentSessions.beginDecision("s1", "d1"); err == nil {
+		t.Fatal("decision attached after reclamation")
+	}
+}
+
+func TestAgentPlanPassesKAndTraceThrough(t *testing.T) {
+	server, logPath := newAgentSessionTestServer(t)
+	defer server.Close()
+	status, created := agentSessionRequest(
+		t, server, http.MethodPost, "/api/maps/m1/agent/sessions",
+		`{"vehicles":[{"fromLon":1,"fromLat":2,"toLon":3,"toLat":4,"agent":true}],
+		 "durationSeconds":900,"stepSeconds":1,"sampleIntervalSeconds":15}`)
+	if status != http.StatusOK {
+		t.Fatalf("create session failed: %d %v", status, created)
+	}
+	sessionID, _ := created["sessionId"].(string)
+
+	status, plan := agentSessionRequest(
+		t, server, http.MethodPost,
+		"/api/maps/m1/agent/sessions/"+sessionID+"/plan",
+		`{"vehicleId":0,"algorithm":"kshortest","kPaths":3,"recordTrace":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("k-shortest plan failed: %d %v", status, plan)
+	}
+	alternatives, _ := plan["alternatives"].([]any)
+	if len(alternatives) != 2 {
+		t.Fatalf("alternatives were not passed through: %v", plan)
+	}
+	trace, _ := plan["searchTrace"].(map[string]any)
+	if trace == nil || trace["stepCount"] != float64(2) {
+		t.Fatalf("search trace was not passed through: %v", plan)
+	}
+	log := fakeSessionLog(t, logPath)
+	if !strings.Contains(log, "plan\t"+sessionID+"\t0\tkshortest\t3\t1") {
+		t.Fatalf("k and trace flags did not reach the worker: %q", log)
 	}
 }

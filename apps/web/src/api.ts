@@ -14,6 +14,7 @@ import type {
   BenchmarkJob,
   BenchmarkManifest,
   BenchmarkReport,
+  ControlHealth,
   ImportJob,
   InspectResult,
   IssueGeoJSON,
@@ -58,6 +59,10 @@ function benchmarkRequest<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getHealth(): Promise<ControlHealth> {
+    return request('/api/health')
+  },
+
   listBenchmarkJobs(limit = 50): Promise<BenchmarkJob[]> {
     return benchmarkRequest(`/api/benchmarks?limit=${encodeURIComponent(limit)}`)
   },
@@ -249,11 +254,19 @@ export const api = {
     sessionId: string,
     vehicleId: number,
     algorithm: string,
+    options?: { kPaths?: number; recordTrace?: boolean },
   ): Promise<AgentRouteCandidate> {
+    const payload: Record<string, unknown> = { vehicleId, algorithm }
+    if (options?.kPaths && options.kPaths > 1) {
+      payload.kPaths = options.kPaths
+    }
+    if (options?.recordTrace) {
+      payload.recordTrace = true
+    }
     return request(`/api/maps/${encodeURIComponent(mapId)}/agent/sessions/${encodeURIComponent(sessionId)}/plan`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vehicleId, algorithm }),
+      body: JSON.stringify(payload),
     })
   },
 

@@ -29,6 +29,10 @@ type RouteWorkerRequest struct {
 	Algorithm   string
 	MaxDistance float64
 	OutputPath  string
+	// KPaths requests k-shortest candidates; 0 or 1 means a single path.
+	KPaths int
+	// TracePath receives the search settle trace; empty disables recording.
+	TracePath string
 }
 
 type RouteWorkerResult struct {
@@ -273,8 +277,16 @@ func (s *routeWorkerSession) Close() {
 }
 
 func encodeRouteWorkerRequest(request RouteWorkerRequest) (string, error) {
-	if strings.ContainsAny(request.OutputPath, "\t\r\n") {
+	if strings.ContainsAny(request.OutputPath, "\t\r\n") ||
+		strings.ContainsAny(request.TracePath, "\t\r\n") {
 		return "", errors.New("route output path contains a protocol delimiter")
+	}
+	kPaths := request.KPaths
+	if kPaths < 1 {
+		kPaths = 1
+	}
+	if kPaths > 8 {
+		kPaths = 8
 	}
 	fields := []string{
 		formatFloat(request.FromLon),
@@ -284,6 +296,8 @@ func encodeRouteWorkerRequest(request RouteWorkerRequest) (string, error) {
 		request.Algorithm,
 		formatFloat(request.MaxDistance),
 		request.OutputPath,
+		strconv.Itoa(kPaths),
+		request.TracePath,
 	}
 	for _, field := range fields[:6] {
 		if field == "" || strings.ContainsAny(field, "\t\r\n") {

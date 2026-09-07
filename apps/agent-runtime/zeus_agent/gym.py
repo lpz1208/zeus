@@ -65,7 +65,16 @@ class ZeusEnv:
         self._session_id = created.session_id
         self._vehicle_id = (created.agents or [0])[0]
         self._decisions = 0
-        return self._client.observe_vehicle(self._session_id, self._vehicle_id)
+        # Advance to the first decision boundary so step() can resolve it;
+        # the runner's advance node performs the same step right after create.
+        self._last = self._client.step_until_event(
+            self._session_id, max_ticks=1_000_000)
+        observation = self._client.observe_vehicle(
+            self._session_id, self._vehicle_id)
+        # Baseline the ETA so the first step's reward is the ETA delta rather
+        # than the negated total remaining ETA.
+        self._previous_eta = observation.remaining_eta_s
+        return observation
 
     def step(
         self, action_kind: str, candidate_id: str | None = None,

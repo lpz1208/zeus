@@ -286,7 +286,7 @@ export function BenchmarkComposer({
         {submitting ? <span className="spin" /> : <Route size={14} />}
         {submitting ? '提交实验…' : `运行 ${totalRuns} 个 EPISODES`}
       </button>
-      {!serviceOnline && <p className="bench-service-note">启动 `make agent-benchmark-service` 后可提交任务。</p>}
+      {!serviceOnline && <p className="bench-service-note">评测服务未就绪，请重新运行 `make run`；分步开发时可单独启动任务服务。</p>}
     </aside>
   )
 }
