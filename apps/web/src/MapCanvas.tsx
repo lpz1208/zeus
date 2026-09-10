@@ -230,7 +230,7 @@ export function MapCanvas({
           {
             id: 'background',
             type: 'background',
-            paint: { 'background-color': '#f1f5f9' },
+            paint: { 'background-color': '#ffffff' },
           },
         ],
       },
@@ -329,9 +329,9 @@ export function MapCanvas({
           'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 5, 15, 11],
           'circle-color': [
             'match', ['get', 'SEVERITY'],
-            'fatal', '#ff453a',
-            'error', '#ff5d4d',
-            'warning', '#ff8a24',
+            'fatal', '#b91c1c',
+            'error', '#cc2f2f',
+            'warning', '#e07818',
             '#8fb6a7',
           ],
           'circle-opacity': 0.18,
@@ -346,9 +346,9 @@ export function MapCanvas({
           'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 2, 15, 4.5],
           'circle-color': [
             'match', ['get', 'SEVERITY'],
-            'fatal', '#ff453a',
-            'error', '#ff5d4d',
-            'warning', '#ff8a24',
+            'fatal', '#b91c1c',
+            'error', '#cc2f2f',
+            'warning', '#e07818',
             '#8fb6a7',
           ],
           'circle-stroke-color': '#ffffff',
@@ -375,12 +375,25 @@ export function MapCanvas({
           'line-color': [
             'match',
             ['get', 'CLASS'],
-            ['arterial', 'primary', 'trunk'], '#2563eb',
-            ['ring', 'motorway'], '#f97316',
-            ['collector', 'secondary'], '#64748b',
-            '#94a3b8',
+            ['arterial', 'primary', 'trunk', 'ring', 'motorway'], '#1a1d21',
+            ['collector', 'secondary'], '#3d444c',
+            '#6b737c',
           ],
           'line-width': ['interpolate', ['linear'], ['zoom'], 7, 0.8, 13, 2.2, 17, 5],
+          'line-opacity': 1,
+        },
+      })
+      // White dashed lane separators, sumo-gui standard scheme lineage: the
+      // centerline appears once individual carriageways are distinguishable.
+      map.addLayer({
+        id: 'lane-dash',
+        type: 'line',
+        source: 'roads',
+        minzoom: 14,
+        paint: {
+          'line-color': '#ffffff',
+          'line-width': ['interpolate', ['linear'], ['zoom'], 14, 0.6, 17, 1.6],
+          'line-dasharray': [4, 3],
           'line-opacity': 0.9,
         },
       })
@@ -390,9 +403,8 @@ export function MapCanvas({
         source: 'roads',
         filter: emptyFilter,
         paint: {
-          'line-color': '#e11d48',
+          'line-color': '#cc2f2f',
           'line-width': ['interpolate', ['linear'], ['zoom'], 7, 3, 15, 10],
-          'line-blur': 0.4,
           'line-opacity': 1,
         },
       })
@@ -415,7 +427,7 @@ export function MapCanvas({
         source: 'route-alts',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: {
-          'line-color': '#94a3b8',
+          'line-color': '#9ca3ab',
           'line-width': ['interpolate', ['linear'], ['zoom'], 8, 3, 16, 7],
           'line-opacity': 0.4,
         },
@@ -438,7 +450,7 @@ export function MapCanvas({
         source: 'route',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: {
-          'line-color': '#7c3aed',
+          'line-color': '#6d3fc0',
           'line-width': ['interpolate', ['linear'], ['zoom'], 8, 4, 16, 9],
           'line-opacity': 1,
         },
@@ -471,7 +483,7 @@ export function MapCanvas({
           'circle-color': [
             'interpolate', ['linear'],
             ['/', ['get', 'ORDER'], ['max', ['get', 'TOTAL'], 1]],
-            0, '#38bdf8', 1, '#7c3aed',
+            0, '#38bdf8', 1, '#6d3fc0',
           ],
           'circle-opacity': 0.8,
         },
@@ -485,7 +497,7 @@ export function MapCanvas({
         paint: {
           'circle-radius': ['interpolate', ['linear'], ['zoom'], 13, 3, 18, 8],
           'circle-color': '#ffffff',
-          'circle-stroke-color': '#2563eb',
+          'circle-stroke-color': '#1a1d21',
           'circle-stroke-width': 1,
           'circle-opacity': 0.92,
         },
@@ -500,8 +512,8 @@ export function MapCanvas({
           'circle-color': [
             'case',
             ['>', ['+', ['get', 'IN_DEGREE'], ['get', 'OUT_DEGREE']], 4],
-            '#f97316',
-            '#2563eb',
+            '#1a1d21',
+            '#3d444c',
           ],
         },
       })
@@ -514,7 +526,7 @@ export function MapCanvas({
         paint: {
           'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, 6, 18, 13],
           'circle-color': 'rgba(255, 255, 255, 0.8)',
-          'circle-stroke-color': '#dc2626',
+          'circle-stroke-color': '#cc2f2f',
           'circle-stroke-width': 2.5,
         },
       })
@@ -527,8 +539,8 @@ export function MapCanvas({
           'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 2.5, 14, 4.5, 18, 7],
           'circle-color': [
             'case',
-            ['==', ['get', 'HELD'], true], '#dc2626',
-            ['<', ['get', 'SPEED_FACTOR'], 1], '#f97316',
+            ['==', ['get', 'HELD'], true], '#cc2f2f',
+            ['<', ['get', 'SPEED_FACTOR'], 1], '#e07818',
             '#f59e0b',
           ],
           'circle-opacity': 0.96,

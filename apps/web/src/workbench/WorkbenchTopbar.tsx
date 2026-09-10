@@ -1,4 +1,4 @@
-import { BrainCircuit, Check, ChevronRight, FlaskConical, Waypoints } from 'lucide-react'
+import { BrainCircuit, FlaskConical, Waypoints } from 'lucide-react'
 import type { IntakeStage } from './useMapIntake'
 
 interface WorkbenchTopbarProps {
@@ -23,9 +23,8 @@ function Pipeline({ stage }: { stage: IntakeStage }) {
           className={`wb-pipeline__step ${index < active ? 'is-done' : ''} ${index === active ? 'is-active' : ''}`}
           key={step}
         >
-          <span>{index < active ? <Check size={12} /> : String(index + 1).padStart(2, '0')}</span>
+          <span>{String(index + 1).padStart(2, '0')}</span>
           <strong>{step}</strong>
-          {index < steps.length - 1 && <ChevronRight size={13} />}
         </div>
       ))}
     </div>
@@ -38,7 +37,7 @@ export function WorkbenchTopbar({
   return (
     <header className="wb-topbar">
       <div className="wb-brand">
-        <div className="wb-brand__mark"><Waypoints size={23} strokeWidth={1.7} /></div>
+        <div className="wb-brand__mark"><Waypoints size={14} strokeWidth={1.7} /></div>
         <div>
           <span>ZEUS</span>
           <strong>MAP LAB</strong>
