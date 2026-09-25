@@ -444,3 +444,23 @@ Snapshot/Restore 已通过确定性重放和版本化 JSON 文件实现：暂停
 7. 多 OD/OD 矩阵、需求曲线和场景版本。
 
 Agent 层设计与分阶段计划见 [geospatial-agent-environment.md](geospatial-agent-environment.md)。
+
+### 导出阶段的路线回切证据
+
+PlaybackExporter 在导出阶段按每辆车的成功应用序列计算 `route_reversed`，并写入 `route_reversal_version: 1`。连续两次实际改道返回此前路线时记为 A→B→A；同路应用只更新比较边界，失败动作不影响历史。比较核对已行驶前缀、道路顺序与终点偏移；应用边界或连续性缺失时留空。原生动作快照的确定性重放重建同样的应用记录。详见 [Benchmark 指标](benchmark-metrics.md)。
+
+### 道路恢复收益扫描与换路稳定性
+
+原生车辆支持三个可选参数，HTTP/Benchmark 使用 camelCase，CLI 如下：
+
+| HTTP 字段 | CLI | 默认值与含义 |
+| --- | --- | --- |
+| `rerouteRecoveryIntervalSeconds` | `--reroute-recovery-interval` | 0 关闭；开启后限制全网恢复收益扫描的最短间隔 |
+| `rerouteMinGainSeconds` | `--reroute-min-gain` | 0；主动换路预计节省时间须超过此值 |
+| `rerouteCooldownSeconds` | `--reroute-cooldown` | 0；两次原生主动换路之间的最短时间 |
+
+道路/路口重新开放、显式速度或容量成本下降、周期拥堵扫描发现显著费用下降时，开启的恢复扫描会检查所有仍在等待/行驶的车辆，包括当前路线未经过恢复道路的车辆。第一次事件可立即扫描，连续事件合并在扫描间隔内。冷却尚未结束的车辆保留待检查状态，到期重新从当前位置规划；无收益的候选保持原路。当前路线被封闭时绕行跳过收益门槛和冷却。无待处理恢复事件时不进行全车收益扫描。
+
+Agent 车辆只收到 `decisionReason: route_improved` 决策机会，路径不会自动替换，也不会因其他道路恢复而设置 `routeInvalidated`。该原因表示网络存在改善，不保证其 OD 一定有更优路径；是否采用由代码/策略和 Guard 决定。原生收益门槛与冷却不替代 Agent Guard。现有路段费用改变触发的 `route_invalidated` 及周期决策保持原有语义。
+
+配置在 Agent 请求、普通快照、导航历史、后台检查点、Python 场景、Benchmark manifest 和仿真回放中保留。界面的仿真场景支持三个参数，Agent 任务支持恢复通知间隔，Benchmark 的原生参数仅影响原生自动换路车辆。默认全为 0，已有场景不自动开启恢复扫描。恢复扫描仍调用现有路由规划器，尚未实现增量搜索或大规模分片。

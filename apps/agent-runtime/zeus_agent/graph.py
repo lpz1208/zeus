@@ -21,6 +21,7 @@ from zeus_agent.client import (
     EnvironmentError,
     FALLBACK_ALGORITHMS,
     KSHORTEST_K,
+    ActionAck,
     ActionRequest,
     RouteCandidate,
     StepResponse,
@@ -56,6 +57,11 @@ class AgentState(TypedDict, total=False):
     commits: int
     guard_rejections: int
     fallbacks: int
+    action_attempts: int
+    action_rejections: int
+    action_failures: int
+    route_change_requests: int
+    unchanged_route_requests: int
     decisions_since_commit: int
     route_invalidated_events: int
     model_calls: int
@@ -364,8 +370,25 @@ def make_nodes(
         )
         commits = state.get("commits", 0)
         since = state.get("decisions_since_commit", 0)
+        counts = {name: state.get(name, 0) for name in (
+            "action_attempts", "action_rejections", "action_failures",
+            "route_change_requests", "unchanged_route_requests",
+        )}
+
+        def submit(action: ActionRequest) -> ActionAck:
+            counts["action_attempts"] += 1
+            try:
+                accepted = client.submit_action(state["session_id"], action)
+                if not accepted.accepted:
+                    raise EnvironmentError(409, accepted.reason or "action rejected")
+                return accepted
+            except EnvironmentError as error:
+                key = "action_rejections" if 400 <= error.status_code < 500 else "action_failures"
+                counts[key] += 1
+                raise
+
         try:
-            ack = client.submit_action(state["session_id"], request)
+            ack = submit(request)
         except EnvironmentError as error:
             # Deterministic fallback: keep the current valid route (§7.4).
             fallback = ActionRequest(
@@ -376,8 +399,9 @@ def make_nodes(
                 reason_code="agent_fallback_keep",
             )
             try:
-                fallback_ack = client.submit_action(state["session_id"], fallback)
+                fallback_ack = submit(fallback)
                 return {
+                    **counts,
                     "fallbacks": state.get("fallbacks", 0) + 1,
                     "action_error": error.message,
                     "decision_id": None,
@@ -390,6 +414,7 @@ def make_nodes(
                 }
             except EnvironmentError as inner:
                 return {
+                    **counts,
                     "action_error": inner.message,
                     "done": True,
                     "events": [
@@ -400,9 +425,19 @@ def make_nodes(
         if decision.kind == "commit_route":
             commits += 1
             since = 0
+            candidate = next((item for item in state.get("candidates", [])
+                              if item.candidate_id == decision.candidate_id), None)
+            # Compare paths at the same observation boundary. These count
+            # accepted requests, not proof of next-tick route application.
+            if candidate and candidate.edges and observation.remaining_edge_ids:
+                key = ("unchanged_route_requests"
+                       if candidate.edges == observation.remaining_edge_ids
+                       else "route_change_requests")
+                counts[key] += 1
         else:
             since += 1
         return {
+            **counts,
             "commits": commits,
             "decisions_since_commit": since,
             "decision_id": None,

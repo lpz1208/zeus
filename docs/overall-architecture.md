@@ -2,9 +2,9 @@
 
 > 文档状态：持续演进
 >
-> 最后更新：2026-08-30
+> 最后更新：2026-09-23
 >
-> 适用阶段：已实现基础能力，进入 Agent Environment 规划与实施
+> 适用阶段：导航仿真、单 Agent 闭环与基础批量评测已交付，自定义算法实验台收口
 > 维护约定：后续架构、范围或技术决策发生变化时，直接更新本文，并同步修改“决策记录”和“变更记录”。
 
 ## 1. 已确定的核心决策
@@ -17,7 +17,7 @@
 6. C++ 仿真内核与导航算法优先在同一进程内通过函数调用交互；需要隔离时使用共享内存或批量 RPC。
 7. 浏览器通过二进制实时流接收经过裁剪、聚合或降采样的数据，不直接消费十万辆车的全部内部状态。
 8. 平台目标升级为地理空间导航智能体仿真与评测；现有全局导航算法作为可注册、可比较、可动态选择的 Agent Tools。
-9. 中观 MVP 使用确定性的路段密度速度模型：7 m 等效拥堵间距、15% 最低速度比例、入口容量准入和 tick 末迁移提交；当前无随机行为。
+9. 中观 MVP 使用确定性的路段密度速度模型：7 m 等效拥堵间距、可配置最低速度比例（默认 0）、入口容量准入和 tick 末迁移提交；当前无随机行为。
 10. C++ 是地图、仿真时钟、车辆状态和路线合法性的唯一事实源；Python Agent Runtime 负责低频、事件驱动的策略编排。
 11. 万级车辆采用“轻量车辆 + 区域 Agent + 少量全局 Agent”的分层架构，不为每辆车创建 LLM Agent。
 12. Agent 可以在决策边界调用并切换导航算法，但候选路线计算与路线提交分离，最终动作必须通过确定性安全门。
@@ -52,9 +52,9 @@ Zeus 是一个面向地理空间智能体研究的动态道路仿真与评测平
 - 单实验和批量实验。
 - 实时地图、路线、交通状态和算法指标展示。
 - 运行记录、回放和多算法对比。
-- 十万级在途车辆的基准测试能力。
+- 已具备仿真与评测入口；十万级在途车辆的受控性能验收仍待完成。
 
-### 3.2 下一阶段：Agent Environment MVP
+### 3.2 已实现：Agent Environment 与单导航智能体最小闭环
 
 - 有状态 `SimulationSession`：reset、observe、step、pause、snapshot 和 close。
 - 结构化 Observation、Action、Tool 和 DecisionTrace 协议。
@@ -62,7 +62,12 @@ Zeus 是一个面向地理空间智能体研究的动态道路仿真与评测平
 - Python Agent Runtime、LangGraph 状态图和 ModelProvider 适配层。
 - 事件触发唤醒、确定性 Action Guard、超时与 fallback。
 - Agent 决策过程的 Web 时间线和回放。
-- A*、动态重规划、LLM 直接导航与 Navigation Agent 的对照评测。
+- 固定算法、事件触发重规划、规则 Agent 与模型 Agent 的批量对照评测。
+- Benchmark 任务持久化、并发门禁、取消/重启恢复、Web 进度与 JSON/CSV 报告。
+- 五算法注册表（含 Yen K 最短路）、多候选比较与搜索波前回放。
+- 自定义 Python 子集算法、静态运行/调试、实验历史和车辆精确路径执行；自动代码导航支持页面循环和独立后台任务，后台任务可在重启后手动恢复。
+
+当前运行时使用 HTTP 与常驻 C++ Worker 帧协议，Protobuf 为目标契约，gRPC 尚未接入。Memory、分层多智能体与生产级鉴权/隔离不属于当前已交付能力。
 
 详细设计见 [geospatial-agent-environment.md](geospatial-agent-environment.md)。
 
@@ -454,7 +459,7 @@ SimulationKernel
 
 ### 8.2 仿真时钟
 
-所有模块只读取统一的仿真时间，不直接使用系统墙钟。当前 MVP 支持固定步长和最快速度离线运行；实时模式、暂停和单步属于任务化阶段。MVP 没有随机行为，因此不设置 seed；增加随机需求或驾驶行为后再引入显式确定性随机数流。
+仿真推进只读取统一的仿真时间；控制面另用墙钟管理请求和决策超时。当前支持固定步长、最快速度离线运行，以及有状态会话的暂停、单步和事件推进。仿真内核尚无随机行为；Benchmark 已按 seed 生成可重复、对齐 tick 的封路/降速事件，同轮各策略共享实际事件表。
 
 仿真配置示意：
 
@@ -464,7 +469,7 @@ struct SimulationConfig {
     double duration_seconds = 900.0;
     double sample_interval_seconds = 15.0;
     double jam_spacing_m = 7.0;
-    double min_speed_ratio = 0.15;
+    double min_speed_ratio = 0.0;
 };
 ```
 
@@ -480,7 +485,7 @@ struct SimulationConfig {
 
 该模型优先服务于十万级全局导航和动态重规划验证。
 
-当前已实现的 MVP 使用 `capacity=max(1,floor(length/7m)×lane_count)`，车辆速度为自由流速度乘以 `clamp(1-(occupancy-1)/capacity, 0.15, 1)`。同 tick 车辆读取相同的占用快照，跨边只写迁移缓冲并在 tick 末提交；下游无容量时车辆停在边端点，形成排队和回溢。可选 edge 出口 headway 按占用率限制汇总放行流率；转向级信号方案按绿灯、黄灯和全红周期门控 `from_edge → to_edge`，并以每转向独立饱和流率限制连续放行；封路、限速、降容和达到阈值的周期拥堵权重通过 dynamic routing overlay 触发受影响车辆重规划，并保持在途精确起点和原精确终点。车道数驱动的转向流率推导、自动冲突组/配时和替代道路恢复后的全局收益扫描尚未实现。实现、接口和测试见 [simulation-core-design.md](simulation-core-design.md)。
+当前已实现的 MVP 使用 `capacity=max(1,floor(length/7m)×lane_count)`，车辆速度为自由流速度乘以 `clamp(1-(occupancy-1)/capacity, min_speed_ratio, 1)`。同 tick 车辆读取相同的占用快照，跨边只写迁移缓冲并在 tick 末提交；下游无容量时车辆停在边端点，形成排队和回溢。可选 edge 出口 headway 按占用率限制汇总放行流率；转向级信号方案按绿灯、黄灯和全红周期门控 `from_edge → to_edge`，并以每转向独立饱和流率限制连续放行；封路、限速、降容和达到阈值的周期拥堵权重通过 dynamic routing overlay 触发受影响车辆重规划，并保持在途精确起点和原精确终点。车道数驱动的转向流率推导、自动冲突组/配时和替代道路恢复后的全局收益扫描尚未实现。实现、接口和测试见 [simulation-core-design.md](simulation-core-design.md)。
 
 ### 8.4 微观和混合仿真扩展
 
@@ -857,7 +862,7 @@ zeus/
 ├── apps/
 │   ├── web/
 │   ├── control-server/
-│   └── agent-runtime/          # Python + LangGraph，下一阶段
+│   └── agent-runtime/          # Python + LangGraph，已实现单 Agent 与批量评测
 ├── cpp/
 │   ├── map-core/
 │   ├── routing-core/
@@ -920,7 +925,7 @@ Kubernetes 部署：
 - 独立计算节点池运行大规模实验。
 - 对象存储持久化运行产物。
 
-用户自定义算法默认使用非 root、只读文件系统、无宿主机访问、受限网络和严格资源配额的隔离容器。
+规模化部署的目标是将用户自定义算法放入非 root、只读文件系统、受限网络和严格资源配额的隔离容器。当前本地工作台使用受限 AST 解释器与子进程预算，尚未提供该容器隔离。
 
 ## 16. 可观测性
 
@@ -978,7 +983,7 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 - 从 C++ 生成实时帧并在 Web 显示。
 - 完成 1 万和 10 万车辆基准，确定数据结构和 Tick 方案。
 
-### 阶段 1：导航与中观仿真 MVP（主体已完成，任务化待补）
+### 阶段 1：导航与中观仿真 MVP（主体已完成，场景版本与容器部署待补）
 
 - 地图导入和统一内部模型。
 - 场景编辑和版本管理。
@@ -989,16 +994,18 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 - 两个算法的并排对比。
 - Docker Compose 一键部署。
 
-### 阶段 2：Agent Environment MVP（下一优先级）
+### 阶段 2：Agent Environment MVP（HTTP 最小闭环已交付，gRPC 待接入）
 
 - 有状态 SimulationSession 和 reset/observe/step/snapshot。
 - Observation、Action、Tool 和 DecisionTrace Protobuf。
-- 现有四算法 Tool Registry 与规则策略基线。
+- 五算法 Tool Registry 与规则策略基线。
 - Python LangGraph Agent Runtime 和独立 ModelProvider。
 - 事件触发 Agent、Action Guard、超时及确定性 fallback。
 - Web Agent 决策时间线、回放和单智能体对照评测。
 
-### 阶段 3：正式智能体评测平台
+### 阶段 3：正式智能体评测平台（基础批量评测与自定义算法已落地）
+
+已实现批量任务、搜索与决策可视化、报告导出，以及受限 Python 算法实验和页面驱动的连续导航。以下仍包含目标能力：完整版本管理、随机事件、多租户隔离、分布式调度与十万级性能验收。
 
 - 算法 SDK 和隔离插件。
 - AgentPolicyVersion、ToolRegistryVersion 和 Memory 版本管理。
@@ -1065,12 +1072,14 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 5. Go 控制服务具体采用 Chi 还是 Gin。
 6. C++ 依赖管理使用 Conan 还是 vcpkg。
 7. MVP 是否需要用户登录和多租户权限。
-8. 第一阶段是否允许用户上传并运行自定义算法。
-9. 第一个 D* Lite / K Shortest Paths / 时间依赖算法的实现顺序。
+8. 自定义算法已允许本地运行 Python 子集；公开部署的系统隔离与鉴权方案待确定。
+9. Yen K 最短路已实现；D* Lite 与时间依赖算法的后续实现顺序待确定。
 10. 区域 Agent 的初始划分采用固定网格、行政区还是动态路网社区。
 11. 本科毕设实验规模采用“万级车辆 + 百级规则/轻量 Agent + 1–5 个 LLM Agent”的具体上限。
 
 ## 22. 决策记录
+
+2026-09-18：确认当前交付范围为 HTTP 单 Agent 闭环、基础 Benchmark 和本地受限 Python 算法实验。精确路径在提交及执行边界分别校验；后台自动导航、gRPC、生产隔离和规模性能仍为后续工作。端到端入口 `make algorithm-e2e` 使用真实前端循环、Go、Python 和 C++，CI 必须执行。
 
 | 日期 | 决策 | 状态 |
 | --- | --- | --- |
@@ -1120,6 +1129,14 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 
 ## 23. 变更记录
 
+2026-09-23：Benchmark v3 增加 C++ 权威路线应用结果与剩余路线重叠率。应用边界记录位置，导出时计算有向道路区间交并比，排除已行驶前缀并合并重复覆盖；前端区分提交与执行指标，兼容旧报告缺失值。
+
+2026-09-23：Benchmark 报告升级为 v2，补齐 Guard 阻止、动作拒绝/服务错误、降级和道路序列变更提交指标，贯通聚合、持久化与 Web/JSON/CSV；兼容旧报告缺失值，明确提交计数不等于真实路线应用或抖动。详见 [指标口径](benchmark-metrics.md)。
+
+2026-09-22：导航历史支持服务端原子持久化、容量与版本检查、刷新/重启后的源码和车辆边界恢复；恢复创建暂停会话，不启动后台自动循环。
+
+2026-09-18：同步 Agent Environment、Benchmark、自定义算法实验台与精确路径快照的落地状态；补充跨语言端到端验收与前端导航 CI，纠正早期阶段标记。
+
 | 日期 | 版本 | 说明 |
 | --- | --- | --- |
 | 2026-08-24 | 0.1 | 建立整体方案初稿，明确不依赖 SUMO、自研 C++ 仿真内核及十万级通信方案 |
@@ -1149,3 +1166,7 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 | 2026-08-30 | 0.25 | 新增 Agent Environment v1 Protobuf 和 Go 决策屏障协调器，建立仿真时间/墙上时间分离、状态版本与有效期校验、超时 fallback 及并发回收基础 |
 | 2026-08-30 | 0.26 | 新增 C++ Stateful SimulationSession 与 tick 边界控制器，在保持一次性 run 兼容的同时支持逐步推进、暂停观察、单调版本、取消回收和 barrier/compute 耗时分离 |
 | 2026-09-07 | 0.27 | 新增 Yen K 最短路（第五算法，loopless 禁边 overlay + spur 伪起点携带根前缀代价，registry 升 v2）与搜索 settle trace 全链路：plan 多候选、route alternatives、Web 多候选对比与搜索波前动画 |
+
+2026-09-24：补齐后台导航生命周期、自定义代码 Benchmark 和种子随机事件。v4 报告包含源码/场景版本、实际事件与代码决策记录；后台任务独占会话，检查点保存失败即停止，重启后需手动恢复。
+
+2026-09-24：Benchmark v5 增加原生 A→B→A 路线回切次数，贯通报告聚合、JSON/CSV 和 Web；快照重放保留应用证据，缺失证据不补零。该指标没有时间窗口，不将合理回切自动归类为策略错误。

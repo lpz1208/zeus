@@ -55,9 +55,7 @@ struct SearchOutput {
 
 // Edge-state shortest path used when the map carries explicit turn
 // transitions. The state is the incoming directed edge, so relaxing the next
-// edge can enforce (from_edge,to_edge) prohibitions and penalties. Both
-// bidirectional algorithm selections intentionally use this forward search
-// until a restriction-safe reverse state graph is introduced.
+// edge can enforce (from_edge,to_edge) prohibitions and penalties.
 [[nodiscard]] SearchOutput runTurnAwareSearch(
     const zeus::map::MapRuntime& runtime,
     const SearchQuery& query,
@@ -83,6 +81,15 @@ struct IncomingAdjacency {
 // tops satisfy top_f + top_b >= best. `expanded_nodes` counts settles on both
 // sides.
 [[nodiscard]] SearchOutput runBidirectionalSearch(
+    const zeus::map::MapRuntime& runtime,
+    const IncomingAdjacency& incoming,
+    const SearchQuery& query,
+    double max_speed_mps,
+    double known_best_time_s);
+
+// Bidirectional edge-state search with forward-oriented turn checks on both
+// frontiers and partial endpoint costs. A* uses the balanced endpoint potential.
+[[nodiscard]] SearchOutput runTurnAwareBidirectionalSearch(
     const zeus::map::MapRuntime& runtime,
     const IncomingAdjacency& incoming,
     const SearchQuery& query,

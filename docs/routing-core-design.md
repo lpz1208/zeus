@@ -76,7 +76,7 @@ relax(incoming_edge → outgoing_edge)
 cost += edge_time(outgoing_edge) + turn_penalty(incoming_edge,outgoing_edge)
 ```
 
-禁止转换返回无穷代价，不参与松弛；缺省转换允许且代价为零。目标 suffix 前也会检查最后一条边到目标边的转换，避免在终点入口绕过禁转。当前限制是：带转向规则的 `bidijkstra/biastar` 选择会复用正确的单向 edge-state 搜索，尚未实现 restriction-safe 的反向 line graph；无转向规则地图仍使用原双向实现。
+禁止转换返回无穷代价，不参与松弛；缺省转换允许且代价为零。目标 suffix 前也会检查最后一条边到目标边的转换，避免在终点入口绕过禁转。带转向规则的 `bidijkstra/biastar` 使用双向 edge-state 搜索。反向扩展枚举当前边起点的入边，始终按正向 `(from_edge, to_edge)` 检查禁转和惩罚；终点标签包含最后一次转向与目标边的部分费用。双向 A* 在入边终点上使用对称势函数，两侧标签相遇时势相消。无转向规则地图继续使用节点态双向搜索。
 
 地图编译可用可读 sidecar：
 
@@ -188,9 +188,8 @@ POST /api/maps/{id}/route
 1. 起终点各取吸附最优的一条边（含 twin），不从边中段向其他方向离开；需要掉头的场景通过路口绕行完成，多候选多源搜索留待后续。
 2. 并列最优路径下 Dijkstra 与 A* 可能返回不同但等价的边序列。
 3. OSM PBF 已能自动生成转向 sidecar，但当前只支持单 via-node 的机动车 `no_*` / `only_*`；via-way、conditional 和完整车型例外尚未进入运行时模型。
-4. 带转向规则时双向算法暂退化为单向 edge-state 搜索，保证正确性优先。
-5. 欧氏距离/全图最大限速启发式仍偏弱；已消除双向 A* 的全图势函数预扫描，ALT/CH 仍未实现。
-6. 当前每张地图默认只有一个串行路由 Worker；高并发阶段需要按地图分片多个只读 Worker，或将线程安全搜索上下文下沉到同一进程线程池。
+4. 欧氏距离/全图最大限速启发式仍偏弱；已消除双向 A* 的全图势函数预扫描，ALT/CH 仍未实现。
+5. 当前每张地图默认只有一个串行路由 Worker；高并发阶段需要按地图分片多个只读 Worker，或将线程安全搜索上下文下沉到同一进程线程池。
 
 ## 9. 下一步
 
@@ -203,3 +202,9 @@ POST /api/maps/{id}/route
 5. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。
 
 算法作为 Agent Tools、动态切换边界和安全门设计见 [geospatial-agent-environment.md](geospatial-agent-environment.md)。
+
+### 转向限制感知双向搜索验收（2026-09-25）
+
+双向 Dijkstra/A* 的能力版本为 2，`effectiveAlgorithm` 保留请求的双向算法。600 组固定种子场景分别与单向 Dijkstra 对拍，覆盖非对称禁转/惩罚、动态禁边/费用、精确部分边起终点、当前边已关闭但车辆仍可驶出、吸附双向 twin、多源/多目标及不可达情况。每条成功路径另行累计真实转向/部分边费用并验证没有驶入封闭道路。双向边态搜索支持 settle 轨迹。该实现仍为每请求搜索，尚不包含增量修复、时间依赖或 ALT/CH。
+
+路径并列最优时，算法升级可能选择不同道路序列；新的持久化快照使用重放契约 `zeus-session-replay-v2`，不把不同契约当作可验证重放。旧格式 1/2 仍按未校验兼容路径读取。

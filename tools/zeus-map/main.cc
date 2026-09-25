@@ -23,6 +23,7 @@
 #include "zeus/map/osm_road_preprocessor.h"
 #include "zeus/map/shapefile_importer.h"
 #include "zeus/routing/kshortest.h"
+#include "zeus/routing/algorithm_lab.h"
 #include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
@@ -104,6 +105,9 @@ void printUsage() {
         << "  --exit-headway-jam SECONDS  discharge headway under jam (default 2.0)\n"
         << "  --reroute-interval SECONDS  live congestion scan interval (default 0=off)\n"
         << "  --reroute-cost-ratio RATIO  material edge-cost change threshold (default 1.25)\n"
+        << "  --reroute-recovery-interval SECONDS  benefit scan interval (default 0=off)\n"
+        << "  --reroute-min-gain SECONDS  minimum optional reroute saving (default 0)\n"
+        << "  --reroute-cooldown SECONDS  optional reroute cooldown (default 0)\n"
         << "  --controls FILE            time,scope,target,action[,value] rows\n"
         << "  --signals FILE             node,phase,green,yellow,all_red,offset,from,to[,flow_vph] rows\n"
         << "  --output FILE              write per-vehicle WGS84 trajectory GeoJSON\n"
@@ -494,6 +498,47 @@ int run(int argc, char** argv) {
     if (command == "route-worker") {
         return runRouteWorker(runtime);
     }
+    if (command == "algorithm-context" || command == "algorithm-validate") {
+        zeus::routing::RouteRequest request;
+        std::vector<double> xs{std::stod(options.at("lon")), std::stod(options.at("dest-lon"))};
+        std::vector<double> ys{std::stod(options.at("lat")), std::stod(options.at("dest-lat"))};
+        transformWgs84Batch(xs, ys, runtime.data().metadata.runtime_crs_wkt);
+        request.origin = {xs[0], ys[0]};
+        request.destination = {xs[1], ys[1]};
+        request.max_snap_distance_m = 100;
+        std::vector<std::uint8_t> enabled(runtime.data().edges.size(), 1);
+        if (options.contains("closed")) {
+            std::istringstream list(options.at("closed"));
+            std::string item;
+            while (std::getline(list, item, ',')) {
+                const auto edge = std::stoul(item);
+                if (edge >= enabled.size()) throw std::invalid_argument("unknown closed edge");
+                enabled[edge] = 0;
+            }
+        }
+        zeus::routing::RoutingOverlay overlay{enabled, {}};
+        request.overlay = &overlay;
+        zeus::routing::AlgorithmLab lab(runtime, request);
+        if (command == "algorithm-context") {
+            std::ofstream context(options.at("output"));
+            if (!context) throw std::runtime_error("cannot write algorithm context");
+            lab.writeContext(context);
+        } else {
+            std::ifstream input_states(options.at("states"));
+            std::vector<int> states;
+            int state;
+            while (input_states >> state) {
+                states.push_back(state);
+                if (states.size() > 10000) throw std::invalid_argument("route state limit exceeded");
+            }
+            if (!input_states.eof()) throw std::invalid_argument("invalid route state file");
+            const auto result = lab.validate(states);
+            (void)zeus::routing::RouteGeoJsonExporter::save(runtime.data(), result, options.at("output"));
+            std::cout << std::setprecision(17) << "{\"ok\":true,\"timeS\":" << result.stats.time_s
+                      << ",\"lengthM\":" << result.stats.length_m << ",\"edges\":" << result.path.edges.size() << '}';
+        }
+        return 0;
+    }
     if (command == "query") {
         zeus::map::Point2d point;
         if (options.contains("x") && options.contains("y")) {
@@ -625,6 +670,15 @@ int run(int argc, char** argv) {
         }
         if (const auto found = options.find("reroute-interval"); found != options.end()) {
             config.reroute_interval_seconds = std::stod(found->second);
+        }
+        if (const auto found = options.find("reroute-recovery-interval"); found != options.end()) {
+            config.reroute_recovery_interval_seconds = std::stod(found->second);
+        }
+        if (const auto found = options.find("reroute-min-gain"); found != options.end()) {
+            config.reroute_min_gain_seconds = std::stod(found->second);
+        }
+        if (const auto found = options.find("reroute-cooldown"); found != options.end()) {
+            config.reroute_cooldown_seconds = std::stod(found->second);
         }
         if (const auto found = options.find("reroute-cost-ratio"); found != options.end()) {
             config.reroute_cost_ratio = std::stod(found->second);

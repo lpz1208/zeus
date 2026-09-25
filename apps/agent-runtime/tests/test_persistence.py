@@ -116,6 +116,24 @@ def test_persistence_options_reject_plain_loop(tmp_path):
         )
 
 
+def test_action_quality_counters_survive_checkpoint_without_double_count(tmp_path):
+    environment = FakeEnvironment(fail_first_commit=True)
+    checkpoint = tmp_path / "quality.sqlite"
+    first = run_episode(
+        _client(environment), _scenario(), checkpoint_path=checkpoint,
+        thread_id="quality", interrupt_after="act")
+    assert first.interrupted
+    assert first.action_attempts == 2
+    assert first.action_rejections == first.fallbacks == 1
+    resumed = run_episode(
+        _client(environment), _scenario(), checkpoint_path=checkpoint,
+        thread_id="quality", resume=True)
+    assert resumed.finished
+    assert resumed.action_attempts == len(environment.actions) == 4
+    assert resumed.action_rejections == resumed.fallbacks == 1
+    assert resumed.unchanged_route_requests == resumed.commits == 1
+
+
 def test_resume_requires_stable_thread_and_checkpoint():
     with pytest.raises(ValueError, match="resume requires"):
         run_episode(_client(FakeEnvironment()), _scenario(), resume=True)

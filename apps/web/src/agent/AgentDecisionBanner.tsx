@@ -16,7 +16,7 @@ export function AgentDecisionBanner({ agent }: { agent: AgentSessionApi }) {
         <span className="agent-decision-banner__id">
           <Pause size={12} fill="currentColor" /> DECISION {agent.decisionId.slice(-8)}
         </span>
-        <span className="agent-decision-banner__reason">{reason}</span>
+        <span className="agent-decision-banner__reason">{reason === 'route_improved' ? '道路恢复，可重新评估路线' : reason}</span>
         <span className="agent-decision-banner__version">v{agent.state?.stateVersion ?? 0}</span>
       </div>
       <p>

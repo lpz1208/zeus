@@ -41,7 +41,7 @@ export function AgentMissionPanel({
         <span>运行地图</span>
         <select
           value={activeMap?.id ?? ''}
-          disabled={Boolean(session)}
+          disabled={Boolean(session) || Boolean(busy)}
           onChange={(event) => {
             const selected = maps.find((item) => item.id === event.target.value)
             if (selected) onMapChange(selected)
@@ -73,6 +73,7 @@ export function AgentMissionPanel({
           <div className="agent-config-grid">
             <label><span>任务时域<small>SIM SEC</small></span><input type="number" min="60" max="28800" value={agent.durationSeconds} onChange={(event) => agent.setDurationSeconds(Number(event.target.value))} /></label>
             <label><span>决策周期<small>SIM SEC</small></span><input type="number" min="1" max="3600" value={agent.decisionIntervalSeconds} onChange={(event) => agent.setDecisionIntervalSeconds(Number(event.target.value))} /></label>
+            <label><span>恢复扫描<small>0 关闭 · 秒</small></span><input type="number" min="0" max="3600" value={agent.recoveryIntervalSeconds} onChange={(event) => agent.setRecoveryIntervalSeconds(Number(event.target.value))} /></label>
           </div>
           <button
             className="agent-primary"
@@ -90,12 +91,12 @@ export function AgentMissionPanel({
           <section className="agent-state-card">
             <div className="agent-state-card__head">
               <span><i /> ENVIRONMENT</span>
-              <strong>{state?.finished ? 'FINISHED' : decisionId ? 'AWAITING ACTION' : 'PAUSED'}</strong>
+              <strong>{state?.finished ? 'FINISHED' : observation?.state === 'arrived' ? 'ARRIVED' : decisionId ? 'AWAITING ACTION' : 'PAUSED'}</strong>
             </div>
             <div className="agent-state-metrics">
               <div><span>仿真时间</span><strong>{formatTime(state?.simulationTimeS ?? 0)}</strong></div>
               <div><span>状态版本</span><strong>v{state?.stateVersion ?? 0}</strong></div>
-              <div><span>当前边</span><strong>{observation?.position.edgeId ?? '—'}</strong></div>
+              <div><span>当前边</span><strong>{observation?.state === 'driving' ? observation.position.edgeId : '—'}</strong></div>
               <div><span>剩余 ETA</span><strong>{observation ? formatTime(observation.remainingEtaS) : '—'}</strong></div>
             </div>
             {decisionId && <div className="agent-barrier"><Pause size={12} /> 仿真已冻结，等待版本 v{state?.stateVersion} 的动作</div>}
@@ -119,7 +120,7 @@ export function AgentMissionPanel({
             </button>
             {agent.snapshots.map((snapshot) => (
               <div className="agent-snapshot-row" key={snapshot.snapshotId}>
-                <span><strong>T{snapshot.tick}</strong><small>{snapshot.snapshotId.slice(-8)}</small></span>
+                <span><strong>T{snapshot.tick}</strong><small title={snapshot.mapRevision}>{snapshot.snapshotId.slice(-8)} · {snapshot.integrity === 'verified' ? '已校验' : '旧版未校验'}</small></span>
                 <button type="button" aria-label="恢复快照" onClick={() => void agent.restoreSnapshot(snapshot)}><TimerReset size={12} /></button>
                 <button type="button" aria-label="删除快照" onClick={() => void agent.deleteSnapshot(snapshot)}><Trash2 size={12} /></button>
               </div>

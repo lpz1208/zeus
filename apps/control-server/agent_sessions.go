@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -32,43 +33,56 @@ type AgentVehicleSpec struct {
 }
 
 type AgentSessionRequest struct {
-	Vehicles               []AgentVehicleSpec          `json:"vehicles"`
-	DurationSeconds        float64                     `json:"durationSeconds"`
-	StepSeconds            float64                     `json:"stepSeconds"`
-	SampleIntervalSeconds  float64                     `json:"sampleIntervalSeconds"`
-	ExitHeadwayFfSeconds   float64                     `json:"exitHeadwayFfSeconds"`
-	ExitHeadwayJamSeconds  float64                     `json:"exitHeadwayJamSeconds"`
-	RerouteIntervalSeconds float64                     `json:"rerouteIntervalSeconds"`
-	RerouteCostRatio       float64                     `json:"rerouteCostRatio"`
-	MinSpeedRatio          float64                     `json:"minSpeedRatio"`
-	VehicleControls        []VehicleSimulationControl  `json:"vehicleControls,omitempty"`
-	RoadControls           []RoadSimulationControl     `json:"roadControls,omitempty"`
-	JunctionControls       []JunctionSimulationControl `json:"junctionControls,omitempty"`
-	SignalPlans            []JunctionSignalPlan        `json:"signalPlans,omitempty"`
+	Vehicles                       []AgentVehicleSpec          `json:"vehicles"`
+	DurationSeconds                float64                     `json:"durationSeconds"`
+	StepSeconds                    float64                     `json:"stepSeconds"`
+	SampleIntervalSeconds          float64                     `json:"sampleIntervalSeconds"`
+	ExitHeadwayFfSeconds           float64                     `json:"exitHeadwayFfSeconds"`
+	ExitHeadwayJamSeconds          float64                     `json:"exitHeadwayJamSeconds"`
+	RerouteIntervalSeconds         float64                     `json:"rerouteIntervalSeconds"`
+	RerouteCostRatio               float64                     `json:"rerouteCostRatio"`
+	RerouteRecoveryIntervalSeconds float64                     `json:"rerouteRecoveryIntervalSeconds,omitempty"`
+	RerouteMinGainSeconds          float64                     `json:"rerouteMinGainSeconds,omitempty"`
+	RerouteCooldownSeconds         float64                     `json:"rerouteCooldownSeconds,omitempty"`
+	MinSpeedRatio                  float64                     `json:"minSpeedRatio"`
+	VehicleControls                []VehicleSimulationControl  `json:"vehicleControls,omitempty"`
+	RoadControls                   []RoadSimulationControl     `json:"roadControls,omitempty"`
+	JunctionControls               []JunctionSimulationControl `json:"junctionControls,omitempty"`
+	SignalPlans                    []JunctionSignalPlan        `json:"signalPlans,omitempty"`
 }
 
 type agentSessionEntry struct {
-	mapID          string
-	runtime        string
-	stepSecond     float64
-	activeDecision string
-	request        AgentSessionRequest
+	navigationOwner string
+	mapID           string
+	runtime         string
+	mapRevision     string
+	stepSecond      float64
+	activeDecision  string
+	request         AgentSessionRequest
 	// lastActive drives the idle sweeper; refreshed by every registry access.
 	lastActive time.Time
 	inFlight   int
+	commandMu  *sync.Mutex
 }
 
 type agentSnapshotEntry struct {
 	artifact agentSnapshotArtifact
 }
 
-const agentSnapshotFormatVersion = 1
+const agentSnapshotFormatVersion = 3
+
+type agentExactPath struct {
+	Edges        []int   `json:"edges"`
+	StartOffsetM float64 `json:"startOffsetM"`
+	EndOffsetM   float64 `json:"endOffsetM"`
+}
 
 type agentReplayAction struct {
-	Tick      uint64 `json:"tick"`
-	VehicleID int    `json:"vehicleId"`
-	Kind      string `json:"kind"`
-	Algorithm string `json:"algorithm,omitempty"`
+	Tick      uint64          `json:"tick"`
+	VehicleID int             `json:"vehicleId"`
+	Kind      string          `json:"kind"`
+	Algorithm string          `json:"algorithm,omitempty"`
+	Path      *agentExactPath `json:"path,omitempty"`
 }
 
 type agentSnapshotArtifact struct {
@@ -83,6 +97,9 @@ type agentSnapshotArtifact struct {
 	DecisionPending bool                `json:"decisionPending"`
 	Request         AgentSessionRequest `json:"request"`
 	AppliedActions  []agentReplayAction `json:"appliedActions"`
+	MapRevision     string              `json:"mapRevision,omitempty"`
+	ReplayContract  string              `json:"replayContract,omitempty"`
+	Checksum        string              `json:"checksum,omitempty"`
 }
 
 type agentSessionRegistry struct {
@@ -95,6 +112,7 @@ func (r *agentSessionRegistry) add(id string, entry agentSessionEntry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry.lastActive = time.Now().UTC()
+	entry.commandMu = &sync.Mutex{}
 	r.sessions[id] = entry
 }
 
@@ -153,6 +171,19 @@ func (s *Server) withAgentSession(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		defer s.agentSessions.release(id)
+		if r.Method != http.MethodGet {
+			entry, _ := s.agentSessions.get(id)
+			if !entry.commandMu.TryLock() {
+				writeError(w, http.StatusConflict, "another session command is active")
+				return
+			}
+			defer entry.commandMu.Unlock()
+			entry, _ = s.agentSessions.get(id)
+			if entry.navigationOwner != "" && r.Context().Value(navigationOwnerKey{}) != entry.navigationOwner {
+				writeError(w, 409, "会话由后台导航任务管理，请先停止任务")
+				return
+			}
+		}
 		next(w, r)
 	}
 }
@@ -194,7 +225,7 @@ func (r *agentSessionRegistry) collectIdle(now time.Time, ttl time.Duration) []s
 	defer r.mu.Unlock()
 	var idle []string
 	for id, entry := range r.sessions {
-		if entry.activeDecision != "" || entry.inFlight > 0 {
+		if entry.navigationOwner != "" || entry.activeDecision != "" || entry.inFlight > 0 {
 			continue
 		}
 		if now.Sub(entry.lastActive) > ttl {
@@ -210,7 +241,7 @@ func (r *agentSessionRegistry) takeIdle(id string, now time.Time, ttl time.Durat
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	entry, ok := r.sessions[id]
-	if !ok || entry.activeDecision != "" || entry.inFlight > 0 || now.Sub(entry.lastActive) <= ttl {
+	if !ok || entry.navigationOwner != "" || entry.activeDecision != "" || entry.inFlight > 0 || now.Sub(entry.lastActive) <= ttl {
 		return agentSessionEntry{}, false
 	}
 	delete(r.sessions, id)
@@ -252,17 +283,24 @@ func (s *Server) loadAgentSnapshot(id string) (agentSnapshotArtifact, error) {
 	if err != nil {
 		return agentSnapshotArtifact{}, err
 	}
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return agentSnapshotArtifact{}, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, agentSnapshotMaxBytes+1))
+	if err != nil || len(data) > agentSnapshotMaxBytes {
+		return agentSnapshotArtifact{}, errors.New("agent snapshot is unreadable or exceeds 64 MiB")
 	}
 	var artifact agentSnapshotArtifact
 	if err := json.Unmarshal(data, &artifact); err != nil {
 		return agentSnapshotArtifact{}, fmt.Errorf("decode agent snapshot: %w", err)
 	}
-	if artifact.FormatVersion != agentSnapshotFormatVersion ||
-		artifact.SnapshotID != id || artifact.MapID == "" {
+	if artifact.SnapshotID != id || artifact.MapID == "" {
 		return agentSnapshotArtifact{}, errors.New("invalid agent snapshot artifact")
+	}
+	if err := verifyAgentSnapshot(artifact); err != nil {
+		return agentSnapshotArtifact{}, err
 	}
 	return artifact, nil
 }
@@ -280,6 +318,10 @@ func (s *Server) resetAgentWorkerSession(
 	request AgentSessionRequest,
 	sessionID string,
 ) (SessionCommandResult, float64, error) {
+	if err := validateRecoverySettings(request.RerouteRecoveryIntervalSeconds,
+		request.RerouteMinGainSeconds, request.RerouteCooldownSeconds); err != nil {
+		return SessionCommandResult{}, 0, &agentSessionResetError{status: http.StatusBadRequest, err: err}
+	}
 	odPath, err := writeAgentOdFile(&request)
 	if err != nil {
 		return SessionCommandResult{}, 0, &agentSessionResetError{
@@ -328,7 +370,10 @@ func (s *Server) resetAgentWorkerSession(
 		formatFloat(request.RerouteIntervalSeconds),
 		formatFloat(request.RerouteCostRatio),
 		formatFloat(request.MinSpeedRatio),
-		odPath, controlsPath, signalsPath)
+		odPath, controlsPath, signalsPath,
+		formatFloat(request.RerouteRecoveryIntervalSeconds),
+		formatFloat(request.RerouteMinGainSeconds),
+		formatFloat(request.RerouteCooldownSeconds))
 	if err != nil {
 		return SessionCommandResult{}, 0, &agentSessionResetError{
 			status: http.StatusBadGateway, err: err}
@@ -351,6 +396,7 @@ type sessionStateFields struct {
 	SimulationTimeS float64 `json:"simulationTimeS"`
 	StateVersion    uint64  `json:"stateVersion"`
 	Finished        bool    `json:"finished"`
+	Paused          bool    `json:"paused"`
 	Cancelled       bool    `json:"cancelled"`
 	DecisionDue     bool    `json:"decisionDue"`
 	DecisionReason  string  `json:"decisionReason"`
@@ -381,7 +427,9 @@ func (s *Server) agentSessionCommand(
 		writeError(w, http.StatusNotFound, "agent session belongs to another map")
 		return SessionCommandResult{}, nil
 	}
-	result, err := s.sessionWorkers.Command(r.Context(), entry.runtime, fields...)
+	ctx, cancel := residentAgentCommandContext(r.Context())
+	defer cancel()
+	result, err := s.sessionWorkers.Command(ctx, entry.runtime, fields...)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return SessionCommandResult{}, nil
@@ -404,6 +452,20 @@ func (s *Server) agentSessionCommand(
 	return result, result.Payload
 }
 
+// A disconnected browser must not terminate the shared resident map worker.
+// Commands already dispatched finish at a tick boundary; server deadlines
+// still bound them, and shutdown is handled by SessionWorkerManager.Close.
+func residentAgentCommandContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent.Err() != nil {
+		return context.WithCancel(parent)
+	}
+	ctx := context.WithoutCancel(parent)
+	if deadline, ok := parent.Deadline(); ok {
+		return context.WithDeadline(ctx, deadline)
+	}
+	return context.WithCancel(ctx)
+}
+
 type agentWorkerActionError struct {
 	status  int
 	message string
@@ -419,7 +481,9 @@ func (s *Server) applyAgentWorkerAction(
 	entry agentSessionEntry,
 	fields ...string,
 ) (SessionCommandResult, error) {
-	result, err := s.sessionWorkers.Command(ctx, entry.runtime, fields...)
+	commandCtx, cancel := residentAgentCommandContext(ctx)
+	defer cancel()
+	result, err := s.sessionWorkers.Command(commandCtx, entry.runtime, fields...)
 	if err != nil {
 		return SessionCommandResult{}, &agentWorkerActionError{
 			status: http.StatusBadGateway, message: err.Error()}
@@ -486,6 +550,10 @@ func (s *Server) handleCreateAgentSession(w http.ResponseWriter, r *http.Request
 	}
 
 	sessionID := newID("ses")
+	if err := s.pinAgentRuntime(r.Context(), &record, ""); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	result, step, err := s.resetAgentWorkerSession(
 		r.Context(), record, request, sessionID)
 	if err != nil {
@@ -498,7 +566,7 @@ func (s *Server) handleCreateAgentSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.agentSessions.add(sessionID, agentSessionEntry{
-		mapID: r.PathValue("id"), runtime: record.Runtime,
+		mapID: r.PathValue("id"), runtime: record.Runtime, mapRevision: record.RuntimeRevision,
 		stepSecond: step, request: request})
 	s.logger.Info("agent session created",
 		slog.String("session", sessionID), slog.String("map", r.PathValue("id")))
@@ -597,7 +665,79 @@ func (s *Server) agentSessionPassthrough(
 }
 
 func (s *Server) handleObserveAgentSession(w http.ResponseWriter, r *http.Request) {
-	s.agentSessionPassthrough(w, r, "observe", r.PathValue("session"), "hot")
+	_, payload := s.agentSessionCommand(w, r, "observe", r.PathValue("session"), "hot")
+	if payload == nil {
+		return
+	}
+	var response map[string]any
+	if json.Unmarshal(payload, &response) != nil {
+		writeError(w, 502, "unreadable observation")
+		return
+	}
+	entry, _ := s.agentSessions.get(r.PathValue("session"))
+	response["decisionId"] = entry.activeDecision
+	response["navigationJobId"] = entry.navigationOwner
+	writeJSON(w, 200, response)
+}
+
+// Opens a decision at the current paused boundary, including tick zero.
+// This lets user code select the first route before the vehicle departs.
+func (s *Server) handleAgentDecision(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		VehicleID           int    `json:"vehicleId"`
+		BasedOnStateVersion uint64 `json:"basedOnStateVersion"`
+	}
+	if err := decodeJSON(r, &request); err != nil || request.BasedOnStateVersion == 0 || request.VehicleID < 0 {
+		writeError(w, 400, "vehicleId and current basedOnStateVersion are required")
+		return
+	}
+	id := r.PathValue("session")
+	_, payload := s.agentSessionCommand(w, r, "observe", id, "hot")
+	if payload == nil {
+		return
+	}
+	var state sessionStateFields
+	if json.Unmarshal(payload, &state) != nil {
+		writeError(w, 502, "unreadable observation")
+		return
+	}
+	if !state.Paused || state.Finished || state.StateVersion != request.BasedOnStateVersion {
+		writeError(w, 409, "decision requires the current paused state version")
+		return
+	}
+	var agents []struct {
+		VehicleID int    `json:"vehicleId"`
+		State     string `json:"state"`
+	}
+	if json.Unmarshal(state.Agents, &agents) != nil {
+		writeError(w, 502, "unreadable agents")
+		return
+	}
+	active := false
+	for _, agent := range agents {
+		if agent.VehicleID == request.VehicleID && (agent.State == "waiting" || agent.State == "driving") {
+			active = true
+		}
+	}
+	if !active {
+		writeError(w, 400, "vehicle is not an active agent")
+		return
+	}
+	entry, _ := s.agentSessions.get(id)
+	decision := entry.activeDecision
+	if decision == "" {
+		state.DecisionReason = "manual"
+		if state.Tick == 0 {
+			state.DecisionReason = "initial"
+		}
+		var err error
+		decision, err = s.openDecisionBarrier(id, state)
+		if err != nil {
+			writeError(w, 409, err.Error())
+			return
+		}
+	}
+	writeJSON(w, 200, map[string]any{"state": state, "decisionId": decision})
 }
 
 func (s *Server) handleAgentObserveVehicle(w http.ResponseWriter, r *http.Request) {
@@ -653,9 +793,10 @@ func (s *Server) handleAgentPlan(w http.ResponseWriter, r *http.Request) {
 }
 
 type AgentStepRequest struct {
-	Ticks      uint64 `json:"ticks"`
-	UntilEvent bool   `json:"untilEvent"`
-	MaxTicks   uint64 `json:"maxTicks"`
+	Ticks               uint64  `json:"ticks"`
+	UntilEvent          bool    `json:"untilEvent"`
+	MaxTicks            uint64  `json:"maxTicks"`
+	BasedOnStateVersion *uint64 `json:"basedOnStateVersion,omitempty"`
 }
 
 func (s *Server) handleAgentStep(w http.ResponseWriter, r *http.Request) {
@@ -665,6 +806,21 @@ func (s *Server) handleAgentStep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionID := r.PathValue("session")
+	if request.BasedOnStateVersion != nil {
+		_, current := s.agentSessionCommand(w, r, "observe", sessionID, "hot")
+		if current == nil {
+			return
+		}
+		var state sessionStateFields
+		if json.Unmarshal(current, &state) != nil {
+			writeError(w, 502, "unreadable observation")
+			return
+		}
+		if !state.Paused || state.StateVersion != *request.BasedOnStateVersion {
+			writeError(w, 409, "step requires the current paused state version")
+			return
+		}
+	}
 	if entry, ok := s.agentSessions.get(sessionID); ok && entry.activeDecision != "" {
 		writeError(w, http.StatusConflict,
 			"resolve pending decision "+entry.activeDecision+" before stepping")
@@ -751,6 +907,15 @@ func (s *Server) openDecisionBarrier(
 		var ids []int
 		if json.Unmarshal(state.Agents, &ids) == nil {
 			agents = append(agents, ids...)
+		} else {
+			var values []struct {
+				VehicleID int `json:"vehicleId"`
+			}
+			if json.Unmarshal(state.Agents, &values) == nil {
+				for _, value := range values {
+					agents = append(agents, value.VehicleID)
+				}
+			}
 		}
 	}
 	go func() {
@@ -911,9 +1076,15 @@ func (s *Server) replayAgentSnapshot(
 	artifact agentSnapshotArtifact,
 	sessionID string,
 ) (state sessionStateFields, record MapRecord, err error) {
+	if err := verifyAgentSnapshot(artifact); err != nil {
+		return state, record, err
+	}
 	record, err = s.mapRecord(artifact.MapID)
 	if err != nil {
 		return state, record, fmt.Errorf("snapshot map is unavailable: %w", err)
+	}
+	if err := s.pinAgentRuntime(ctx, &record, artifact.MapRevision); err != nil {
+		return state, record, err
 	}
 	reset, _, err := s.resetAgentWorkerSession(
 		ctx, record, artifact.Request, sessionID)
@@ -976,14 +1147,35 @@ func (s *Server) replayAgentSnapshot(
 		var payload json.RawMessage
 		switch action.Kind {
 		case string(NavigationActionCommitRoute):
-			switch action.Algorithm {
-			case "dijkstra", "astar", "bidijkstra", "biastar":
-			default:
-				return state, record, fmt.Errorf(
-					"snapshot contains invalid algorithm %q", action.Algorithm)
+			var planned json.RawMessage
+			var commandErr error
+			if action.Path != nil {
+				path := action.Path
+				if len(path.Edges) == 0 || len(path.Edges) > 9999 ||
+					math.IsNaN(path.StartOffsetM) || math.IsInf(path.StartOffsetM, 0) ||
+					math.IsNaN(path.EndOffsetM) || math.IsInf(path.EndOffsetM, 0) {
+					return state, record, errors.New("snapshot contains invalid exact path")
+				}
+				edges := make([]string, len(path.Edges))
+				for i, edge := range path.Edges {
+					if edge < 0 {
+						return state, record, errors.New("snapshot contains negative path edge")
+					}
+					edges[i] = strconv.Itoa(edge)
+				}
+				planned, commandErr = command("path-candidate", sessionID, vehicle, version,
+					strconv.FormatFloat(path.StartOffsetM, 'g', -1, 64),
+					strconv.FormatFloat(path.EndOffsetM, 'g', -1, 64), strings.Join(edges, ","))
+			} else {
+				switch action.Algorithm {
+				case "dijkstra", "astar", "bidijkstra", "biastar", "kshortest":
+				default:
+					return state, record, fmt.Errorf(
+						"snapshot contains invalid algorithm %q", action.Algorithm)
+				}
+				planned, commandErr = command(
+					"plan", sessionID, vehicle, action.Algorithm, "1", "0")
 			}
-			planned, commandErr := command(
-				"plan", sessionID, vehicle, action.Algorithm)
 			if commandErr != nil {
 				return state, record, fmt.Errorf("replay plan: %w", commandErr)
 			}
@@ -1046,6 +1238,9 @@ func (s *Server) handleCreateAgentSnapshot(w http.ResponseWriter, r *http.Reques
 	if payload == nil {
 		return
 	}
+	defer func() {
+		_, _ = s.sessionWorkers.Command(context.Background(), entry.runtime, "drop-snapshot", snapshotID)
+	}()
 	var workerSnapshot struct {
 		Tick           uint64              `json:"tick"`
 		StateVersion   uint64              `json:"stateVersion"`
@@ -1068,14 +1263,16 @@ func (s *Server) handleCreateAgentSnapshot(w http.ResponseWriter, r *http.Reques
 		Request:         entry.request,
 		AppliedActions:  workerSnapshot.AppliedActions,
 	}
+	if err := sealAgentSnapshot(&artifact, entry.mapRevision); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if err := os.MkdirAll(s.agentSnapshotsDir(), 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	path, _ := s.agentSnapshotPath(snapshotID)
 	if err := saveJSONFile(path, artifact); err != nil {
-		_, _ = s.sessionWorkers.Command(
-			context.Background(), entry.runtime, "drop-snapshot", snapshotID)
 		writeError(w, http.StatusInternalServerError,
 			"persist agent snapshot: "+err.Error())
 		return
@@ -1086,40 +1283,50 @@ func (s *Server) handleCreateAgentSnapshot(w http.ResponseWriter, r *http.Reques
 	_ = json.Unmarshal(payload, &response)
 	response["storage"] = "durable_replay_v1"
 	response["formatVersion"] = agentSnapshotFormatVersion
+	response["mapRevision"], response["checksum"] = artifact.MapRevision, artifact.Checksum
+	response["integrity"] = "verified"
 	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleRestoreAgentSnapshot(w http.ResponseWriter, r *http.Request) {
 	snapshotID := r.PathValue("snapshot")
-	snapshot, ok := s.agentSessions.getSnapshot(snapshotID)
-	if !ok {
-		artifact, err := s.loadAgentSnapshot(snapshotID)
-		if err == nil {
-			snapshot = agentSnapshotEntry{artifact: artifact}
-			s.agentSessions.addSnapshot(snapshotID, snapshot)
-			ok = true
-		}
-	}
-	if !ok || snapshot.artifact.MapID != r.PathValue("id") {
+	// Re-read the durable source of truth; an in-memory cache must not conceal
+	// changes to the artifact after it was saved.
+	artifact, err := s.loadAgentSnapshot(snapshotID)
+	if os.IsNotExist(err) || (err == nil && artifact.MapID != r.PathValue("id")) {
 		writeError(w, http.StatusNotFound, "unknown agent snapshot")
 		return
 	}
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.restoreAgentArtifact(w, r, artifact)
+}
+
+func (s *Server) restoreAgentArtifact(w http.ResponseWriter, r *http.Request, artifact agentSnapshotArtifact) {
 	sessionID := newID("ses")
 	state, record, err := s.replayAgentSnapshot(
-		r.Context(), snapshot.artifact, sessionID)
+		r.Context(), artifact, sessionID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.agentSessions.add(sessionID, agentSessionEntry{
-		mapID:      snapshot.artifact.MapID,
-		runtime:    record.Runtime,
-		stepSecond: snapshot.artifact.StepSecond,
-		request:    snapshot.artifact.Request})
+		mapID:       artifact.MapID,
+		runtime:     record.Runtime,
+		mapRevision: record.RuntimeRevision,
+		stepSecond:  artifact.StepSecond,
+		request:     artifact.Request})
 	response := map[string]any{
-		"snapshotId": snapshotID,
-		"state":      state,
-		"storage":    "durable_replay_v1",
+		"snapshotId":  artifact.SnapshotID,
+		"state":       state,
+		"storage":     "durable_replay_v1",
+		"integrity":   "verified",
+		"mapRevision": record.RuntimeRevision,
+	}
+	if artifact.FormatVersion < agentSnapshotFormatVersion {
+		response["integrity"] = "legacy_unverified"
 	}
 	if state.DecisionDue {
 		decisionID, barrierErr := s.openDecisionBarrier(sessionID, state)
@@ -1148,12 +1355,6 @@ func (s *Server) handleDeleteAgentSnapshot(w http.ResponseWriter, r *http.Reques
 	if !ok || snapshot.artifact.MapID != r.PathValue("id") {
 		writeError(w, http.StatusNotFound, "unknown agent snapshot")
 		return
-	}
-	if record, err := s.mapRecord(snapshot.artifact.MapID); err == nil {
-		// The durable artifact is authoritative. The process-local copy is only
-		// a cache and may already be gone after worker eviction or restart.
-		_, _ = s.sessionWorkers.Command(
-			r.Context(), record.Runtime, "drop-snapshot", snapshotID)
 	}
 	path, _ := s.agentSnapshotPath(snapshotID)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {

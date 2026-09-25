@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -37,6 +38,11 @@ struct SimulationConfig {
     // An edge becomes a routing event when its cost factor changes by at least
     // this multiplicative ratio since the previous published value.
     double reroute_cost_ratio = 1.25;
+    // Zero disables network-wide benefit scans after reopening/cost decreases.
+    double reroute_recovery_interval_seconds = 0.0;
+    // Stability controls for optional reroutes; blocked routes bypass both.
+    double reroute_min_gain_seconds = 0.0;
+    double reroute_cooldown_seconds = 0.0;
     // Abort after this many consecutive ticks without any vehicle movement.
     std::uint32_t deadlock_probe_ticks = 300;
 };
@@ -116,6 +122,10 @@ struct VehicleRerouteRecord {
     std::uint32_t old_route_id = 0;
     std::uint32_t new_route_id = 0;
     bool success = false;
+    // Position on the old route immediately before application. Retained for
+    // offline comparison; a missing index means legacy/unavailable evidence.
+    std::optional<std::uint32_t> old_route_index = std::nullopt;
+    double old_route_offset_m = 0.0;
 };
 
 enum class VehicleState : std::uint8_t {
@@ -222,7 +232,7 @@ struct TickSnapshot {
     double simulation_time_s = 0.0;
     std::uint64_t state_version = 0;
     bool decision_due = false;
-    std::string decision_reason;        // "route_invalidated" | "periodic" | ""
+    std::string decision_reason;        // "route_invalidated" | "route_improved" | "periodic" | ""
     std::vector<EdgeTickState> edges;   // hot edges only
     std::vector<AgentVehicleState> agents;
     std::uint64_t arrived = 0;
@@ -232,12 +242,13 @@ struct TickSnapshot {
 };
 
 // A committed agent action queued by the session and drained by the engine at
-// the next tick boundary. The route itself is re-planned deterministically
-// from the vehicle's live position; only the algorithm choice travels.
+// the next tick boundary. An exact path is validated again against live road
+// conditions; otherwise the selected native algorithm replans from the vehicle.
 struct RouteInjection {
     std::uint32_t vehicle_id = 0;
     zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
     std::uint64_t based_on_state_version = 0;
+    std::optional<zeus::routing::RoutePath> path;
 };
 
 struct SimulationResult {

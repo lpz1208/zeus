@@ -231,6 +231,38 @@ public:
         return CommitResult::kApplied;
     }
 
+    [[nodiscard]] CommitResult commitPath(
+        std::uint32_t vehicle_id,
+        const zeus::routing::RoutePath& path,
+        std::uint64_t expected_state_version) {
+        std::lock_guard lock(mutex_);
+        if (closed_ || !started_) return CommitResult::kRejectedClosed;
+        if (state_.state_version != expected_state_version) return CommitResult::kRejectedStaleVersion;
+        if (vehicle_id >= demands_.size()) return CommitResult::kRejectedUnknownVehicle;
+        if (!demands_[vehicle_id].agent_controlled) return CommitResult::kRejectedNotAgent;
+        if (state_.finished || !snapshot_) return CommitResult::kRejectedInactiveVehicle;
+        if (!state_.paused || run_to_end_ || command_active_) return CommitResult::kRejectedNotPaused;
+        const auto agent = std::find_if(snapshot_->agents.begin(), snapshot_->agents.end(),
+            [vehicle_id](const auto& value) { return value.vehicle_id == vehicle_id; });
+        if (agent == snapshot_->agents.end() ||
+            (agent->state != VehicleState::kWaiting && agent->state != VehicleState::kDriving)) {
+            return CommitResult::kRejectedInactiveVehicle;
+        }
+        RouteInjection injection;
+        try {
+            injection.path = engine_.validateAgentRoute(demands_[vehicle_id], *agent, *snapshot_, path).path;
+        } catch (const std::invalid_argument&) {
+            return CommitResult::kRejectedInvalidPath;
+        }
+        injection.vehicle_id = vehicle_id;
+        injection.based_on_state_version = expected_state_version;
+        std::erase_if(pending_injections_, [vehicle_id](const auto& value) {
+            return value.vehicle_id == vehicle_id;
+        });
+        pending_injections_.push_back(std::move(injection));
+        return CommitResult::kApplied;
+    }
+
     [[nodiscard]] CommitResult keepRoute(
         std::uint32_t vehicle_id,
         std::uint64_t expected_state_version) {
@@ -459,6 +491,12 @@ SimulationSession::CommitResult SimulationSession::commitRoute(
     zeus::routing::Algorithm algorithm,
     std::uint64_t expected_state_version) {
     return impl_->commitRoute(vehicle_id, algorithm, expected_state_version);
+}
+
+SimulationSession::CommitResult SimulationSession::commitPath(
+    std::uint32_t vehicle_id, const zeus::routing::RoutePath& path,
+    std::uint64_t expected_state_version) {
+    return impl_->commitPath(vehicle_id, path, expected_state_version);
 }
 
 SimulationSession::CommitResult SimulationSession::keepRoute(

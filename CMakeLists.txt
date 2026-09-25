@@ -44,6 +44,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 add_library(zeus_routing_core
+    cpp/routing-core/src/algorithm_lab.cc
     cpp/routing-core/src/kshortest.cc
     cpp/routing-core/src/route_exporter.cc
     cpp/routing-core/src/route_planner.cc

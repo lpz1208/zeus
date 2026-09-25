@@ -82,6 +82,9 @@ public:
         kRejectedStaleVersion,
         kRejectedUnknownVehicle,
         kRejectedNotAgent,
+        kRejectedNotPaused,
+        kRejectedInactiveVehicle,
+        kRejectedInvalidPath,
     };
 
     // Queues a route replacement for `vehicle_id` (a vehicle index), applied
@@ -92,6 +95,14 @@ public:
     [[nodiscard]] CommitResult commitRoute(
         std::uint32_t vehicle_id,
         zeus::routing::Algorithm algorithm,
+        std::uint64_t expected_state_version);
+
+    // Queues exactly this route from a paused, version-matched observation.
+    // The engine rechecks legality after next-tick controls; rejection there
+    // retains the old route and records a failed reroute, never a substitute.
+    [[nodiscard]] CommitResult commitPath(
+        std::uint32_t vehicle_id,
+        const zeus::routing::RoutePath& path,
         std::uint64_t expected_state_version);
 
     // Version-validated acknowledgement that the agent keeps its route; drops

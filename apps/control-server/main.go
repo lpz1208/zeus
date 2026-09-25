@@ -29,6 +29,8 @@ import (
 const maxUploadBytes = 512 << 20
 
 type Config struct {
+	AlgorithmPython string
+
 	Addr            string
 	DataDir         string
 	ZeusMap         string
@@ -56,12 +58,22 @@ type Config struct {
 }
 
 type Server struct {
-	config Config
-	logger *slog.Logger
-	jobs   *JobManager
+	navigationJobsMu     sync.Mutex
+	navigationJobs       map[string]*backgroundNavigation
+	navigationJobsClosed bool
+	navigationJobsWG     sync.WaitGroup
+	config               Config
+	logger               *slog.Logger
+	jobs                 *JobManager
 	// simSlots bounds concurrent C++ simulate processes: each one loads the
 	// full .zmap and builds its own spatial index.
-	simSlots chan struct{}
+	simSlots               chan struct{}
+	algorithmSlots         chan struct{}
+	algorithmHistoryMu     sync.Mutex
+	navigationHistoryMu    sync.Mutex
+	algorithmDebugMu       sync.Mutex
+	algorithmDebugSessions map[string]*algorithmDebugSession
+	algorithmDebugClosed   bool
 	// routeWorkers keeps one framed C++ process per recently used immutable
 	// map version, so HTTP routing reuses MapRuntime and RoutePlanner indexes.
 	routeWorkers *RouteWorkerManager
@@ -220,6 +232,7 @@ type MapRecord struct {
 	Issues           []ValidationIssue   `json:"issues"`
 	Cleaning         *OSMCleaningSummary `json:"cleaning,omitempty"`
 	Runtime          string              `json:"-"`
+	RuntimeRevision  string              `json:"-"`
 	GeoJSON          string              `json:"-"`
 	NodesGeoJSON     string              `json:"-"`
 	IssuesGeoJSON    string              `json:"-"`
@@ -290,7 +303,7 @@ type RouteResponse struct {
 	OK        bool   `json:"ok"`
 	Algorithm string `json:"algorithm"`
 	// EffectiveAlgorithm is what actually ran; bidirectional selections
-	// downgrade to the forward search on turn-restricted maps.
+	// use restriction-safe edge-state search on turn-restricted maps.
 	EffectiveAlgorithm string          `json:"effectiveAlgorithm"`
 	Reason             string          `json:"reason,omitempty"`
 	Message            string          `json:"message,omitempty"`
@@ -313,24 +326,27 @@ var routeMatchPattern = regexp.MustCompile(
 	`^(origin|dest)\.edge=([^ ]+) road_id=([^ ]+) source=([^ ]+) offset_s=([^ ]+) distance=([^ ]+) confidence=([^ ]+)$`)
 
 type SimulateRequest struct {
-	FromLon                *float64                    `json:"fromLon"`
-	FromLat                *float64                    `json:"fromLat"`
-	ToLon                  *float64                    `json:"toLon"`
-	ToLat                  *float64                    `json:"toLat"`
-	Count                  int                         `json:"count"`
-	SpreadSeconds          float64                     `json:"spreadSeconds"`
-	DurationSeconds        float64                     `json:"durationSeconds"`
-	StepSeconds            float64                     `json:"stepSeconds"`
-	SampleIntervalSeconds  float64                     `json:"sampleIntervalSeconds"`
-	ExitHeadwayFfSeconds   float64                     `json:"exitHeadwayFfSeconds"`
-	ExitHeadwayJamSeconds  float64                     `json:"exitHeadwayJamSeconds"`
-	RerouteIntervalSeconds float64                     `json:"rerouteIntervalSeconds"`
-	RerouteCostRatio       float64                     `json:"rerouteCostRatio"`
-	Algorithm              string                      `json:"algorithm"`
-	VehicleControls        []VehicleSimulationControl  `json:"vehicleControls,omitempty"`
-	RoadControls           []RoadSimulationControl     `json:"roadControls,omitempty"`
-	JunctionControls       []JunctionSimulationControl `json:"junctionControls,omitempty"`
-	SignalPlans            []JunctionSignalPlan        `json:"signalPlans,omitempty"`
+	FromLon                        *float64                    `json:"fromLon"`
+	FromLat                        *float64                    `json:"fromLat"`
+	ToLon                          *float64                    `json:"toLon"`
+	ToLat                          *float64                    `json:"toLat"`
+	Count                          int                         `json:"count"`
+	SpreadSeconds                  float64                     `json:"spreadSeconds"`
+	DurationSeconds                float64                     `json:"durationSeconds"`
+	StepSeconds                    float64                     `json:"stepSeconds"`
+	SampleIntervalSeconds          float64                     `json:"sampleIntervalSeconds"`
+	ExitHeadwayFfSeconds           float64                     `json:"exitHeadwayFfSeconds"`
+	ExitHeadwayJamSeconds          float64                     `json:"exitHeadwayJamSeconds"`
+	RerouteIntervalSeconds         float64                     `json:"rerouteIntervalSeconds"`
+	RerouteCostRatio               float64                     `json:"rerouteCostRatio"`
+	RerouteRecoveryIntervalSeconds float64                     `json:"rerouteRecoveryIntervalSeconds,omitempty"`
+	RerouteMinGainSeconds          float64                     `json:"rerouteMinGainSeconds,omitempty"`
+	RerouteCooldownSeconds         float64                     `json:"rerouteCooldownSeconds,omitempty"`
+	Algorithm                      string                      `json:"algorithm"`
+	VehicleControls                []VehicleSimulationControl  `json:"vehicleControls,omitempty"`
+	RoadControls                   []RoadSimulationControl     `json:"roadControls,omitempty"`
+	JunctionControls               []JunctionSimulationControl `json:"junctionControls,omitempty"`
+	SignalPlans                    []JunctionSignalPlan        `json:"signalPlans,omitempty"`
 }
 
 type VehicleSimulationControl struct {
@@ -411,6 +427,7 @@ type SimulateResponse struct {
 
 func main() {
 	config := Config{}
+	flag.StringVar(&config.AlgorithmPython, "algorithm-python", "python3", "Python 3 executable for restricted algorithm interpreter")
 	flag.StringVar(&config.Addr, "addr", ":8080", "HTTP listen address")
 	flag.StringVar(&config.DataDir, "data-dir", "data", "persistent data directory")
 	flag.StringVar(&config.ZeusMap, "zeus-map", "build/zeus-map", "path to zeus-map executable")
@@ -462,6 +479,9 @@ func main() {
 }
 
 func NewServer(config Config, logger *slog.Logger) *Server {
+	if config.AlgorithmPython == "" {
+		config.AlgorithmPython = "python3"
+	}
 	if config.CmdLimit == 0 {
 		config.CmdLimit = 2 * time.Minute
 	}
@@ -489,6 +509,7 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 		logger:         logger,
 		jobs:           NewJobManager(config.ImportWorkers, config.JobRetentionTTL),
 		simSlots:       make(chan struct{}, simSlots),
+		algorithmSlots: make(chan struct{}, 2),
 		routeWorkers:   NewRouteWorkerManager(config.ZeusMap, config.CmdLimit, config.RouteWorkerMaps),
 		sessionWorkers: NewSessionWorkerManager(config.ZeusMap, 10*config.CmdLimit, config.SessionWorkerMaps),
 		agentSessions: agentSessionRegistry{
@@ -507,6 +528,8 @@ func NewServer(config Config, logger *slog.Logger) *Server {
 
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		s.closeBackgroundNavigation()
+		s.closeAlgorithmDebuggers()
 		if s.agentSessionSweeperStop != nil {
 			close(s.agentSessionSweeperStop)
 		}
@@ -542,6 +565,18 @@ func (s *Server) referenceLayersDir() string {
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /api/live", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "zeus-control-server"})
+	})
+	mux.HandleFunc("GET /api/algorithms/capabilities", s.handleAlgorithmCapabilities)
+	mux.HandleFunc("POST /api/algorithms/check", s.handleAlgorithmCheck)
+	mux.HandleFunc("POST /api/maps/{id}/algorithms/debug", s.handleAlgorithmDebugStart)
+	mux.HandleFunc("POST /api/maps/{id}/algorithms/debug/{debug}", s.handleAlgorithmDebugCommand)
+	mux.HandleFunc("DELETE /api/maps/{id}/algorithms/debug/{debug}", s.handleAlgorithmDebugCommand)
+	mux.HandleFunc("POST /api/maps/{id}/algorithms/run", s.handleAlgorithmRun)
+	mux.HandleFunc("GET /api/maps/{id}/algorithms/experiments", s.handleAlgorithmHistory)
+	mux.HandleFunc("GET /api/maps/{id}/algorithms/experiments/{run}", s.handleAlgorithmHistory)
+	mux.HandleFunc("DELETE /api/maps/{id}/algorithms/experiments/{run}", s.handleAlgorithmHistory)
 	mux.HandleFunc("GET /api/maps", s.handleListMaps)
 	mux.HandleFunc("POST /api/maps/inspect", s.handleInspect)
 	mux.HandleFunc("POST /api/maps/import", s.handleImport)
@@ -561,15 +596,27 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/maps/{id}/route", s.handleRoute)
 	mux.HandleFunc("POST /api/maps/{id}/simulate", s.handleSimulate)
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions", s.handleCreateAgentSession)
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/navigation-jobs", s.withAgentSession(s.handleStartBackgroundNavigation))
+	mux.HandleFunc("GET /api/maps/{id}/agent/navigation-jobs", s.handleBackgroundNavigation)
+	mux.HandleFunc("GET /api/maps/{id}/agent/navigation-jobs/{job}", s.handleBackgroundNavigation)
+	mux.HandleFunc("POST /api/maps/{id}/agent/navigation-jobs/{job}", s.handleBackgroundNavigation)
+	mux.HandleFunc("DELETE /api/maps/{id}/agent/navigation-jobs/{job}", s.handleBackgroundNavigation)
 	mux.HandleFunc("GET /api/maps/{id}/agent/tools", s.handleAgentTools)
 	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}", s.withAgentSession(s.handleObserveAgentSession))
 	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/agent/{vehicle}", s.withAgentSession(s.handleAgentObserveVehicle))
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/plan", s.withAgentSession(s.handleAgentPlan))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/algorithms/plan", s.withAgentSession(s.handleAlgorithmVehiclePlan))
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/step", s.withAgentSession(s.handleAgentStep))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/decisions", s.withAgentSession(s.handleAgentDecision))
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/actions", s.withAgentSession(s.handleAgentAction))
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/run", s.withAgentSession(s.handleAgentRunToEnd))
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/pause", s.withAgentSession(s.handleAgentPause))
 	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/snapshots", s.withAgentSession(s.handleCreateAgentSnapshot))
+	mux.HandleFunc("POST /api/maps/{id}/agent/sessions/{session}/navigation-history", s.withAgentSession(s.handleSaveNavigationHistory))
+	mux.HandleFunc("GET /api/maps/{id}/agent/navigation-history", s.handleNavigationHistory)
+	mux.HandleFunc("GET /api/maps/{id}/agent/navigation-history/{history}", s.handleNavigationHistory)
+	mux.HandleFunc("DELETE /api/maps/{id}/agent/navigation-history/{history}", s.handleNavigationHistory)
+	mux.HandleFunc("POST /api/maps/{id}/agent/navigation-history/{history}/restore", s.handleRestoreNavigationHistory)
 	mux.HandleFunc("POST /api/maps/{id}/agent/snapshots/{snapshot}/restore", s.handleRestoreAgentSnapshot)
 	mux.HandleFunc("DELETE /api/maps/{id}/agent/snapshots/{snapshot}", s.handleDeleteAgentSnapshot)
 	mux.HandleFunc("GET /api/maps/{id}/agent/sessions/{session}/result", s.withAgentSession(s.handleAgentSessionResult))
@@ -1793,7 +1840,20 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 
 // buildSimulateArgs validates the request and returns the CLI arguments
 // (without the leading "simulate <map>" pair).
+func validateRecoverySettings(interval, gain, cooldown float64) error {
+	for _, value := range []float64{interval, gain, cooldown} {
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value > 3600 {
+			return errors.New("reroute recovery interval, minimum gain and cooldown must be finite and between 0 and 3600 seconds")
+		}
+	}
+	return nil
+}
+
 func buildSimulateArgs(request SimulateRequest) ([]string, error) {
+	if err := validateRecoverySettings(request.RerouteRecoveryIntervalSeconds,
+		request.RerouteMinGainSeconds, request.RerouteCooldownSeconds); err != nil {
+		return nil, err
+	}
 	if request.FromLon == nil || request.FromLat == nil ||
 		request.ToLon == nil || request.ToLat == nil {
 		return nil, errors.New("simulate requires fromLon/fromLat and toLon/toLat")
@@ -1899,6 +1959,15 @@ func buildSimulateArgs(request SimulateRequest) ([]string, error) {
 	}
 	if request.RerouteIntervalSeconds > 0 {
 		args = append(args, "--reroute-interval", formatFloat(request.RerouteIntervalSeconds))
+	}
+	if request.RerouteRecoveryIntervalSeconds > 0 {
+		args = append(args, "--reroute-recovery-interval", formatFloat(request.RerouteRecoveryIntervalSeconds))
+	}
+	if request.RerouteMinGainSeconds > 0 {
+		args = append(args, "--reroute-min-gain", formatFloat(request.RerouteMinGainSeconds))
+	}
+	if request.RerouteCooldownSeconds > 0 {
+		args = append(args, "--reroute-cooldown", formatFloat(request.RerouteCooldownSeconds))
 	}
 	if request.RerouteCostRatio > 0 {
 		args = append(args, "--reroute-cost-ratio", formatFloat(request.RerouteCostRatio))

@@ -146,8 +146,7 @@ struct RouteResult {
     RouteFailure failure = RouteFailure::kNone;
     std::string message;
     Algorithm algorithm = Algorithm::kDijkstra;            // requested
-    // What actually ran: bidirectional selections downgrade to the forward
-    // edge-state search on maps that carry turn transitions.
+    // What actually ran, including restriction-safe bidirectional edge search.
     Algorithm effective_algorithm = Algorithm::kDijkstra;
     RouteEndpointMatch origin;
     RouteEndpointMatch destination;

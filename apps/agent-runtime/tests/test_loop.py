@@ -65,6 +65,9 @@ def test_episode_falls_back_to_keep_on_conflict():
     assert trace.arrived
     keeps = [a for a in environment.actions if a.get("kind") == "keep_route"]
     assert any(a.get("reasonCode") == "agent_fallback_keep" for a in keeps)
+    assert trace.action_rejections == 1
+    assert trace.action_failures == 0
+    assert trace.action_attempts == len(environment.actions)
 
 
 def test_episode_always_closes_the_session(fake_environment):
@@ -119,6 +122,79 @@ def test_episode_can_explicitly_use_plain_loop(fake_client):
     trace = run_episode(fake_client, scenario(), use_langgraph=False)
     assert trace.execution_mode == "plain_loop"
     assert trace.finished and trace.arrived
+
+
+@pytest.mark.parametrize("use_langgraph", [False, True])
+@pytest.mark.parametrize("status,accepted,expected_rejections,expected_failures", [
+    (200, False, 1, 0), (409, False, 1, 0), (503, False, 0, 1),
+])
+def test_action_quality_counts_rejected_ack_and_http_errors(
+    use_langgraph, status, accepted, expected_rejections, expected_failures,
+):
+    environment = FakeEnvironment()
+    attempted = 0
+
+    def handle(request):
+        nonlocal attempted
+        if request.url.path.endswith("/actions"):
+            attempted += 1
+            if attempted == 1:
+                return httpx.Response(status, json={
+                    "accepted": accepted, "reason": "rejected", "error": "rejected",
+                })
+        return environment.handle(request)
+
+    client = HttpEnvironmentClient(
+        map_id="m1", base_url="http://testserver", transport=httpx.MockTransport(handle))
+    trace = run_episode(client, scenario(), use_langgraph=use_langgraph)
+    assert trace.finished and trace.arrived
+    assert trace.action_attempts == attempted == 4
+    assert trace.action_rejections == expected_rejections
+    assert trace.action_failures == expected_failures
+    assert trace.fallbacks == 1
+    assert trace.route_change_requests + trace.unchanged_route_requests == trace.commits
+    assert trace.commits == 1  # The rejected initial commit never counts.
+
+
+def test_rejected_fallback_stops_without_counting_success():
+    environment = FakeEnvironment()
+
+    def handle(request):
+        if request.url.path.endswith("/actions"):
+            return httpx.Response(200, json={"accepted": False, "reason": "stale"})
+        return environment.handle(request)
+
+    client = HttpEnvironmentClient(
+        map_id="m1", base_url="http://testserver", transport=httpx.MockTransport(handle))
+    trace = run_episode(client, scenario())
+    assert not trace.finished
+    assert trace.action_attempts == trace.action_rejections == 2
+    assert trace.fallbacks == trace.commits == trace.route_change_requests == 0
+    assert trace.error == "stale"
+    assert environment.session_closed
+
+
+@pytest.mark.parametrize("algorithm,changes,unchanged", [("astar", 0, 1), ("dijkstra", 1, 0)])
+def test_route_request_comparison_uses_paths_not_algorithm_names(algorithm, changes, unchanged):
+    model = MockModelProvider(scripted={
+        "route_invalidated": Decision(
+            "commit_route", candidate_id=f"cand-{algorithm}", reason="detour"),
+    })
+    trace = run_episode(client_for(FakeEnvironment()), scenario(), model=model)
+    assert trace.route_change_requests == changes
+    assert trace.unchanged_route_requests == unchanged
+
+
+def test_guard_rejections_do_not_count_as_submitted_route_changes():
+    class InvalidPolicy:
+        def decide(self, observation, candidates, registry=None):
+            return Decision("commit_route", candidate_id="missing", reason="invalid")
+
+    trace = run_episode(client_for(FakeEnvironment()), scenario(), InvalidPolicy())
+    assert trace.guard_rejections == 3
+    assert trace.action_attempts == 3  # Guard substitutes a keep action.
+    assert trace.action_rejections == trace.fallbacks == trace.commits == 0
+    assert trace.route_change_requests == trace.unchanged_route_requests == 0
 
 
 def test_episode_cancellation_resolves_barrier_and_closes_session():

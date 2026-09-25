@@ -91,6 +91,9 @@ class CreateSessionRequest(CamelModel):
     exit_headway_jam_seconds: float = 2.0
     reroute_interval_seconds: float = 0.0
     reroute_cost_ratio: float = 1.25
+    reroute_recovery_interval_seconds: float = 0.0
+    reroute_min_gain_seconds: float = 0.0
+    reroute_cooldown_seconds: float = 0.0
     min_speed_ratio: float = 0.0
     road_controls: list[RoadControl] = Field(default_factory=list)
     vehicle_controls: list[VehicleControl] = Field(default_factory=list)
@@ -106,6 +109,7 @@ class SessionState(CamelModel):
     cancelled: bool = False
     decision_due: bool = False
     decision_reason: str = ""
+    decision_id: str | None = None
     agent_vehicle_ids: list[int] = Field(default_factory=list)
     # create/reset only
     session_id: str | None = None
@@ -247,6 +251,11 @@ class PlanResponse(CamelModel):
     alternatives: list[PlanAlternative] = Field(default_factory=list)
 
 
+class DecisionResponse(CamelModel):
+    state: SessionObservation
+    decision_id: str = Field(alias="decisionId")
+
+
 class StepResponse(CamelModel):
     state: SessionState
     decision_id: str | None = None
@@ -310,6 +319,9 @@ class EnvironmentClient(Protocol):
     def step(self, session_id: str, ticks: int = 1) -> StepResponse: ...
     def step_until_event(self, session_id: str, max_ticks: int = 100_000) -> StepResponse: ...
     def submit_action(self, session_id: str, action: ActionRequest) -> ActionAck: ...
+    def open_decision(self, session_id: str, vehicle_id: int, state_version: int) -> DecisionResponse: ...
+    def plan_code(self, session_id: str, vehicle_id: int, state_version: int,
+                  source: str, steps: int = 5_000_000) -> dict: ...
     def resume(self, session_id: str) -> ResumeAck: ...
     def pause(self, session_id: str) -> SessionState: ...
     def create_snapshot(self, session_id: str) -> SnapshotInfo: ...
@@ -460,6 +472,31 @@ class HttpEnvironmentClient:
                 f"{self._prefix}/sessions/{session_id}/actions",
                 payload=action,
             ).json())
+
+    def open_decision(self, session_id: str, vehicle_id: int, state_version: int) -> DecisionResponse:
+        response = self._client.post(f"{self._prefix}/sessions/{session_id}/decisions", json={
+            "vehicleId": vehicle_id, "basedOnStateVersion": state_version,
+        })
+        self._check_response(response)
+        return DecisionResponse.model_validate(response.json())
+
+    @staticmethod
+    def _check_response(response: httpx.Response) -> None:
+        if response.status_code >= 400:
+            try:
+                message = response.json().get("error", response.text)
+            except ValueError:
+                message = response.text
+            raise EnvironmentError(response.status_code, str(message))
+
+    def plan_code(self, session_id: str, vehicle_id: int, state_version: int,
+                  source: str, steps: int = 5_000_000) -> dict:
+        response = self._client.post(f"{self._prefix}/sessions/{session_id}/algorithms/plan", json={
+            "vehicleId": vehicle_id, "basedOnStateVersion": state_version,
+            "source": source, "steps": steps,
+        }, timeout=40)
+        self._check_response(response)
+        return response.json()
 
     def resume(self, session_id: str) -> ResumeAck:
         return ResumeAck.model_validate(

@@ -43,6 +43,10 @@ import sys
 from pathlib import Path
 if not Path('control.pid').exists():
     sys.exit(1)
+assert sys.argv[1] == '--disable'
+assert sys.argv[-1].endswith('/api/live')
+Path(sys.argv[sys.argv.index('--output') + 1]).write_text('{"ok":true,"service":"zeus-control-server"}')
+print('200', end='')
 Path('health-checked').touch()
 """)
     executable(binaries / "uv", """

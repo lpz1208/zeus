@@ -1,10 +1,12 @@
 #include "zeus/simulation/playback_exporter.h"
 
 #include <cmath>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <map>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -68,6 +70,170 @@ zeus::map::Point2d samplePoint(
 }
 
 }  // namespace
+
+std::optional<PlaybackExporter::RouteChange> PlaybackExporter::compareReroute(
+    const zeus::map::MapRuntime& runtime,
+    const SimulationResult& result,
+    const VehicleRerouteRecord& reroute) {
+    if (!reroute.success || !reroute.old_route_index ||
+        reroute.old_route_id >= result.routes.size() ||
+        reroute.new_route_id >= result.routes.size()) {
+        return std::nullopt;
+    }
+    const auto& before = result.routes[reroute.old_route_id];
+    const auto& after = result.routes[reroute.new_route_id];
+    const auto first = *reroute.old_route_index;
+    if (first >= before.edges.size() || after.edges.empty()) return std::nullopt;
+
+    using Interval = std::pair<double, double>;
+    using Coverage = std::map<zeus::map::EdgeIndex, std::vector<Interval>>;
+    const auto coverage = [&](const zeus::routing::RoutePath& route,
+                              std::size_t begin_index, double offset)
+        -> std::optional<Coverage> {
+        Coverage value;
+        for (std::size_t i = begin_index; i < route.edges.size(); ++i) {
+            const auto edge = route.edges[i];
+            if (edge >= runtime.data().edges.size()) return std::nullopt;
+            const double length = runtime.edge(edge).length_m;
+            double begin = i == begin_index ? offset : 0.0;
+            double end = i + 1 == route.edges.size() ? route.end_offset_m : length;
+            if (!std::isfinite(begin) || !std::isfinite(end) || !std::isfinite(length) ||
+                length < 0 || begin < -1e-8 || end > length + 1e-8 || end < begin - 1e-8) {
+                return std::nullopt;
+            }
+            begin = std::clamp(begin, 0.0, length);
+            end = std::clamp(end, begin, length);
+            if (end > begin) value[edge].emplace_back(begin, end);
+        }
+        for (auto& [edge, intervals] : value) {
+            std::sort(intervals.begin(), intervals.end());
+            std::vector<Interval> merged;
+            for (const auto& interval : intervals) {
+                if (merged.empty() || interval.first > merged.back().second) {
+                    merged.push_back(interval);
+                } else {
+                    merged.back().second = std::max(merged.back().second, interval.second);
+                }
+            }
+            intervals = std::move(merged);
+        }
+        return value;
+    };
+    const auto old_coverage = coverage(before, first, reroute.old_route_offset_m);
+    const auto new_coverage = coverage(after, 0, after.start_offset_m);
+    if (!old_coverage || !new_coverage) return std::nullopt;
+    double total = 0.0;
+    for (const auto* item : {&*old_coverage, &*new_coverage}) {
+        for (const auto& [edge, intervals] : *item) {
+            for (const auto& [begin, end] : intervals) total += end - begin;
+        }
+    }
+    double shared = 0.0;
+    for (const auto& [edge, intervals] : *old_coverage) {
+        const auto found = new_coverage->find(edge);
+        if (found == new_coverage->end()) continue;
+        const auto& other = found->second;
+        std::size_t i = 0, j = 0;
+        while (i < intervals.size() && j < other.size()) {
+            shared += std::max(0.0, std::min(intervals[i].second, other[j].second) -
+                                      std::max(intervals[i].first, other[j].first));
+            if (intervals[i].second < other[j].second) ++i;
+            else ++j;
+        }
+    }
+    const bool same = after.edges.size() == before.edges.size() - first &&
+        std::equal(after.edges.begin(), after.edges.end(), before.edges.begin() + first) &&
+        std::abs(after.start_offset_m - reroute.old_route_offset_m) <= 1e-8 &&
+        std::abs(after.end_offset_m - before.end_offset_m) <= 1e-8;
+    const double union_length = total - shared;
+    return RouteChange{!same, union_length > 0 ? std::clamp(shared / union_length, 0.0, 1.0)
+                                             : (same ? 1.0 : 0.0)};
+}
+
+std::vector<std::optional<PlaybackExporter::RouteChange>> PlaybackExporter::compareReroutes(
+    const zeus::map::MapRuntime& runtime,
+    const SimulationResult& result) {
+    struct RemainingRoute {
+        std::uint32_t route_id;
+        std::size_t index;
+        double offset_m;
+    };
+    struct History {
+        std::optional<std::uint32_t> current_route;
+        std::optional<RemainingRoute> abandoned;
+        double time_s = 0.0;
+        bool known = true;
+    };
+    std::map<std::uint32_t, History> histories;
+    std::vector<std::optional<RouteChange>> comparisons;
+    comparisons.reserve(result.reroutes.size());
+    for (const auto& record : result.reroutes) {
+        auto comparison = compareReroute(runtime, result, record);
+        auto& history = histories[record.vehicle_id];
+        if (!record.success) {
+            comparisons.push_back(std::nullopt);
+            continue;
+        }
+        if (!comparison) {
+            history = History{};
+            history.known = false;
+            comparisons.push_back(std::nullopt);
+            continue;
+        }
+        const auto& before = result.routes[record.old_route_id];
+        const auto& after = result.routes[record.new_route_id];
+        const auto index = *record.old_route_index;
+        const bool valid_boundary = std::isfinite(record.time_s) && record.time_s >= 0 &&
+            before.edges[index] == after.edges.front() &&
+            std::abs(record.old_route_offset_m - after.start_offset_m) <= 1e-8 &&
+            (index != 0 || record.old_route_offset_m >= before.start_offset_m - 1e-8);
+        if (!valid_boundary || (history.current_route &&
+            (*history.current_route != record.old_route_id || record.time_s < history.time_s))) {
+            history.known = false;
+            history.abandoned.reset();
+        }
+
+        if (history.abandoned) {
+            auto& abandoned = *history.abandoned;
+            const auto& earlier = result.routes[abandoned.route_id];
+            // Progress follows the last accepted route, including repeated edges.
+            // Searching for a matching edge alone would confuse loop occurrences
+            // and could claim a reversal after driving a different branch.
+            const bool shared_prefix = index < earlier.edges.size() - abandoned.index &&
+                std::equal(before.edges.begin(), before.edges.begin() + index + 1,
+                           earlier.edges.begin() + abandoned.index) &&
+                (index != 0 || record.old_route_offset_m >= abandoned.offset_m - 1e-8);
+            if (!shared_prefix) {
+                history.abandoned.reset();
+            } else {
+                abandoned.index += index;
+                abandoned.offset_m = record.old_route_offset_m;
+                if (abandoned.index + 1 == earlier.edges.size() &&
+                    abandoned.offset_m > earlier.end_offset_m + 1e-8) {
+                    history.abandoned.reset();
+                }
+            }
+        }
+        if (history.known) {
+            comparison->reversed = false;
+            if (comparison->changed && history.abandoned) {
+                const auto& abandoned = *history.abandoned;
+                const auto& earlier = result.routes[abandoned.route_id];
+                comparison->reversed = after.edges.size() == earlier.edges.size() - abandoned.index &&
+                    std::equal(after.edges.begin(), after.edges.end(), earlier.edges.begin() + abandoned.index) &&
+                    std::abs(after.end_offset_m - earlier.end_offset_m) <= 1e-8;
+            }
+        }
+        if (comparison->changed && valid_boundary) {
+            history.abandoned = RemainingRoute{record.old_route_id, index, record.old_route_offset_m};
+            history.known = true;
+        }
+        history.current_route = record.new_route_id;
+        history.time_s = record.time_s;
+        comparisons.push_back(comparison);
+    }
+    return comparisons;
+}
 
 std::size_t TrajectoryExporter::save(
     const zeus::map::MapRuntime& runtime,
@@ -182,6 +348,9 @@ void PlaybackExporter::save(
            << "  \"reroute_interval_s\": "
            << result.config.reroute_interval_seconds << ",\n"
            << "  \"reroute_cost_ratio\": " << result.config.reroute_cost_ratio << ",\n"
+           << "  \"reroute_recovery_interval_s\": " << result.config.reroute_recovery_interval_seconds << ",\n"
+           << "  \"reroute_min_gain_s\": " << result.config.reroute_min_gain_seconds << ",\n"
+           << "  \"reroute_cooldown_s\": " << result.config.reroute_cooldown_seconds << ",\n"
            << "  \"cancelled\": "
            << (result.stats.cancelled ? "true" : "false") << ",\n"
            << "  \"barrier_wait_ms\": " << result.stats.barrier_wait_ms << ",\n"
@@ -201,7 +370,10 @@ void PlaybackExporter::save(
                << "\", \"value\": " << control.value << '}';
     }
     output << "],\n"
+           << "  \"route_comparison_version\": 1,\n"
+           << "  \"route_reversal_version\": 1,\n"
            << "  \"reroutes\": [";
+    const auto comparisons = compareReroutes(runtime, result);
     for (std::size_t i = 0; i < result.reroutes.size(); ++i) {
         const VehicleRerouteRecord& reroute = result.reroutes[i];
         if (i > 0) {
@@ -211,8 +383,21 @@ void PlaybackExporter::save(
                << ", \"vehicle_id\": " << reroute.vehicle_id
                << ", \"old_route_id\": " << reroute.old_route_id
                << ", \"new_route_id\": " << reroute.new_route_id
-               << ", \"success\": " << (reroute.success ? "true" : "false")
-               << '}';
+               << ", \"success\": " << (reroute.success ? "true" : "false");
+        const auto& comparison = comparisons[i];
+        output << ", \"route_changed\": ";
+        if (comparison) output << (comparison->changed ? "true" : "false");
+        else output << "null";
+        output << ", \"remaining_overlap_ratio\": ";
+        if (comparison) output << std::setprecision(6) << comparison->overlap_ratio;
+        else output << "null";
+        output << ", \"route_reversed\": ";
+        if (comparison && comparison->reversed.has_value()) {
+            output << (*comparison->reversed ? "true" : "false");
+        } else {
+            output << "null";
+        }
+        output << '}';
     }
     output << "],\n"
            << "  \"edge_kpis\": [";

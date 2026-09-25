@@ -55,10 +55,22 @@ while IFS="$tab" read -r command session rest; do
       payload=$(printf '{"tick":1,"simulationTimeS":1.0,"stateVersion":%s,"finished":false,"cancelled":false,"decisionDue":%s,"decisionReason":"%s","agentVehicleIds":[0]}' "$state_version" "$due" "$reason")
       exit_code=0 ;;
     observe)
-      payload=$(printf '{"tick":1,"simulationTimeS":1.0,"stateVersion":%s,"finished":false,"cancelled":false,"decisionDue":true,"decisionReason":"route_invalidated","counts":{"arrived":0,"driving":2,"waiting":0,"unroutable":0},"edges":[],"agents":[]}' "$state_version")
+      payload=$(printf '{"tick":1,"simulationTimeS":1.0,"stateVersion":%s,"paused":true,"finished":false,"cancelled":false,"decisionDue":true,"decisionReason":"route_invalidated","counts":{"arrived":0,"driving":2,"waiting":0,"unroutable":0},"edges":[],"agents":[{"vehicleId":0,"state":"driving","routeId":0}]}' "$state_version")
       exit_code=0 ;;
     agent-observe)
       payload=$(printf '{"tick":1,"simulationTimeS":1.0,"stateVersion":%s,"vehicleId":0,"state":"driving","position":{"edgeId":4,"offsetM":12.5},"destinationEdgeId":9,"remainingEtaS":42.0,"routeInvalidated":true,"remainingEdgeIds":[4,5],"nearbyRoads":[],"activeEvents":[]}' "$state_version")
+      exit_code=0 ;;
+    algorithm-context)
+      graph_path=$(printf '%s' "$rest" | cut -f3)
+      printf '%s' '{"adjacency":{"-1":[[0,0,2,20]],"0":[[-2,1,3,30]]},"nodes":[1,2],"estimates":[3,0],"baseline":{"ok":true,"timeS":5,"lengthM":50},"observation":{"mode":"vehicle","stateVersion":1,"vehicle":{"vehicleId":0,"routeInvalidated":false}}}' > "$graph_path"
+      payload='{"basedOnStateVersion":1,"observation":{"mode":"vehicle","stateVersion":1,"vehicle":{"vehicleId":0,"routeInvalidated":false}}}'
+      exit_code=0 ;;
+    algorithm-candidate|path-candidate)
+      if [ "$command" = "algorithm-candidate" ]; then
+        route_path=$(printf '%s' "$rest" | cut -f4)
+        printf '%s' '{"type":"FeatureCollection","features":[]}' > "$route_path"
+      fi
+      payload='{"candidateId":"cand-custom","vehicleId":0,"algorithm":"custom","basedOnStateVersion":1,"ok":true,"timeS":5,"lengthM":50,"edges":[0,1]}'
       exit_code=0 ;;
     plan)
       plan_k=$(printf '%s' "$rest" | cut -f3)
@@ -189,6 +201,12 @@ func newAgentSessionServer(t *testing.T, dataDir, executable string) *Server {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(dataDir, "maps", "m1"), 0o755); err != nil {
 		t.Fatal(err)
+	}
+	runtime := filepath.Join(dataDir, "maps", "m1", "map.zmap")
+	if _, err := os.Stat(runtime); os.IsNotExist(err) {
+		if err := os.WriteFile(runtime, []byte("fake session map v1"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dataDir, "maps", "m1", "record.json"), []byte(`{
 		"id": "m1", "name": "test", "source": "test", "status": "ready",

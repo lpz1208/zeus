@@ -87,7 +87,7 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
               <article><span>途经边</span><strong>{formatNumber(routeResult.edges)}</strong></article>
               <article>
                 <span>算法</span>
-                <strong title={routeResult.effectiveAlgorithm && routeResult.effectiveAlgorithm !== routeResult.algorithm ? '该地图含转向限制，双向算法退化为前向搜索' : undefined}>
+                <strong title={routeResult.effectiveAlgorithm && routeResult.effectiveAlgorithm !== routeResult.algorithm ? '实际执行算法与请求算法不同' : undefined}>
                   {routeResult.effectiveAlgorithm && routeResult.effectiveAlgorithm !== routeResult.algorithm
                     ? `${routeResult.algorithm.toUpperCase()} → ${routeResult.effectiveAlgorithm.toUpperCase()}`
                     : routeResult.algorithm.toUpperCase()}

@@ -636,4 +636,174 @@ SearchOutput runBidirectionalSearch(
     return output;
 }
 
+// Both frontiers use the same state: the incoming directed edge. The reverse
+// traversal inverts legal forward transitions, not the turn restriction itself.
+SearchOutput runTurnAwareBidirectionalSearch(
+    const zeus::map::MapRuntime& runtime,
+    const IncomingAdjacency& incoming,
+    const SearchQuery& query,
+    double max_speed_mps,
+    double known_best_time_s) {
+    SearchOutput output;
+    const auto& data = runtime.data();
+    const auto count = data.edges.size();
+    if (query.starts.empty() || query.goals.empty() || count == 0 ||
+        incoming.offsets.size() != data.nodes.size() + 1) return output;
+
+    std::vector<zeus::map::Point2d> starts, goals;
+    for (const auto& endpoint : query.starts) {
+        if (endpoint.edge < count && endpoint.node < data.nodes.size() &&
+            data.edges[endpoint.edge].to == endpoint.node)
+            starts.push_back(data.nodes[endpoint.node].point);
+    }
+    for (const auto& endpoint : query.goals) {
+        if (endpoint.edge < count && endpoint.node < data.nodes.size() &&
+            data.edges[endpoint.edge].from == endpoint.node && edgeEnabled(query, endpoint.edge))
+            goals.push_back(data.nodes[endpoint.node].point);
+    }
+    if (starts.empty() || goals.empty()) return output;
+    std::vector<double> potentials(data.nodes.size(), std::numeric_limits<double>::quiet_NaN());
+    const auto potential = [&](zeus::map::EdgeIndex state) {
+        if (query.algorithm != Algorithm::kBidirectionalAStar) return 0.0;
+        const auto node = data.edges[state].to;
+        auto& cached = potentials[node];
+        if (!std::isnan(cached)) return cached;
+        const auto& point = data.nodes[node].point;
+        double hs = kInfinity, ht = kInfinity;
+        const double speed = std::max(kMinSpeedMps, max_speed_mps);
+        for (const auto& start : starts)
+            hs = std::min(hs, std::hypot(point.x - start.x, point.y - start.y) / speed);
+        for (const auto& goal : goals)
+            ht = std::min(ht, std::hypot(point.x - goal.x, point.y - goal.y) / speed);
+        cached = (ht - hs) / 2.0;
+        return cached;
+    };
+    const auto weight = [&](zeus::map::EdgeIndex from, zeus::map::EdgeIndex to) {
+        if (!edgeEnabled(query, to)) return kInfinity;
+        const double turn = runtime.turnPenaltySeconds(from, to);
+        if (!std::isfinite(turn)) return kInfinity;
+        // The potential is consistent: states lie at incoming-edge endpoints,
+        // so the next edge's traversal bounds their Euclidean separation.
+        return std::max(0.0, turn + edgeCost(query, to, data.edges[to]) +
+                             potential(to) - potential(from));
+    };
+
+    std::vector<double> forward(count, kInfinity), backward(count, kInfinity);
+    std::vector<zeus::map::EdgeIndex> pred(count, zeus::map::kInvalidEdge),
+        next(count, zeus::map::kInvalidEdge);
+    std::vector<std::size_t> start_of(count, query.starts.size()), goal_of(count, query.goals.size());
+    std::vector<std::uint8_t> closed_f(count, 0), closed_b(count, 0);
+    SearchQueue queue_f, queue_b;
+    for (std::size_t i = 0; i < query.starts.size(); ++i) {
+        const auto& start = query.starts[i];
+        if (start.edge >= count || start.node >= data.nodes.size() ||
+            data.edges[start.edge].to != start.node) continue;
+        // An exact origin may finish a currently closed edge.
+        const double label = start.extra_cost_s + potential(start.edge);
+        if (label < forward[start.edge]) {
+            forward[start.edge] = label;
+            start_of[start.edge] = i;
+            queue_f.push({label, start.edge});
+        }
+    }
+    for (std::size_t i = 0; i < query.goals.size(); ++i) {
+        const auto& goal = query.goals[i];
+        if (goal.edge >= count || goal.node >= data.nodes.size() ||
+            data.edges[goal.edge].from != goal.node || !edgeEnabled(query, goal.edge)) continue;
+        // Goal labels include the final turn and only the partial goal edge.
+        for (auto k = incoming.offsets[goal.node]; k < incoming.offsets[goal.node + 1]; ++k) {
+            const auto state = incoming.edges[k];
+            const double label = runtime.turnPenaltySeconds(state, goal.edge) +
+                                 goal.extra_cost_s - potential(state);
+            if (label < backward[state]) {
+                backward[state] = label;
+                goal_of[state] = i;
+                queue_b.push({label, state});
+            }
+        }
+    }
+    double best = known_best_time_s;
+    auto meeting = zeus::map::kInvalidEdge;
+    const auto meet = [&](zeus::map::EdgeIndex state) {
+        const double total = forward[state] + backward[state];
+        if (total < best) { best = total; meeting = state; }
+    };
+    // Initial labels can already meet (adjacent matched endpoint edges).
+    for (const auto& start : query.starts) if (start.edge < count) meet(start.edge);
+    while (true) {
+        const double top_f = peekTop(queue_f, closed_f), top_b = peekTop(queue_b, closed_b);
+        if (!(top_f + top_b < best)) break;
+        const bool forwards = top_f <= top_b;
+        auto& queue = forwards ? queue_f : queue_b;
+        const auto state = queue.top().second;
+        queue.pop();
+        (forwards ? closed_f : closed_b)[state] = 1;
+        ++output.expanded_nodes;
+        if (query.record_trace) {
+            const double g = forwards ? forward[state] - potential(state)
+                                      : backward[state] + potential(state);
+            recordSettle(output.trace, output.expanded_nodes, data.edges[state].to,
+                         forwards ? top_f : top_b, g);
+        }
+        meet(state);
+        if (forwards) {
+            for (const auto successor : runtime.outgoingEdges(data.edges[state].to)) {
+                const double candidate = forward[state] + weight(state, successor);
+                if (candidate < forward[successor]) {
+                    forward[successor] = candidate;
+                    pred[successor] = state;
+                    start_of[successor] = start_of[state];
+                    queue_f.push({candidate, successor});
+                    meet(successor);
+                }
+            }
+        } else {
+            const auto node = data.edges[state].from;
+            for (auto k = incoming.offsets[node]; k < incoming.offsets[node + 1]; ++k) {
+                const auto predecessor = incoming.edges[k];
+                // Preserve forward ordering for asymmetric bans and penalties.
+                const double candidate = backward[state] + weight(predecessor, state);
+                if (candidate < backward[predecessor]) {
+                    backward[predecessor] = candidate;
+                    next[predecessor] = state;
+                    goal_of[predecessor] = goal_of[state];
+                    queue_b.push({candidate, predecessor});
+                    meet(predecessor);
+                }
+            }
+        }
+    }
+    output.trace = compactTrace(std::move(output.trace));
+    if (meeting == zeus::map::kInvalidEdge) return output;
+    auto state = meeting;
+    std::size_t guard = 0;
+    while (pred[state] != zeus::map::kInvalidEdge) {
+        if (++guard > count) return {};
+        output.node_edges.push_back(state);
+        state = pred[state];
+    }
+    output.start_index = start_of[state];
+    std::reverse(output.node_edges.begin(), output.node_edges.end());
+    state = meeting;
+    guard = 0;
+    while (next[state] != zeus::map::kInvalidEdge) {
+        if (++guard > count) return {};
+        state = next[state];
+        output.node_edges.push_back(state);
+    }
+    output.goal_index = goal_of[state];
+    if (output.start_index >= query.starts.size() || output.goal_index >= query.goals.size()) return {};
+    // Recompute physical cost from final parent chains, without potentials.
+    output.total_time_s = query.starts[output.start_index].extra_cost_s;
+    state = query.starts[output.start_index].edge;
+    for (const auto edge : output.node_edges) {
+        output.total_time_s += runtime.turnPenaltySeconds(state, edge) + edgeCost(query, edge, data.edges[edge]);
+        state = edge;
+    }
+    const auto& goal = query.goals[output.goal_index];
+    output.total_time_s += runtime.turnPenaltySeconds(state, goal.edge) + goal.extra_cost_s;
+    output.found = std::isfinite(output.total_time_s);
+    return output;
+}
+
 }  // namespace zeus::routing

@@ -13,6 +13,8 @@ import { useMapInteraction } from './useMapInteraction'
 import { usePlayback } from './usePlayback'
 import { useRouteSimulation } from './useRouteSimulation'
 import './workbench.css'
+import { useAlgorithmLab } from '../algorithm/useAlgorithmLab'
+import { AlgorithmConsole } from '../algorithm/AlgorithmConsole'
 
 interface MapWorkbenchProps {
   library: MapLibraryApi
@@ -41,6 +43,7 @@ export function MapWorkbench({
     onRouteReady: () => setPanel('route'),
   })
   const playback = usePlayback(routeSim.simResult)
+  const lab = useAlgorithmLab(library.activeMap?.id)
 
   // Map switch: drop route/simulation/selection state (simulation params
   // survive in sessionStorage inside useRouteSimulation).
@@ -68,22 +71,24 @@ export function MapWorkbench({
   }
 
   return (
-    <main className="wb-shell">
+    <main className={`wb-shell ${lab.opened ? 'is-algorithm' : ''}`}>
       <WorkbenchTopbar
         intakeStage={intake.stage}
         serviceOnline={library.serviceOnline}
         agentEnabled={Boolean(library.activeMap)}
+        algorithmOpen={lab.opened}
+        onToggleAlgorithm={() => lab.opened ? lab.close() : lab.open(routeSim.routeStart, routeSim.routeEnd)}
         onEnterAgent={onEnterAgent}
         onEnterBenchmark={onEnterBenchmark}
       />
 
-      <LeftRail
+      {!lab.opened && <LeftRail
         intake={intake}
         library={library}
         references={references}
         onVisibilityToggle={onVisibilityToggle}
         onLayerDeleted={onLayerDeleted}
-      />
+      />}
 
       <MapCanvas
         data={library.roadData}
@@ -99,19 +104,19 @@ export function MapWorkbench({
         selectedRoad={interaction.selectedRoad}
         selectedReferenceFeature={interaction.selectedReferenceFeature}
         focusedIssueIndex={interaction.focusedIssueIndex}
-        routeMode={routeSim.routeMode}
-        routeStart={routeSim.routeStart}
-        routeEnd={routeSim.routeEnd}
-        routeData={routeSim.routeMainData}
-        routeAlternativesData={routeSim.routeGhostData}
-        searchTrace={routeSim.routeResult?.searchTrace ?? null}
-        searchTraceProgress={routeSim.tracePlayback.progress}
-        trajectoryData={routeSim.simResult?.geojson ?? null}
-        vehicleFrame={vehicleFrame}
-        junctionPickMode={routeSim.junctionPickMode}
+        routeMode={lab.opened ? lab.picking : routeSim.routeMode}
+        routeStart={lab.opened ? lab.from : routeSim.routeStart}
+        routeEnd={lab.opened ? lab.to : routeSim.routeEnd}
+        routeData={lab.opened ? lab.routeData : routeSim.routeMainData}
+        routeAlternativesData={lab.opened ? null : routeSim.routeGhostData}
+        searchTrace={lab.opened ? lab.trace : routeSim.routeResult?.searchTrace ?? null}
+        searchTraceProgress={lab.opened ? lab.playback.progress : routeSim.tracePlayback.progress}
+        trajectoryData={lab.opened ? null : routeSim.simResult?.geojson ?? null}
+        vehicleFrame={lab.opened ? emptyVehicleFrame : vehicleFrame}
+        junctionPickMode={!lab.opened && routeSim.junctionPickMode}
         selectedControlNodeId={routeSim.selectedControlNodeId}
         onQuery={interaction.query}
-        onRoutePoint={routeSim.handleRoutePoint}
+        onRoutePoint={lab.opened ? lab.pick : routeSim.handleRoutePoint}
         onIssueSelect={interaction.selectIssue}
         onRoadSelect={(road) => {
           interaction.selectRoad(road)
@@ -125,7 +130,7 @@ export function MapWorkbench({
         onPointerMove={interaction.setPointer}
       />
 
-      <Inspector
+      {lab.opened ? <AlgorithmConsole lab={lab} mapName={library.activeMap?.name ?? '未选择地图'} /> : <Inspector
         panel={panel}
         onPanelChange={setPanel}
         library={library}
@@ -133,7 +138,7 @@ export function MapWorkbench({
         routeSim={routeSim}
         playback={playback}
         vehicleFrame={vehicleFrame}
-      />
+      />}
 
       <footer className="wb-statusbar">
         <span><i className="wb-statusbar__live" /> ZEUS MAP KERNEL</span>

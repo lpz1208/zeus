@@ -12,9 +12,38 @@
 #include <vector>
 
 #include "zeus/routing/route_types.h"
+#include "zeus/routing/algorithm_lab.h"
 #include "zeus/simulation/vehicle_store.h"
 
 namespace zeus::simulation {
+zeus::routing::RouteResult SimulationEngine::validateRoute(
+    const zeus::routing::RouteRequest& request,
+    const zeus::routing::RoutePath& path) const {
+    return zeus::routing::AlgorithmLab(runtime_, request).validatePath(path);
+}
+
+zeus::routing::RouteResult SimulationEngine::validateAgentRoute(
+    const VehicleDemand& demand, const AgentVehicleState& agent,
+    const TickSnapshot& snapshot, const zeus::routing::RoutePath& path) const {
+    std::vector<std::uint8_t> enabled(runtime_.data().edges.size(), 1);
+    std::vector<double> costs(enabled.size(), 1.0);
+    for (const auto& edge : snapshot.edges) {
+        enabled.at(edge.edge) = edge.closed ? 0 : 1;
+        costs.at(edge.edge) = edge.routing_cost_factor;
+    }
+    const zeus::routing::RoutingOverlay overlay{enabled, costs};
+    zeus::routing::RouteRequest request;
+    request.origin = demand.origin;
+    request.destination = demand.destination;
+    request.overlay = &overlay;
+    request.destination_position = zeus::routing::RoutePosition{
+        agent.destination_edge, agent.route_end_offset_m};
+    if (agent.state == VehicleState::kDriving) {
+        request.origin_position = zeus::routing::RoutePosition{agent.edge, agent.offset_s};
+    }
+    return validateRoute(request, path);
+}
+
 namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -152,6 +181,12 @@ SimulationResult SimulationEngine::run(
         config.exit_headway_jam_s < 0.0 ||
         !std::isfinite(config.reroute_interval_seconds) ||
         config.reroute_interval_seconds < 0.0 ||
+        !std::isfinite(config.reroute_recovery_interval_seconds) ||
+        config.reroute_recovery_interval_seconds < 0.0 ||
+        !std::isfinite(config.reroute_min_gain_seconds) ||
+        config.reroute_min_gain_seconds < 0.0 ||
+        !std::isfinite(config.reroute_cooldown_seconds) ||
+        config.reroute_cooldown_seconds < 0.0 ||
         !std::isfinite(config.reroute_cost_ratio) ||
         config.reroute_cost_ratio < 1.01 || config.deadlock_probe_ticks == 0) {
         throw std::invalid_argument("invalid simulation configuration");
@@ -356,6 +391,13 @@ SimulationResult SimulationEngine::run(
                                      ? result.config.reroute_interval_seconds
                                      : std::numeric_limits<double>::infinity();
 
+    std::vector<std::uint8_t> recovery_pending(store.size(), 0);
+    std::vector<double> last_reroute_s(
+        store.size(), -std::numeric_limits<double>::infinity());
+    double next_recovery_scan_s = 0.0;
+    bool has_pending_recovery = false;
+    bool agent_route_improved = false;
+
     // Optional exit-headway gate: leaving an edge must respect the time since
     // that edge's previous exit, so a bottleneck does not only "fill up" but
     // also "flows" at a bounded discharge rate.
@@ -520,7 +562,7 @@ SimulationResult SimulationEngine::run(
         return total;
     };
 
-    const auto rerouteAffectedVehicles = [&](double now) {
+    const auto rerouteAffectedVehicles = [&](double now, bool recovery_scan) {
         const zeus::routing::RoutingOverlay overlay{
             routing_edge_enabled, routing_edge_cost_factors};
         struct CachedRoute {
@@ -531,9 +573,14 @@ SimulationResult SimulationEngine::run(
         for (std::size_t i = 0; i < store.size(); ++i) {
             if (store.states_[i] != VehicleState::kWaiting &&
                 store.states_[i] != VehicleState::kDriving) {
+                recovery_pending[i] = 0;
                 continue;
             }
             const zeus::routing::RoutePath& old_route = result.routes[store.route_ids_[i]];
+            const std::uint32_t old_index = store.states_[i] == VehicleState::kDriving
+                                               ? store.route_indices_[i] : 0;
+            const double old_offset = store.states_[i] == VehicleState::kDriving
+                                          ? store.offsets_[i] : old_route.start_offset_m;
             const std::size_t first_future = store.states_[i] == VehicleState::kDriving
                                                  ? store.route_indices_[i] + 1
                                                  : 0;
@@ -548,16 +595,27 @@ SimulationResult SimulationEngine::run(
                     cost_affected = true;
                 }
             }
-            if (!topology_affected && !cost_affected) {
+            const bool recovery_candidate = recovery_scan && recovery_pending[i] != 0;
+            if (!topology_affected && !cost_affected && !recovery_candidate) {
                 continue;
             }
             if (agent_flags[i] != 0) {
                 // Agent-controlled vehicles change routes only through their
                 // own decision loop; surface the invalidation instead.
-                invalidated_agents.push_back(static_cast<std::uint32_t>(i));
+                if (topology_affected || cost_affected) {
+                    invalidated_agents.push_back(static_cast<std::uint32_t>(i));
+                } else {
+                    agent_route_improved = true;
+                }
+                recovery_pending[i] = 0;
                 continue;
             }
 
+            if (!topology_affected && now + 1e-9 <
+                    last_reroute_s[i] + result.config.reroute_cooldown_seconds) {
+                continue;  // Keep a pending recovery until its cooldown expires.
+            }
+            recovery_pending[i] = 0;
             ++result.stats.reroute_attempts;
             const VehicleDemand& demand = demands[i];
             DynamicRouteKey key;
@@ -612,7 +670,8 @@ SimulationResult SimulationEngine::run(
                             std::abs(planned.path.start_offset_m - current_offset) <= 1e-9 &&
                             std::abs(planned.path.end_offset_m - old_route.end_offset_m) <= 1e-9;
                         const bool beneficial = topology_affected ||
-                            (!same_path && planned.stats.time_s + 1e-9 < current_time);
+                            (!same_path && planned.stats.time_s +
+                                 result.config.reroute_min_gain_seconds + 1e-9 < current_time);
                         if (beneficial) {
                             result.routes.push_back(planned.path);
                             cached->second.route_id = static_cast<std::int32_t>(
@@ -630,26 +689,27 @@ SimulationResult SimulationEngine::run(
             if (cached->second.route_id < 0) {
                 ++result.stats.reroute_failed;
                 result.reroutes.push_back({
-                    now, store.ids_[i], old_route_id, old_route_id, false});
+                    now, store.ids_[i], old_route_id, old_route_id, false,
+                    old_index, old_offset});
                 continue;
             }
             const std::uint32_t new_route_id =
                 static_cast<std::uint32_t>(cached->second.route_id);
+            last_reroute_s[i] = now;
             store.route_ids_[i] = new_route_id;
             store.route_indices_[i] = 0;
             result.vehicles[i].route_id = new_route_id;
             ++result.stats.reroute_succeeded;
             switched_any = true;
             result.reroutes.push_back({
-                now, store.ids_[i], old_route_id, new_route_id, true});
+                now, store.ids_[i], old_route_id, new_route_id, true,
+                old_index, old_offset});
         }
         return switched_any;
     };
 
-    // Applies one committed agent action at the tick boundary. The route is
-    // re-planned deterministically from the vehicle's live position with the
-    // algorithm chosen at commit time, so a stale candidate can never inject
-    // an outdated path; failures keep the previous route.
+    // Apply after this tick's controls. Exact paths are revalidated, never
+    // replaced by a planner-selected alternative; failures keep the old route.
     const auto applyInjectedRoute = [&](const RouteInjection& injection, double now) {
         const std::size_t i = injection.vehicle_id;
         if (i >= store.size() ||
@@ -662,10 +722,15 @@ SimulationResult SimulationEngine::run(
         const zeus::routing::RoutingOverlay overlay{
             routing_edge_enabled, routing_edge_cost_factors};
         const std::uint32_t old_route_id = store.route_ids_[i];
+        const std::uint32_t old_index = store.states_[i] == VehicleState::kDriving
+                                           ? store.route_indices_[i] : 0;
+        const double old_offset = store.states_[i] == VehicleState::kDriving
+                                      ? store.offsets_[i] : old_route.start_offset_m;
         const auto recordFailure = [&]() {
             ++result.stats.reroute_failed;
             result.reroutes.push_back(
-                {now, store.ids_[i], old_route_id, old_route_id, false});
+                {now, store.ids_[i], old_route_id, old_route_id, false,
+                 old_index, old_offset});
         };
         if (routing_edge_enabled[old_route.edges.back()] == 0) {
             recordFailure();
@@ -682,7 +747,17 @@ SimulationResult SimulationEngine::run(
             request.origin_position = zeus::routing::RoutePosition{
                 old_route.edges[store.route_indices_[i]], store.offsets_[i]};
         }
-        const zeus::routing::RouteResult planned = planner_.plan(request);
+        zeus::routing::RouteResult planned;
+        if (injection.path) {
+            try {
+                planned = validateRoute(request, *injection.path);
+            } catch (const std::invalid_argument&) {
+                recordFailure();
+                return;
+            }
+        } else {
+            planned = planner_.plan(request);
+        }
         ++result.stats.route_plans;
         if (!planned.ok) {
             recordFailure();
@@ -695,7 +770,8 @@ SimulationResult SimulationEngine::run(
         store.route_indices_[i] = 0;
         result.vehicles[i].route_id = new_route_id;
         ++result.stats.reroute_succeeded;
-        result.reroutes.push_back({now, store.ids_[i], old_route_id, new_route_id, true});
+        result.reroutes.push_back({now, store.ids_[i], old_route_id, new_route_id, true,
+                                  old_index, old_offset});
     };
 
     // Publishes the immutable snapshot of a committed boundary. No-op unless
@@ -713,10 +789,10 @@ SimulationResult SimulationEngine::run(
         snapshot.unroutable = store.size() - routable;
         snapshot.waiting = store.size() - arrived_count - driving_count -
                            (store.size() - routable);
-        snapshot.decision_due = !invalidated_agents.empty() || periodic_due;
+        snapshot.decision_due = !invalidated_agents.empty() || agent_route_improved || periodic_due;
         snapshot.decision_reason = !invalidated_agents.empty()
                                        ? "route_invalidated"
-                                       : (periodic_due ? "periodic" : "");
+                                       : (agent_route_improved ? "route_improved" : (periodic_due ? "periodic" : ""));
         for (std::size_t e = 0; e < edge_count; ++e) {
             if (occupancy[e] == 0 && !edge_closed[e] && edge_speed_factor[e] == 1.0 &&
                 edge_capacity_factor[e] == 1.0 &&
@@ -790,9 +866,11 @@ SimulationResult SimulationEngine::run(
             injections = run_control->collectRouteInjections();
         }
         invalidated_agents.clear();
+        agent_route_improved = false;
 
         bool control_activity = false;
         bool topology_restricted = false;
+        bool network_improved = false;
         std::fill(changed_routing_edges.begin(), changed_routing_edges.end(), 0);
         std::fill(explicit_cost_edges.begin(), explicit_cost_edges.end(), 0);
         while (control_cursor < sorted_controls.size() &&
@@ -816,6 +894,9 @@ SimulationResult SimulationEngine::run(
                         edge_closed[control.target_id] = true;
                         routing_edge_enabled[control.target_id] = 0;
                     } else if (control.action == ControlAction::kOpen) {
+                        network_improved = network_improved ||
+                            (edge_closed[control.target_id] &&
+                             !junction_closed[data.edges[control.target_id].from]);
                         edge_closed[control.target_id] = false;
                         routing_edge_enabled[control.target_id] =
                             junction_closed[data.edges[control.target_id].from] ? 0 : 1;
@@ -829,6 +910,9 @@ SimulationResult SimulationEngine::run(
                     ++result.stats.edge_control_events;
                     break;
                 case ControlScope::kJunction:
+                    network_improved = network_improved ||
+                        (control.action == ControlAction::kOpen &&
+                         junction_closed[control.target_id]);
                     topology_restricted = topology_restricted ||
                                           (control.action == ControlAction::kClose &&
                                            !junction_closed[control.target_id]);
@@ -854,7 +938,8 @@ SimulationResult SimulationEngine::run(
             explicit_cost_edges.begin(), explicit_cost_edges.end(),
             [](std::uint8_t value) { return value != 0; });
         const bool periodic_cost_scan = now + 1e-9 >= next_reroute_scan_s;
-        if (topology_restricted || has_explicit_cost_event || periodic_cost_scan) {
+        bool has_changed_route_cost = false;
+        if (topology_restricted || network_improved || has_explicit_cost_event || periodic_cost_scan) {
             refreshRoutingCosts();
             for (std::size_t edge = 0; edge < edge_count; ++edge) {
                 const double old_factor = published_edge_cost_factors[edge];
@@ -865,6 +950,7 @@ SimulationResult SimulationEngine::run(
                      std::abs(new_factor - old_factor) > 1e-9) ||
                     (periodic_cost_scan &&
                      ratio + 1e-9 >= result.config.reroute_cost_ratio)) {
+                    network_improved = network_improved || new_factor + 1e-9 < old_factor;
                     changed_routing_edges[edge] = 1;
                     published_edge_cost_factors[edge] = new_factor;
                 }
@@ -874,12 +960,28 @@ SimulationResult SimulationEngine::run(
                     next_reroute_scan_s += result.config.reroute_interval_seconds;
                 } while (next_reroute_scan_s <= now + 1e-9);
             }
-            const bool has_changed_route_cost = std::any_of(
+            has_changed_route_cost = std::any_of(
                 changed_routing_edges.begin(), changed_routing_edges.end(),
                 [](std::uint8_t value) { return value != 0; });
-            if (topology_restricted || has_changed_route_cost) {
-                control_activity = rerouteAffectedVehicles(now) || control_activity;
+        }
+        if (network_improved && result.config.reroute_recovery_interval_seconds > 0.0) {
+            has_pending_recovery = true;
+            for (std::size_t i = 0; i < store.size(); ++i) {
+                recovery_pending[i] = store.states_[i] == VehicleState::kWaiting ||
+                                      store.states_[i] == VehicleState::kDriving;
             }
+        }
+        const bool recovery_scan = result.config.reroute_recovery_interval_seconds > 0.0 &&
+            now + 1e-9 >= next_recovery_scan_s && has_pending_recovery;
+        if (recovery_scan) {
+            refreshRoutingCosts();
+            next_recovery_scan_s = now + result.config.reroute_recovery_interval_seconds;
+        }
+        if (topology_restricted || has_changed_route_cost || recovery_scan) {
+            control_activity = rerouteAffectedVehicles(now, recovery_scan) || control_activity;
+            has_pending_recovery = std::any_of(
+                recovery_pending.begin(), recovery_pending.end(),
+                [](std::uint8_t pending) { return pending != 0; });
         }
 
         // Committed agent actions apply at this boundary, after the control

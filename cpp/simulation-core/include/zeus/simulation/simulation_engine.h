@@ -76,6 +76,13 @@ public:
                    std::span<const JunctionSignalPlan>(signal_plans));
     }
 
+    // Recomputes legality and costs without changing the supplied path.
+    [[nodiscard]] zeus::routing::RouteResult validateRoute(
+        const zeus::routing::RouteRequest& request,
+        const zeus::routing::RoutePath& path) const;
+    [[nodiscard]] zeus::routing::RouteResult validateAgentRoute(
+        const VehicleDemand& demand, const AgentVehicleState& agent,
+        const TickSnapshot& snapshot, const zeus::routing::RoutePath& path) const;
 private:
     const zeus::map::MapRuntime& runtime_;
     const zeus::routing::RoutePlanner& planner_;

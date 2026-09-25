@@ -91,15 +91,7 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
 
     RouteResult result;
     result.algorithm = request.algorithm;
-    // Turn-restricted maps have no restriction-safe reverse search yet, so
-    // bidirectional selections silently fall back to the forward edge-state
-    // search; expose that downgrade instead of hiding it.
-    result.effective_algorithm =
-        runtime_.hasTurnTransitions() && isBidirectional(request.algorithm)
-            ? (request.algorithm == zeus::routing::Algorithm::kBidirectionalAStar
-                   ? zeus::routing::Algorithm::kAStar
-                   : zeus::routing::Algorithm::kDijkstra)
-            : request.algorithm;
+    result.effective_algorithm = request.algorithm;
 
     const zeus::map::MapData& data = runtime_.data();
     if (data.edges.empty() || data.nodes.empty()) {
@@ -329,8 +321,11 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
     }
 
     SearchOutput search = runtime_.hasTurnTransitions()
-                                    ? runTurnAwareSearch(
-                                          runtime_, query, max_speed_mps_, direct.time_s)
+                                    ? (isBidirectional(request.algorithm)
+                                          ? runTurnAwareBidirectionalSearch(
+                                                runtime_, incoming_, query, max_speed_mps_, direct.time_s)
+                                          : runTurnAwareSearch(
+                                                runtime_, query, max_speed_mps_, direct.time_s))
                                     : isBidirectional(request.algorithm)
                                           ? runBidirectionalSearch(
                                                 runtime_, incoming_, query,

@@ -54,6 +54,10 @@ class ZeusEnv:
             step_seconds=self._scenario.step_seconds,
             sample_interval_seconds=self._scenario.sample_interval_seconds,
             reroute_interval_seconds=self._scenario.reroute_interval_seconds,
+            reroute_cost_ratio=self._scenario.reroute_cost_ratio,
+            reroute_recovery_interval_seconds=self._scenario.reroute_recovery_interval_seconds,
+            reroute_min_gain_seconds=self._scenario.reroute_min_gain_seconds,
+            reroute_cooldown_seconds=self._scenario.reroute_cooldown_seconds,
             road_controls=list(self._scenario.road_controls),
         )
         created = self._client.create_session(request)

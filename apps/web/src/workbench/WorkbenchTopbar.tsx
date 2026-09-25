@@ -1,10 +1,12 @@
-import { BrainCircuit, FlaskConical, Waypoints } from 'lucide-react'
+import { BrainCircuit, FlaskConical, Waypoints, Code2 } from 'lucide-react'
 import type { IntakeStage } from './useMapIntake'
 
 interface WorkbenchTopbarProps {
   intakeStage: IntakeStage
   serviceOnline: boolean
   agentEnabled: boolean
+  algorithmOpen: boolean
+  onToggleAlgorithm(): void
   onEnterAgent(): void
   onEnterBenchmark(): void
 }
@@ -32,7 +34,7 @@ function Pipeline({ stage }: { stage: IntakeStage }) {
 }
 
 export function WorkbenchTopbar({
-  intakeStage, serviceOnline, agentEnabled, onEnterAgent, onEnterBenchmark,
+  intakeStage, serviceOnline, agentEnabled, onEnterAgent, onEnterBenchmark, algorithmOpen, onToggleAlgorithm,
 }: WorkbenchTopbarProps) {
   return (
     <header className="wb-topbar">
@@ -50,6 +52,7 @@ export function WorkbenchTopbar({
           <small>CONTROL PLANE</small>
           <strong>{serviceOnline ? 'ONLINE' : 'DEMO MODE'}</strong>
         </div>
+        <button className="wb-agent-launch" type="button" onClick={onToggleAlgorithm} disabled={!agentEnabled} aria-pressed={algorithmOpen}><Code2 size={13} /> CODE</button>
         <button className="wb-agent-launch" type="button" onClick={onEnterAgent} disabled={!agentEnabled}>
           <BrainCircuit size={14} /> AGENT
         </button>

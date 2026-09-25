@@ -640,7 +640,10 @@ export function MapCanvas({
     })
 
     mapRef.current = map
+    const resize = new ResizeObserver(() => map.resize())
+    resize.observe(containerRef.current)
     return () => {
+      resize.disconnect()
       markerRef.current?.remove()
       routeStartMarkerRef.current?.remove()
       routeEndMarkerRef.current?.remove()

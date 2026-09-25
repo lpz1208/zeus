@@ -14,6 +14,7 @@ import {
 import { TracePanel } from '../components/TracePanel'
 import type { AgentSessionApi } from './useAgentSession'
 import { algorithmLabels, formatTime } from './agentGeo'
+import { AgentCodePanel } from './AgentCodePanel'
 
 /** Right column: 观察 / 工具 / 轨迹 three-tab inspector. */
 export function AgentInspector({ agent }: { agent: AgentSessionApi }) {
@@ -27,10 +28,12 @@ export function AgentInspector({ agent }: { agent: AgentSessionApi }) {
       <div className="agent-tabs" role="tablist">
         <button type="button" className={tab === 'observation' ? 'is-active' : ''} onClick={() => setTab('observation')}>观察</button>
         <button type="button" className={tab === 'tools' ? 'is-active' : ''} onClick={() => setTab('tools')}>工具 <span>{candidates.length}</span></button>
+        <button type="button" className={tab === 'code' ? 'is-active' : ''} onClick={() => setTab('code')}>代码</button>
         <button type="button" className={tab === 'trace' ? 'is-active' : ''} onClick={() => setTab('trace')}>轨迹 <span>{timeline.length}</span></button>
       </div>
 
       <div className="agent-inspector-scroll">
+        {tab === 'code' && <AgentCodePanel agent={agent} />}
         {tab === 'observation' && (observation ? (
           <>
             <section className="agent-observation-hero">

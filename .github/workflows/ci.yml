@@ -49,3 +49,9 @@ jobs:
 
       - name: Go tests with race detector
         run: cd apps/control-server && go test -race ./...
+
+      - name: Algorithm and vehicle navigation end-to-end
+        run: make algorithm-e2e
+
+      - name: Build web production bundle
+        run: npm --prefix apps/web run build

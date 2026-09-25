@@ -29,6 +29,9 @@ const defaultSimConfig = {
   exitHeadwayJamSeconds: 0,
   rerouteIntervalSeconds: 0,
   rerouteCostRatio: 1.25,
+  rerouteRecoveryIntervalSeconds: 0,
+  rerouteMinGainSeconds: 0,
+  rerouteCooldownSeconds: 0,
 }
 
 export type SimConfig = typeof defaultSimConfig

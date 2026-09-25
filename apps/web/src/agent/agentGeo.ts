@@ -5,7 +5,8 @@ import type {
   RouteProperties,
 } from '../types'
 
-export const algorithmLabels: Record<RouteAlgorithm, string> = {
+export const algorithmLabels: Record<RouteAlgorithm | 'custom', string> = {
+  custom: '自定义代码',
   dijkstra: 'Dijkstra',
   astar: 'A*',
   bidijkstra: 'Bi-Dijkstra',

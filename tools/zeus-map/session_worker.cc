@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -16,6 +17,8 @@
 #include <vector>
 
 #include "zeus/routing/kshortest.h"
+#include "zeus/routing/algorithm_lab.h"
+#include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
 #include "zeus/simulation/simulation_engine.h"
@@ -97,6 +100,7 @@ struct Candidate {
     double time_s = 0.0;
     double length_m = 0.0;
     std::vector<zeus::map::EdgeIndex> edges;
+    std::optional<zeus::routing::RoutePath> exact_path;
 };
 
 enum class AppliedActionKind : std::uint8_t {
@@ -109,6 +113,7 @@ struct AppliedAction {
     std::uint32_t vehicle_id = 0;
     AppliedActionKind kind = AppliedActionKind::kKeep;
     zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
+    std::optional<zeus::routing::RoutePath> exact_path;
 };
 
 struct WorkerSession {
@@ -247,6 +252,10 @@ private:
         if (command == "plan") {
             return commandPlan(fields, payload);
         }
+        if (command == "algorithm-context" || command == "algorithm-candidate" ||
+            command == "path-candidate") {
+            return commandAlgorithm(fields, payload);
+        }
         if (command == "commit") {
             return commandCommit(fields, payload);
         }
@@ -287,8 +296,8 @@ private:
     }
 
     int commandReset(const std::vector<std::string>& fields, std::ostringstream& out) {
-        if (fields.size() != 13) {
-            throw std::invalid_argument("reset requires 13 tab fields");
+        if (fields.size() != 13 && fields.size() != 16) {
+            throw std::invalid_argument("reset requires 13 or 16 tab fields");
         }
         const std::string& session_id = fields[1];
         if (!validSessionId(session_id)) {
@@ -303,6 +312,11 @@ private:
         config.reroute_interval_seconds = std::stod(fields[7]);
         config.reroute_cost_ratio = std::stod(fields[8]);
         config.min_speed_ratio = std::stod(fields[9]);
+        if (fields.size() == 16) {
+            config.reroute_recovery_interval_seconds = std::stod(fields[13]);
+            config.reroute_min_gain_seconds = std::stod(fields[14]);
+            config.reroute_cooldown_seconds = std::stod(fields[15]);
+        }
         std::vector<zeus::simulation::VehicleDemand> demands;
         if (!fields[10].empty()) {
             demands = buildVehicleDemands(
@@ -359,6 +373,7 @@ private:
             << ", \"stateVersion\": " << state.state_version
             << ", \"finished\": " << (state.finished ? "true" : "false")
             << ", \"cancelled\": " << (state.cancelled ? "true" : "false")
+            << ", \"paused\": " << (state.paused ? "true" : "false")
             << ", \"decisionDue\": " << (snapshot.decision_due ? "true" : "false")
             << ", \"decisionReason\": " << jsonString(snapshot.decision_reason)
             << ", \"agentVehicleIds\": [";
@@ -733,6 +748,142 @@ private:
         return 0;
     }
 
+    int commandAlgorithm(const std::vector<std::string>& fields, std::ostringstream& out) {
+        const bool exact = fields[0] == "path-candidate";
+        const bool export_route = fields[0] == "algorithm-candidate" && fields.size() == 6;
+        if (fields.size() != (exact ? 7 : 5) && !export_route) {
+            throw std::invalid_argument("invalid algorithm command fields");
+        }
+        auto& entry = requireSession(fields[1]);
+        const auto vehicle = parseUint(fields[2]);
+        const auto version = parseUint64(fields[3]);
+        const auto state = entry.session->observe();
+        const auto snapshot = entry.session->snapshot();
+        if (!state.paused || state.finished || state.state_version != version ||
+            snapshot.state_version != version) {
+            throw std::invalid_argument("algorithm requires the current paused state version");
+        }
+        const auto* agent = findAgent(snapshot, vehicle);
+        if (vehicle >= entry.demands.size() || agent == nullptr ||
+            (agent->state != zeus::simulation::VehicleState::kDriving &&
+             agent->state != zeus::simulation::VehicleState::kWaiting)) {
+            throw std::invalid_argument("algorithm requires an active agent vehicle");
+        }
+        std::vector<std::uint8_t> enabled(runtime_.data().edges.size(), 1);
+        std::vector<double> costs(enabled.size(), 1.0);
+        for (const auto& edge : snapshot.edges) {
+            enabled.at(edge.edge) = edge.closed ? 0 : 1;
+            costs.at(edge.edge) = edge.routing_cost_factor;
+        }
+        const zeus::routing::RoutingOverlay overlay{enabled, costs};
+        zeus::routing::RouteRequest request;
+        request.origin = entry.demands[vehicle].origin;
+        request.destination = entry.demands[vehicle].destination;
+        request.overlay = &overlay;
+        request.destination_position = zeus::routing::RoutePosition{
+            agent->destination_edge, agent->route_end_offset_m};
+        if (agent->state == zeus::simulation::VehicleState::kDriving) {
+            request.origin_position = zeus::routing::RoutePosition{agent->edge, agent->offset_s};
+        }
+        const zeus::routing::AlgorithmLab lab(runtime_, request);
+        if (fields[0] == "algorithm-context") {
+            std::ostringstream observation;
+            observation << std::setprecision(17) << "{\"mode\":\"vehicle\",\"tick\":" << state.tick
+                << ",\"stateVersion\":" << version << ",\"simulationTimeS\":" << state.simulation_time_s
+                << ",\"decisionReason\":" << jsonString(snapshot.decision_reason.empty()
+                    ? (state.tick == 0 ? "initial" : "manual") : snapshot.decision_reason)
+                << ",\"vehicle\":{\"vehicleId\":" << vehicle << ",\"state\":" << jsonString(jsonVehicleState(agent->state))
+                << ",\"routeId\":" << agent->route_id << ",\"position\":";
+            if (agent->state == zeus::simulation::VehicleState::kDriving) {
+                observation << "{\"edgeId\":" << agent->edge << ",\"offsetM\":" << agent->offset_s << '}';
+            } else observation << "null";
+            observation << ",\"destinationEdgeId\":" << agent->destination_edge
+                << ",\"destinationOffsetM\":" << agent->route_end_offset_m
+                // A closed remaining edge makes ETA infinite. Match observe's
+                // finite JSON representation: emitting inf corrupts the frame
+                // and forces the control plane to restart this shared worker.
+                << ",\"remainingEtaS\":" << jsonNumber(agent->remaining_eta_s)
+                << ",\"routeInvalidated\":" << (agent->route_invalidated ? "true" : "false")
+                << ",\"held\":" << (agent->held ? "true" : "false") << ",\"remainingEdgeIds\":[";
+            const auto count = std::min<std::size_t>(10000, agent->remaining_edges.size());
+            for (std::size_t i = 0; i < count; ++i) {
+                if (i) observation << ',';
+                observation << agent->remaining_edges[i];
+            }
+            observation << "],\"remainingEdgesTruncated\":" << (count < agent->remaining_edges.size() ? "true" : "false") << "}}";
+            std::ofstream file(fields[4]);
+            lab.writeContext(file, observation.str());
+            file.close();
+            if (!file) throw std::runtime_error("cannot write algorithm context");
+            out << "{\"basedOnStateVersion\":" << version << ",\"observation\":" << observation.str() << "}";
+            return 0;
+        }
+        std::vector<int> values;
+        std::istringstream input(exact ? fields[6] : fields[4]);
+        std::string token;
+        while (std::getline(input, token, ',')) {
+            std::size_t used = 0;
+            const int value = std::stoi(token, &used);
+            if (used != token.size() || values.size() >= 10000) {
+                throw std::invalid_argument("invalid route states");
+            }
+            values.push_back(value);
+        }
+        zeus::routing::RouteResult checked;
+        if (exact) {
+            zeus::routing::RoutePath path;
+            const auto offset = [](const std::string& text) {
+                std::size_t used = 0;
+                const double value = std::stod(text, &used);
+                if (used != text.size() || !std::isfinite(value)) {
+                    throw std::invalid_argument("invalid path offset");
+                }
+                return value;
+            };
+            path.start_offset_m = offset(fields[4]);
+            path.end_offset_m = offset(fields[5]);
+            for (auto edge : values) {
+                if (edge < 0) throw std::invalid_argument("negative path edge");
+                path.edges.push_back(edge);
+            }
+            checked = lab.validatePath(path);
+        } else {
+            checked = lab.validate(values);
+        }
+        const auto latest = entry.session->observe();
+        if (!latest.paused || latest.state_version != version || latest.finished) {
+            throw std::invalid_argument("state changed during algorithm validation");
+        }
+        if (export_route) {
+            (void)zeus::routing::RouteGeoJsonExporter::save(runtime_.data(), checked, fields[5]);
+        }
+        // Keep only candidates from the current boundary, and bound repeated
+        // planning without requiring the client to manage native memory.
+        std::erase_if(entry.candidates, [version](const auto& item) {
+            return item.second.based_on_state_version != version;
+        });
+        if (entry.candidates.size() >= 128) throw std::invalid_argument("candidate limit reached");
+        Candidate candidate;
+        candidate.vehicle_id = vehicle;
+        candidate.based_on_state_version = version;
+        candidate.exact_path = checked.path;
+        candidate.edges = checked.path.edges;
+        candidate.time_s = checked.stats.time_s;
+        candidate.length_m = checked.stats.length_m;
+        const auto id = "cand-" + std::to_string(entry.next_candidate++);
+        entry.candidates[id] = candidate;
+        out << "{\"ok\":true,\"algorithm\":\"custom\",\"candidateId\":" << jsonString(id)
+            << ",\"basedOnStateVersion\":" << version << ",\"vehicleId\":" << vehicle
+            << ",\"timeS\":" << jsonNumber(candidate.time_s)
+            << ",\"lengthM\":" << jsonNumber(candidate.length_m) << ",\"edges\":[";
+        for (std::size_t i = 0; i < candidate.edges.size(); ++i) {
+            if (i) out << ',';
+            out << candidate.edges[i];
+        }
+        out << "]}";
+        return 0;
+    }
+
     static void writeCommitResult(
         std::ostringstream& out,
         zeus::simulation::SimulationSession::CommitResult result) {
@@ -758,6 +909,18 @@ private:
                 accepted = false;
                 reason = "vehicle_not_agent_controlled";
                 break;
+            case zeus::simulation::SimulationSession::CommitResult::kRejectedNotPaused:
+                accepted = false;
+                reason = "session_not_paused";
+                break;
+            case zeus::simulation::SimulationSession::CommitResult::kRejectedInactiveVehicle:
+                accepted = false;
+                reason = "vehicle_not_active";
+                break;
+            case zeus::simulation::SimulationSession::CommitResult::kRejectedInvalidPath:
+                accepted = false;
+                reason = "invalid_exact_path";
+                break;
         }
         out << "{\"accepted\": " << (accepted ? "true" : "false")
             << ", \"reason\": " << jsonString(reason)
@@ -778,15 +941,19 @@ private:
             throw std::invalid_argument("candidate belongs to another vehicle");
         }
         const std::uint64_t expected_version = parseUint64(fields[4]);
-        // Commit re-plans from the live position with the candidate's
-        // algorithm; the stored path itself never crosses the boundary.
         const zeus::simulation::SimulationSessionState state = entry.session->observe();
-        const auto result = entry.session->commitRoute(
-            vehicle_id, found->second.algorithm, expected_version);
+        const auto& candidate = found->second;
+        if (candidate.exact_path && candidate.based_on_state_version != expected_version) {
+            writeCommitResult(out, zeus::simulation::SimulationSession::CommitResult::kRejectedStaleVersion);
+            return 0;
+        }
+        const auto result = candidate.exact_path
+            ? entry.session->commitPath(vehicle_id, *candidate.exact_path, expected_version)
+            : entry.session->commitRoute(vehicle_id, candidate.algorithm, expected_version);
         if (result == zeus::simulation::SimulationSession::CommitResult::kApplied) {
             entry.applied_actions.push_back(
                 {state.tick, vehicle_id, AppliedActionKind::kCommit,
-                 found->second.algorithm});
+                 candidate.algorithm, candidate.exact_path});
         }
         writeCommitResult(out, result);
         return 0;
@@ -934,8 +1101,18 @@ private:
                        action.kind == AppliedActionKind::kCommit
                            ? "commit_route" : "keep_route")
                 << ", \"algorithm\": "
-                << jsonString(zeus::routing::algorithmName(action.algorithm))
-                << "}";
+                << jsonString(zeus::routing::algorithmName(action.algorithm));
+            if (action.exact_path) {
+                out << ",\"path\":{\"startOffsetM\":" << std::setprecision(17)
+                    << action.exact_path->start_offset_m << ",\"endOffsetM\":"
+                    << action.exact_path->end_offset_m << ",\"edges\":[";
+                for (std::size_t e = 0; e < action.exact_path->edges.size(); ++e) {
+                    if (e) out << ',';
+                    out << action.exact_path->edges[e];
+                }
+                out << "]}";
+            }
+            out << "}";
         }
         out << "], \"storage\": \"process_local_replay\"}";
         return 0;
@@ -979,8 +1156,9 @@ private:
             }
             zeus::simulation::SimulationSession::CommitResult result;
             if (action.kind == AppliedActionKind::kCommit) {
-                result = entry->session->commitRoute(
-                    action.vehicle_id, action.algorithm, state.state_version);
+                result = action.exact_path
+                    ? entry->session->commitPath(action.vehicle_id, *action.exact_path, state.state_version)
+                    : entry->session->commitRoute(action.vehicle_id, action.algorithm, state.state_version);
             } else {
                 result = entry->session->keepRoute(
                     action.vehicle_id, state.state_version);

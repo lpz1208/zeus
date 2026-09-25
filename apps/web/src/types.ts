@@ -268,6 +268,9 @@ export interface SimulateRequest {
   exitHeadwayJamSeconds: number
   rerouteIntervalSeconds: number
   rerouteCostRatio: number
+  rerouteRecoveryIntervalSeconds?: number
+  rerouteMinGainSeconds?: number
+  rerouteCooldownSeconds?: number
   algorithm: RouteAlgorithm
   vehicleControls: VehicleSimulationControl[]
   roadControls: RoadSimulationControl[]
@@ -386,13 +389,18 @@ export interface PlaybackData {
   sample_interval_s: number
   reroute_interval_s?: number
   reroute_cost_ratio?: number
+  reroute_recovery_interval_s?: number
+  reroute_min_gain_s?: number
+  reroute_cooldown_s?: number
   controls: PlaybackControl[]
   reroutes?: PlaybackReroute[]
+  route_comparison_version?: number
+  route_reversal_version?: number
   signal_plans?: PlaybackSignalPlan[]
   vehicles: PlaybackVehicle[]
 }
 
-export type BenchmarkStrategyKind = 'fixed' | 'reactive' | 'rule_agent' | 'model_agent'
+export type BenchmarkStrategyKind = 'fixed' | 'reactive' | 'rule_agent' | 'model_agent' | 'custom_code'
 export type BenchmarkJobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface BenchmarkRoadControl {
@@ -409,6 +417,16 @@ export interface BenchmarkVehicleControl {
   value: number
 }
 
+export interface BenchmarkRandomEvents {
+  edgeIds: number[]
+  count: number
+  startSeconds: number
+  endSeconds: number
+  durationSeconds: number
+  action: 'close' | 'speedFactor'
+  value: number
+}
+
 export interface BenchmarkScenario {
   id: string
   mapId: string
@@ -418,16 +436,22 @@ export interface BenchmarkScenario {
   stepSeconds: number
   rerouteIntervalSeconds: number
   rerouteCostRatio: number
+  rerouteRecoveryIntervalSeconds?: number
+  rerouteMinGainSeconds?: number
+  rerouteCooldownSeconds?: number
   sampleIntervalSeconds: number
   maxDecisions: number
   seed: number
   roadControls: BenchmarkRoadControl[]
   vehicleControls: BenchmarkVehicleControl[]
+  randomEvents?: BenchmarkRandomEvents | null
 }
 
 export interface BenchmarkStrategy {
   id: string
   kind: BenchmarkStrategyKind
+  source?: string
+  steps?: number
   algorithm: RouteAlgorithm
 }
 
@@ -478,6 +502,19 @@ export interface BenchmarkAggregate {
   model_latency_ms: BenchmarkMetricSummary | null
   model_cost_usd: BenchmarkMetricSummary | null
   real_time_factor: BenchmarkMetricSummary | null
+  guard_rejections?: BenchmarkMetricSummary | null
+  action_attempts?: BenchmarkMetricSummary | null
+  action_rejections?: BenchmarkMetricSummary | null
+  action_failures?: BenchmarkMetricSummary | null
+  fallbacks?: BenchmarkMetricSummary | null
+  route_change_requests?: BenchmarkMetricSummary | null
+  unchanged_route_requests?: BenchmarkMetricSummary | null
+  native_route_applications?: BenchmarkMetricSummary | null
+  native_route_failures?: BenchmarkMetricSummary | null
+  applied_route_changes?: BenchmarkMetricSummary | null
+  applied_unchanged_routes?: BenchmarkMetricSummary | null
+  route_overlap_ratio?: BenchmarkMetricSummary | null
+  route_reversals?: BenchmarkMetricSummary | null
 }
 
 export interface BenchmarkRun {
@@ -512,6 +549,23 @@ export interface BenchmarkRun {
   real_time_factor: number
   compute_ms: number | null
   error: string | null
+  guard_rejections?: number | null
+  action_attempts?: number | null
+  action_rejections?: number | null
+  action_failures?: number | null
+  fallbacks?: number | null
+  route_change_requests?: number | null
+  unchanged_route_requests?: number | null
+  native_route_applications?: number | null
+  native_route_failures?: number | null
+  applied_route_changes?: number | null
+  applied_unchanged_routes?: number | null
+  route_overlap_ratio?: number | null
+  route_reversals?: number | null
+  source_revision?: string | null
+  scenario_revision?: string | null
+  resolved_road_controls?: BenchmarkRoadControl[]
+  custom_decisions?: Array<Record<string, unknown>>
 }
 
 export interface BenchmarkReport {
@@ -544,6 +598,9 @@ export interface PlaybackReroute {
   old_route_id: number
   new_route_id: number
   success: boolean
+  route_changed?: boolean | null
+  remaining_overlap_ratio?: number | null
+  route_reversed?: boolean | null
 }
 
 export interface PlaybackControl {
@@ -636,6 +693,9 @@ export interface AgentSessionRequest {
   exitHeadwayJamSeconds: number
   rerouteIntervalSeconds: number
   rerouteCostRatio: number
+  rerouteRecoveryIntervalSeconds?: number
+  rerouteMinGainSeconds?: number
+  rerouteCooldownSeconds?: number
   minSpeedRatio: number
   vehicleControls?: VehicleSimulationControl[]
   roadControls?: RoadSimulationControl[]
@@ -652,10 +712,12 @@ export interface AgentSessionRequest {
 
 /** State header shared by every session response. */
 export interface AgentSessionState {
+  navigationJobId?: string
   tick: number
   simulationTimeS: number
   stateVersion: number
   finished: boolean
+  paused?: boolean
   cancelled?: boolean
   decisionDue?: boolean
   decisionReason?: string
@@ -696,6 +758,7 @@ export interface AgentVehicleState {
 }
 
 export interface AgentSessionObservation extends AgentSessionState {
+  decisionId?: string
   counts: {
     arrived: number
     driving: number
@@ -743,7 +806,7 @@ export interface AgentStepResponse {
 export interface AgentRouteCandidate {
   candidateId: string
   vehicleId: number
-  algorithm: RouteAlgorithm
+  algorithm: RouteAlgorithm | 'custom'
   effectiveAlgorithm?: RouteAlgorithm
   basedOnStateVersion?: number
   ok: boolean
@@ -753,6 +816,7 @@ export interface AgentRouteCandidate {
   lengthM?: number
   expandedNodes?: number
   edges?: number[]
+  geojson?: RouteGeoJSON
   /** k-shortest alternatives; each carries its own candidateId. */
   alternatives?: AgentRouteAlternative[]
   searchTrace?: SearchTrace
@@ -784,6 +848,10 @@ export interface AgentActionResult {
 }
 
 export interface AgentSnapshot {
+  formatVersion?: number
+  mapRevision?: string
+  checksum?: string
+  integrity?: 'verified' | 'legacy_unverified'
   snapshotId: string
   sourceSessionId: string
   tick: number
@@ -794,6 +862,8 @@ export interface AgentSnapshot {
 }
 
 export interface AgentSnapshotRestore {
+  mapRevision?: string
+  integrity?: 'verified' | 'legacy_unverified'
   snapshotId: string
   /** the restored session carries its new sessionId (worker restore payload) */
   state: AgentSessionCreated

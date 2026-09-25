@@ -70,10 +70,14 @@ def test_job_manager_completes_and_persists_report(tmp_path) -> None:
         assert completed.successful_runs == 1
         report = store.result(submitted.job_id)
         assert report is not None
-        assert report["format_version"] == 1
+        assert report["format_version"] == 5
         assert report["runs"][0]["route_tool_calls"] == 0
+        assert report["runs"][0]["action_attempts"] == 3
+        assert report["aggregates"][0]["action_rejections"]["mean"] == 0
     finally:
         manager.close()
+    reopened = BenchmarkJobStore(tmp_path / "jobs.sqlite")
+    assert reopened.result(submitted.job_id) == report
 
 
 def test_running_job_can_be_cancelled(tmp_path) -> None:

@@ -16,7 +16,7 @@
   z-index: 20;
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: 300px 1fr 340px;
+  grid-template-columns: 300px minmax(160px, 1fr) auto auto;
   align-items: center;
   border-bottom: 1px solid var(--line-strong);
   background: var(--chrome);
@@ -539,6 +539,8 @@
   min-height: 0;
 }
 
+.agent-map-wrap > .map-stage { height: 100%; min-height: 0; }
+
 .agent-map-readout {
   position: absolute;
   top: 10px;
@@ -683,7 +685,7 @@
 
 .agent-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(4, 1fr);
   border-bottom: 1px solid var(--line);
 }
 
@@ -1019,6 +1021,10 @@
 
 /* -------------------------------------------------------------- responsive */
 
+@media (min-width: 1101px) {
+  .agent-shell.is-code { grid-template-columns: 260px minmax(340px, 1fr) minmax(420px, 500px); }
+}
+
 @media (max-width: 1100px) {
   .agent-shell {
     grid-template-columns: 1fr;
@@ -1031,3 +1037,38 @@
   .agent-mission { border-right: none; border-bottom: 1px solid var(--line); max-height: 40dvh; }
   .agent-inspector { border-left: none; border-top: 1px solid var(--line); }
 }
+.agent-code-panel { min-width: 0; }
+.agent-navigation-controls { display: grid; grid-template-columns: 1.5fr 1.2fr .8fr .8fr; gap: 5px; margin: 10px 0; }
+.agent-navigation-controls button, .agent-navigation-records button { display: inline-flex; justify-content: center; align-items: center; gap: 4px; padding: 6px; border: 1px solid var(--line-strong); border-radius: 3px; color: var(--ink); background: var(--chrome); font: 10px var(--sans); cursor: pointer; }
+.agent-navigation-controls button:first-child { background: #e8f0db; border-color: #c3cdb4; }
+.agent-code-panel .agent-navigation-status { padding: 7px; border-left: 2px solid var(--blue); background: var(--soft); }
+.agent-navigation-records { margin: 14px 0; border-top: 1px solid var(--line); padding-top: 10px; font-size: 11px; }
+.agent-navigation-records header { display: flex; align-items: center; gap: 6px; }
+.agent-navigation-records header strong { margin-right: auto; }
+.agent-navigation-records details { border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.agent-navigation-records summary strong { float: right; font-size: 10px; color: var(--muted); }
+.agent-navigation-records pre { font: 10px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-navigation-records small { color: var(--quiet); font: 9px var(--mono); }
+.agent-navigation-records .agent-navigation-error { color: var(--red); }
+.agent-code-panel > p, .agent-code-panel details p { font-size: 11px; line-height: 1.7; color: var(--muted); }
+.agent-code-panel .algorithm-editor { height: 380px; max-height: 50vh; }
+.agent-code-panel .algorithm-toolbar { padding: 7px; gap: 6px; }
+.agent-code-panel .algorithm-toolbar button { display: flex; align-items: center; gap: 4px; padding: 5px 7px; border: 0; border-radius: 3px; background: #d9edb3; color: #1c2810; font-size: 10px; cursor: pointer; }
+.agent-code-panel button:disabled { opacity: .4; cursor: not-allowed; }
+.agent-code-panel details { margin-top: 14px; font-size: 11px; }
+.agent-code-panel summary { cursor: pointer; }
+.agent-navigation-history-list { display: grid; gap: 4px; max-height: 220px; overflow-y: auto; margin: 8px 0; }
+.agent-navigation-history-list > button { justify-content: space-between; text-align: left; padding: 8px; }
+.agent-navigation-history-list > button[aria-pressed="true"] { border-color: var(--blue); background: var(--soft); }
+.agent-navigation-history-list > button > span:first-child { display: grid; gap: 4px; }
+.agent-navigation-history-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.agent-navigation-history-detail { padding: 8px; border: 1px solid var(--line); background: var(--soft); }
+.agent-history-decision { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.agent-code-result { margin-top: 12px; padding: 10px; border: 1px solid var(--line); font-size: 11px; overflow-wrap: anywhere; }
+.agent-code-result small { display: block; margin-top: 6px; color: var(--muted); }
+.agent-code-result pre { white-space: pre-wrap; font: 10px/1.6 var(--mono); }
+
+.agent-background-navigation { border-top: 1px solid var(--border, #ddd); padding-top: 14px; margin-top: 14px; }
+.agent-background-navigation header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-background-navigation article { padding: 12px 0; border-bottom: 1px solid var(--border, #ddd); }
+.agent-background-navigation small { display: block; margin: 5px 0; overflow-wrap: anywhere; opacity: .65; }

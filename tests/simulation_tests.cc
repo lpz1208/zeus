@@ -529,6 +529,11 @@ void runClosureRerouteTest() {
     require(route.edges == std::vector<zeus::map::EdgeIndex>{
                                first, detour_a, detour_b, goal},
             "new route avoids the closed edge without leaving the current edge");
+    const auto comparison = zeus::simulation::PlaybackExporter::compareReroute(
+        *setup.runtime, result, result.reroutes[0]);
+    require(comparison && comparison->changed && comparison->overlap_ratio > 0 &&
+                comparison->overlap_ratio < 1,
+            "automatic reroute preserves its application boundary for overlap metrics");
 }
 
 void runClosureRerouteFailureTest() {
@@ -599,6 +604,100 @@ void runDynamicWeightControlRerouteTest() {
 
     run(zeus::simulation::ControlAction::kSetSpeedFactor);
     run(zeus::simulation::ControlAction::kSetCapacityFactor);
+}
+
+void runRecoveryRerouteTest() {
+    using namespace zeus::simulation;
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0, 0);
+    const auto n1 = fixture.addNode(100, 0);
+    const auto n2 = fixture.addNode(200, 0);
+    const auto n3 = fixture.addNode(100, 100);
+    const auto n4 = fixture.addNode(300, 0);
+    const auto first = fixture.addEdge(n0, n1, 10);
+    const auto direct = fixture.addEdge(n1, n2, 10);
+    const auto detour = fixture.addEdge(n1, n3, 10);
+    fixture.addEdge(n3, n2, 10);
+    const auto goal = fixture.addEdge(n2, n4, 10);
+    SimSetup setup(fixture.data);
+    const auto run = [&](double interval, double gain, double cooldown,
+                         ControlAction action, bool close_detour = false,
+                         double depart = 20) {
+        auto config = quickConfig(120);
+        config.reroute_recovery_interval_seconds = interval;
+        config.reroute_min_gain_seconds = gain;
+        config.reroute_cooldown_seconds = cooldown;
+        std::vector<SimulationControlEvent> controls = {
+            {1, ControlScope::kEdge, direct, action,
+             action == ControlAction::kClose ? 1.0 : .1},
+            {2, ControlScope::kEdge, direct,
+             action == ControlAction::kClose ? ControlAction::kOpen : action, 1},
+        };
+        if (close_detour) controls.push_back({3, ControlScope::kEdge, detour, ControlAction::kClose, 1});
+        return setup.engine->run(config, {demand(10, .5, 290, .5, depart)}, controls);
+    };
+    for (const auto action : {ControlAction::kClose, ControlAction::kSetSpeedFactor,
+                               ControlAction::kSetCapacityFactor}) {
+        const auto restored = run(1, 0, 5, action);
+        require(restored.ok && restored.stats.arrived == 1 &&
+                    restored.stats.reroute_succeeded == 2,
+                "recovery finds an improved road outside the remaining path");
+        require(restored.reroutes.back().time_s == 6,
+                "recovery stays pending and retries after cooldown");
+        require(restored.routes[restored.vehicles[0].route_id].edges ==
+                    std::vector<zeus::map::EdgeIndex>{first, direct, goal},
+                "recovered route returns to the direct branch");
+        const auto disabled = run(0, 0, 0, action);
+        require(disabled.stats.reroute_succeeded == 1,
+                "zero recovery interval preserves legacy behavior");
+    }
+    const auto driving = run(1, 0, 5, ControlAction::kClose, false, 0);
+    require(driving.stats.reroute_succeeded == 2 && driving.reroutes.back().time_s == 6 &&
+                driving.reroutes.back().old_route_offset_m > 10,
+            "driving recovery plans from the current offset after cooldown");
+    const auto small_gain = run(1, 100, 0, ControlAction::kClose);
+    require(small_gain.stats.reroute_succeeded == 1,
+            "optional recovery below minimum gain keeps the detour");
+    const auto blocked = run(1, 100, 100, ControlAction::kClose, true);
+    require(blocked.stats.reroute_succeeded == 2 && blocked.reroutes.back().time_s == 3,
+            "blocked route bypasses both gain and cooldown limits");
+}
+
+void runAgentRecoveryNotificationTest() {
+    using namespace zeus::simulation;
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0, 0);
+    const auto n1 = fixture.addNode(100, 0);
+    const auto n2 = fixture.addNode(200, 0);
+    const auto n3 = fixture.addNode(150, 30);
+    const auto n4 = fixture.addNode(300, 0);
+    fixture.addEdge(n0, n1, 10);
+    fixture.addEdge(n1, n2, 10);
+    const auto a = fixture.addEdge(n1, n3, 10);
+    const auto b = fixture.addEdge(n3, n2, 10);
+    fixture.addEdge(n2, n4, 10);
+    SimSetup setup(fixture.data);
+    auto config = quickConfig(120);
+    config.reroute_recovery_interval_seconds = 1;
+    auto agent = demand(10, .5, 290, .5);
+    agent.agent_controlled = true;
+    const std::vector<VehicleDemand> demands = {agent};
+    const std::vector<SimulationControlEvent> controls = {
+        {0, ControlScope::kEdge, a, ControlAction::kSetSpeedFactor, .2},
+        {0, ControlScope::kEdge, b, ControlAction::kSetSpeedFactor, .2},
+        {1, ControlScope::kEdge, a, ControlAction::kSetSpeedFactor, 1},
+        {1, ControlScope::kEdge, b, ControlAction::kSetSpeedFactor, 1},
+    };
+    SimulationSession session(*setup.engine, config, demands, controls);
+    (void)session.reset();
+    (void)session.stepUntilEvent(100);
+    const auto snapshot = session.snapshot();
+    require(snapshot.tick == 2 && snapshot.decision_reason == "route_improved",
+            "off-route cost recovery wakes the agent at its committed boundary");
+    require(!snapshot.agents.front().route_invalidated &&
+                snapshot.agents.front().route_id == 0,
+            "benefit notification does not invalidate or replace an agent route");
+    session.close();
 }
 
 void runPeriodicCongestionRerouteTest() {
@@ -836,6 +935,230 @@ void runAgentCommitRouteTest() {
     require(result.reroutes.size() == 1 && result.reroutes[0].success,
             "the injection leaves a successful reroute record");
     session.close();
+}
+
+void runAgentExactPathTest() {
+    Fixture fixture;
+    const auto n0 = fixture.addNode(0, 0);
+    const auto n1 = fixture.addNode(100, 0);
+    const auto n2 = fixture.addNode(200, 0);
+    const auto n3 = fixture.addNode(100, 100);
+    const auto n4 = fixture.addNode(300, 0);
+    const auto first = fixture.addEdge(n0, n1, 10);
+    const auto direct = fixture.addEdge(n1, n2, 10);
+    const auto detour_a = fixture.addEdge(n1, n3, 10);
+    const auto detour_b = fixture.addEdge(n3, n2, 10);
+    const auto goal = fixture.addEdge(n2, n4, 10);
+    SimSetup setup(fixture.data);
+    auto agent = demand(10, 0.5, 290, 0.5);
+    agent.agent_controlled = true;
+    const std::vector<zeus::simulation::VehicleDemand> demands{agent};
+    using Commit = zeus::simulation::SimulationSession::CommitResult;
+    for (bool driving : {false, true}) {
+        zeus::simulation::SimulationSession session(*setup.engine, quickConfig(120), demands);
+        auto state = session.reset();
+        if (driving) state = session.step(1);
+        const auto observed = session.snapshot().agents.front();
+        zeus::routing::RoutePath path{{first, detour_a, detour_b, goal},
+            driving ? observed.offset_s : 10, 90};
+        require(session.commitPath(0, path, state.state_version - 1) == Commit::kRejectedStaleVersion,
+                "exact path rejects a stale observation");
+        require(session.commitPath(99, path, state.state_version) == Commit::kRejectedUnknownVehicle,
+                "exact path rejects unknown vehicle");
+        auto invalid = path;
+        invalid.edges = {first, goal};
+        require(session.commitPath(0, invalid, state.state_version) == Commit::kRejectedInvalidPath,
+                "exact path cannot jump across disconnected edges");
+        invalid = path;
+        invalid.start_offset_m += 1;
+        require(session.commitPath(0, invalid, state.state_version) == Commit::kRejectedInvalidPath,
+                "exact path cannot move the vehicle origin");
+        invalid = path;
+        invalid.end_offset_m -= 1;
+        require(session.commitPath(0, invalid, state.state_version) == Commit::kRejectedInvalidPath,
+                "exact path cannot change the destination");
+        require(session.commitPath(0, path, state.state_version) == Commit::kApplied,
+                "legal non-shortest path is accepted from waiting or driving state");
+        static_cast<void>(session.runToEnd());
+        const auto result = session.result();
+        require(result.stats.arrived == 1 && result.stats.reroute_succeeded == 1,
+                "vehicle completes a committed exact route");
+        require(result.routes[result.vehicles[0].route_id].edges == path.edges,
+                "exact route preserves a deliberate detour despite a faster open route");
+        require(near(result.routes[result.vehicles[0].route_id].start_offset_m, path.start_offset_m),
+                "exact route preserves live position without teleporting");
+        require(session.commitPath(0, path, session.observe().state_version) == Commit::kRejectedInactiveVehicle,
+                "finished vehicle cannot receive a path");
+    }
+    // Road controls take effect after commit but before injection on tick zero.
+    const std::vector<zeus::simulation::SimulationControlEvent> controls{{0,
+        zeus::simulation::ControlScope::kEdge, detour_a,
+        zeus::simulation::ControlAction::kClose, 1}};
+    zeus::simulation::SimulationSession changed(*setup.engine, quickConfig(120), demands, controls);
+    const auto initial = changed.reset();
+    const zeus::routing::RoutePath path{{first, detour_a, detour_b, goal}, 10, 90};
+    require(changed.commitPath(0, path, initial.state_version) == Commit::kApplied,
+            "path is legal at the observed boundary before scheduled closure");
+    static_cast<void>(changed.runToEnd());
+    const auto result = changed.result();
+    require(result.stats.reroute_failed == 1 && result.stats.reroute_succeeded == 0 &&
+            result.routes[result.vehicles[0].route_id].edges ==
+                std::vector<zeus::map::EdgeIndex>{first, direct, goal},
+            "new closure rejects queued exact route and retains the original route");
+    require(!zeus::simulation::PlaybackExporter::compareReroute(
+                *setup.runtime, result, result.reroutes.front()),
+            "an accepted path that fails at application has no route comparison");
+
+    zeus::simulation::SimulationSession progressed(*setup.engine, quickConfig(120), demands);
+    static_cast<void>(progressed.reset());
+    const auto progress = progressed.step(11);
+    const auto observation = progressed.snapshot().agents.front();
+    require(observation.remaining_edges.front() != first,
+            "same-route test advances past the original first edge");
+    const zeus::routing::RoutePath suffix{observation.remaining_edges, observation.offset_s, 90};
+    require(progressed.commitPath(0, suffix, progress.state_version) == Commit::kApplied,
+            "remaining suffix can be submitted without changing route");
+    static_cast<void>(progressed.runToEnd());
+    const auto unchanged = progressed.result();
+    const auto comparison = zeus::simulation::PlaybackExporter::compareReroute(
+        *setup.runtime, unchanged, unchanged.reroutes.front());
+    require(unchanged.reroutes.front().old_route_index.value_or(0) > 0 &&
+                comparison && !comparison->changed && near(comparison->overlap_ratio, 1),
+            "same-route application excludes the consumed prefix and keeps precise offset");
+}
+
+void runRouteOverlapTest() {
+    Fixture fixture;
+    const auto a = fixture.addNode(0, 0);
+    const auto b = fixture.addNode(100, 0);
+    const auto c = fixture.addNode(200, 0);
+    const auto d = fixture.addNode(100, 100);
+    const auto e = fixture.addNode(300, 0);
+    const auto first = fixture.addEdge(a, b, 10);
+    const auto direct = fixture.addEdge(b, c, 10);
+    const auto detour_a = fixture.addEdge(b, d, 10);
+    const auto detour_b = fixture.addEdge(d, c, 10);
+    const auto goal = fixture.addEdge(c, e, 10);
+    const auto back = fixture.addEdge(c, a, 10);
+    const auto reverse = fixture.addEdge(c, b, 10);
+    SimSetup setup(fixture.data);
+    zeus::simulation::SimulationResult result;
+    result.routes = {{{first, direct, goal}, 20, 90},
+                     {{first, detour_a, detour_b, goal}, 20, 90}};
+    zeus::simulation::VehicleRerouteRecord record{1, 0, 0, 1, true, 0, 20};
+    const auto compare = [&]() {
+        return zeus::simulation::PlaybackExporter::compareReroute(*setup.runtime, result, record);
+    };
+    auto metric = compare();
+    require(metric && metric->changed &&
+                near(metric->overlap_ratio, 170.0 / (370.0 + std::sqrt(20000.0))),
+            "overlap uses directed edge length and clips first/last edge offsets");
+    result.routes[1] = {{first, direct, back, first, direct, goal}, 20, 90};
+    metric = compare();
+    require(metric && metric->changed && near(metric->overlap_ratio, 270.0 / 490.0),
+            "repeated visits merge coverage intervals instead of double-counting distance");
+    result.routes = {{{direct}, 10, 20}, {{direct}, 80, 90}};
+    record.old_route_offset_m = 10;
+    metric = compare();
+    require(metric && metric->changed && near(metric->overlap_ratio, 0),
+            "disjoint segments of the same edge have zero overlap");
+    result.routes = {{{direct}, 0, 100}, {{reverse}, 0, 100}};
+    record.old_route_offset_m = 0;
+    metric = compare();
+    require(metric && metric->changed && near(metric->overlap_ratio, 0),
+            "opposite directed edges do not count as shared coverage");
+    result.routes = {{{direct}, 10, 10}, {{direct}, 10, 10}};
+    record.old_route_offset_m = 10;
+    metric = compare();
+    require(metric && !metric->changed && near(metric->overlap_ratio, 1),
+            "identical zero-length paths produce finite complete overlap");
+    record.old_route_offset_m = std::numeric_limits<double>::quiet_NaN();
+    require(!compare(), "invalid boundary produces missing evidence instead of NaN");
+    record.old_route_offset_m = 10;
+    record.old_route_index.reset();
+    require(!compare(), "legacy records without boundary must not fabricate comparisons");
+    record.old_route_index = 50;
+    require(!compare(), "invalid old route index is rejected");
+    record.old_route_index = 0;
+    record.new_route_id = 50;
+    require(!compare(), "invalid new route id is rejected");
+}
+
+void runRouteReversalTest() {
+    Fixture fixture;
+    const auto a = fixture.addNode(0, 0);
+    const auto b = fixture.addNode(100, 0);
+    const auto c = fixture.addNode(200, 0);
+    const auto d = fixture.addNode(300, 0);
+    const auto e = fixture.addNode(250, 100);
+    const auto f = fixture.addNode(400, 0);
+    const auto first = fixture.addEdge(a, b, 10);
+    const auto shared = fixture.addEdge(b, c, 10);
+    const auto direct = fixture.addEdge(c, d, 10);
+    const auto detour_a = fixture.addEdge(c, e, 10);
+    const auto detour_b = fixture.addEdge(e, d, 10);
+    const auto goal = fixture.addEdge(d, f, 10);
+    const auto back = fixture.addEdge(d, a, 10);
+    SimSetup setup(fixture.data);
+    using Path = zeus::routing::RoutePath;
+    using Record = zeus::simulation::VehicleRerouteRecord;
+    const std::vector<zeus::map::EdgeIndex> route_a{first, shared, direct, goal};
+    const std::vector<zeus::map::EdgeIndex> route_b{first, shared, detour_a, detour_b, goal};
+    const auto check = [&](std::vector<Path> paths, std::vector<Record> records,
+                           std::vector<std::optional<bool>> expected, const char* message) {
+        zeus::simulation::SimulationResult result;
+        result.routes = std::move(paths);
+        result.reroutes = std::move(records);
+        const auto actual = zeus::simulation::PlaybackExporter::compareReroutes(*setup.runtime, result);
+        require(actual.size() == expected.size(), message);
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            const auto reversed = actual[i] ? actual[i]->reversed : std::nullopt;
+            require(reversed == expected[i], std::string(message) + " record " + std::to_string(i));
+        }
+    };
+    check({{route_a, 10, 90}, {route_b, 10, 90}, {route_a, 20, 90}, {route_b, 30, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 0, 20}, {3, 0, 2, 3, true, 0, 30}},
+          {false, true, true}, "A B A B counts overlapping reversals despite movement");
+    check({{route_a, 10, 90}, {route_b, 10, 90},
+           {{first, shared, direct, back, first, shared, direct, goal}, 20, 90},
+           {route_a, 30, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 0, 20}, {3, 0, 2, 3, true, 0, 30}},
+          {false, false, false}, "A B C A is not a consecutive reversal");
+    check({{route_a, 10, 90}, {route_b, 10, 90},
+           {{shared, detour_a, detour_b, goal}, 20, 90}, {{shared, direct, goal}, 30, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 1, false, 0, 15},
+           {3, 1, 0, 1, true, 0, 10}, {4, 0, 1, 2, true, 1, 20}, {5, 0, 2, 3, true, 0, 30}},
+          {false, std::nullopt, false, false, true},
+          "unchanged reapplications, failures and other vehicles preserve prior distinct route");
+    check({{route_a, 10, 90}, {route_b, 10, 90}, {route_a, 20, 80}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 0, 20}},
+          {false, false}, "same edges with a different destination offset are not A");
+    check({{route_a, 10, 90},
+           {{first, shared, detour_a, detour_b, back, first, shared, detour_a, detour_b, goal}, 10, 90},
+           {route_a, 20, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 5, 20}},
+          {false, false}, "matching a repeated edge after a different driven prefix is not a reversal");
+    check({{{first, shared, direct, back, first, shared, direct, goal}, 10, 90},
+           {{first, shared, direct, back, first, shared, detour_a, detour_b, goal}, 10, 90},
+           {route_a, 20, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 4, 20}},
+          {false, true}, "shared repeated-edge prefixes use the actual occurrence");
+    check({{route_a, 10, 90}, {route_b, 10, 90}, {route_a, 20, 90}, {route_b, 30, 90}},
+          {{1, 0, 0, 1, true, std::nullopt, 10}, {2, 0, 1, 2, true, 0, 20},
+           {3, 0, 2, 3, true, 0, 30}},
+          {std::nullopt, std::nullopt, true}, "unknown applications break evidence until a new pair is known");
+    check({{route_a, 10, 90}, {route_b, 10, 90}, {route_b, 10, 90}, {route_a, 20, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 2, 3, true, 0, 20}},
+          {false, std::nullopt}, "missing route continuity does not fabricate zero reversals");
+    check({{route_a, 10, 90}, {route_b, 10, 90}, {route_a, 20, 90}},
+          {{2, 0, 0, 1, true, 0, 10}, {1, 0, 1, 2, true, 0, 20}},
+          {false, std::nullopt}, "out of order application times are unknown");
+    check({{route_a, 10, 90}, {route_b, 10, 90}, {route_a, 5, 90}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 0, 5}},
+          {false, std::nullopt}, "backwards movement is missing evidence");
+    check({{{first}, 10, 10}, {{first}, 10, 20}, {{first}, 10, 10}},
+          {{1, 0, 0, 1, true, 0, 10}, {2, 0, 1, 2, true, 0, 10}},
+          {false, true}, "zero length destinations retain exact endpoint comparisons");
 }
 
 void runSessionReplayForkTest() {
@@ -1317,7 +1640,10 @@ void runExportTest() {
 
         const std::filesystem::path playback = directory / "playback.json";
         zeus::simulation::SimulationResult playback_result = result;
-        playback_result.reroutes.push_back({12.0, 3, 0, 1, true});
+        playback_result.routes.push_back(playback_result.routes.front());
+        playback_result.reroutes.push_back({12.0, 3, 0,
+            static_cast<std::uint32_t>(playback_result.routes.size() - 1), true, 0,
+            playback_result.routes.front().start_offset_m});
         playback_result.signal_plans.push_back({
             0, 2.0, 3.0, 1.0, {{20.0, {{0, 0}}}}});
         zeus::simulation::PlaybackExporter::save(
@@ -1336,6 +1662,13 @@ void runExportTest() {
                     content.find("\"vehicle_id\": 3") != std::string::npos &&
                     content.find("\"success\": true") != std::string::npos,
                 "playback document lists vehicle reroutes");
+        require(content.find("\"route_comparison_version\": 1") != std::string::npos &&
+                    content.find("\"route_changed\": false") != std::string::npos &&
+                    content.find("\"remaining_overlap_ratio\": 1.000000") != std::string::npos,
+                "playback exports authoritative route application comparison");
+        require(content.find("\"route_reversal_version\": 1") != std::string::npos &&
+                    content.find("\"route_reversed\": false") != std::string::npos,
+                "playback exports versioned route reversal evidence");
         require(content.find("\"reroute_interval_s\": 0.000") != std::string::npos &&
                     content.find("\"reroute_cost_ratio\": 1.250") != std::string::npos,
                 "playback document preserves dynamic routing configuration");
@@ -1401,11 +1734,16 @@ int main() {
         runUntilEventRouteInvalidatedTest();
         runUntilEventPeriodicTest();
         runAgentCommitRouteTest();
+        runAgentExactPathTest();
+        runRouteOverlapTest();
+        runRouteReversalTest();
         runSessionReplayForkTest();
         runAgentKeepRouteTest();
         runClosureRerouteTest();
         runClosureRerouteFailureTest();
         runDynamicWeightControlRerouteTest();
+        runRecoveryRerouteTest();
+        runAgentRecoveryNotificationTest();
         runPeriodicCongestionRerouteTest();
         std::cout << "all simulation tests passed\n";
         return 0;

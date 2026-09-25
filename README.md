@@ -8,7 +8,7 @@ Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。
 
 ## 快速启动
 
-环境需要 C++20、CMake、GDAL/OGR、Boost、Go、Node.js、curl 和 Protobuf 编译器。
+环境需要 C++20、CMake、GDAL/OGR、Boost、Go、Node.js、Python 3.9+、curl 和 Protobuf 编译器。
 
 ```bash
 make run
@@ -22,6 +22,8 @@ make run
 http://127.0.0.1:8080
 ```
 
+启动脚本使用独立的 `/api/live` 检查控制服务存活，`/api/health` 继续返回包含 Benchmark 的整体状态。修改 `ZEUS_ADDR` 时检查地址会同步推导；本地请求自动绕过终端代理，curl 不读取个人配置。检查失败会输出实际 URL、curl 退出码、HTTP 状态及错误原因，可用 `ZEUS_STARTUP_TIMEOUT` 调整默认 30 秒的启动期限。Vite 的大文件警告不代表启动失败。
+
 ## 分步构建
 
 ```bash
@@ -29,7 +31,10 @@ make build-map
 make build-server
 make build-web
 make test
+make algorithm-e2e
 ```
+
+`make test` 包含 C++、Go、Python、前端类型检查与自动导航测试。`make algorithm-e2e` 在临时目录创建小型路网，启动真实控制服务，验证算法运行、封路、单步调试、实验持久化、精确路径跨重启恢复和前端自动导航到达；无需模型服务。CI 同时运行这两项和前端生产构建。使用已有真实路网的验收方式见[算法实验台文档](docs/algorithm-lab.md#端到端验收)。
 
 ## 当前组件
 
@@ -50,6 +55,17 @@ make test
 - [路由内核](docs/routing-core-design.md)
 - [中观仿真内核](docs/simulation-core-design.md)
 - [Web 地图工作台](docs/web-map-workbench.md)
+- [自定义导航算法实验台：控制边界与方法契约](docs/algorithm-lab.md)
+
+## 自定义导航算法
+
+点击工作台顶部 **CODE**，选择或精确输入起终点，编写 Python 子集的 `route(ctx)` 并运行验证。编辑器提供高亮、方法补全、语法检查、单步与断点调试；C++ 独立校验路线，与同条件 Dijkstra 比较，并在地图回放搜索。支持临时封路、步数预算和停止运行；代码修改后旧结果自动标记过期。完成的静态实验保存到服务器，可恢复源码、条件与结果，并比较相同快照下的两次实验。
+
+在 **AGENT → 决策控制台 → 代码** 中，同样的代码可以基于车辆当前位置、封路与拥堵代价生成候选；通过决策横幅提交后，车辆执行该精确路径。提交和执行分别检查版本与道路合法性，快照恢复保留完整路径和偏移。完整接口与限制见[算法实验台文档](docs/algorithm-lab.md)。
+
+支持 **开启自动导航 / 单次决策 / 暂停 / 停止**：从出发前开始，根据事件串行执行用户代码和车辆动作。`ctx.observation()` 读取当前车辆及决策原因，`ctx.keep()` 明确保持原路线。代码失败或路径执行失败时自动暂停；每次决策保留源码、观察、路径和日志，可导出 JSON。源码、决策记录和车辆边界自动保存到服务器，刷新后可在“导航历史”查看、导出并恢复到独立暂停会话。保存失败会停止后续导航。选择“交给后台运行”后可关闭页面；后台任务支持暂停、继续、停止、导出和删除，服务重启后可手动恢复最近检查点。后台任务占用会话期间，手动写操作被阻止。
+
+点击 **调试** 可在语句执行前暂停，单步进入函数、继续到指定行断点，并查看局部变量和调用栈。暂停保留同一进程现场，等待时间不计入计算预算；空闲 60 秒会自动回收，重复调试命令由暂停序号校验拦截。
 
 ## 转向代价
 
@@ -109,6 +125,8 @@ curl -X POST http://127.0.0.1:8080/api/benchmarks \
 
 Web 顶栏的 `BENCH` 工作区使用同源 `/api/benchmarks`，可编辑多场景与四类策略，查看场景 × 策略进度、取消任务、浏览历史和聚合指标，并下载 JSON/CSV 报告。Go 服务可用 `--benchmark-url` 覆盖上游地址；只有需要绕过控制面调试时，才使用前端环境变量 `VITE_BENCHMARK_BASE_URL` 直连任务服务。
 
+报告 v5 包含 Guard 阻止、动作提交尝试、服务端拒绝/错误、保持路线降级、道路序列提交计数，以及 C++ 实际路线应用成功/失败、改道/同路应用、剩余路线重叠率和 A→B→A 回切次数。结果页可对比均值并展开每次运行；JSON/CSV 同步包含指标，旧报告缺失值显示为 `—`。获准提交与实际执行分别统计；口径见 [Benchmark 指标](docs/benchmark-metrics.md)。
+
 `make run` 的本地监管参数均可通过环境变量覆盖：`ZEUS_ADDR`、`ZEUS_CONTROL_BASE_URL`、`ZEUS_DATA_DIR`、`ZEUS_BENCHMARK_HOST`、`ZEUS_BENCHMARK_PORT`、`ZEUS_BENCHMARK_DB`、`ZEUS_BENCHMARK_WORKERS`、`ZEUS_BENCHMARK_MAX_PENDING` 和 `ZEUS_BENCHMARK_MODEL_TIMEOUT`。模型密钥仍只从服务进程环境读取。
 
 默认 CLI 使用 LangGraph + 规则基线；接兼容模型服务时只从环境变量读取密钥：
@@ -157,3 +175,11 @@ Zeus 不依赖 SUMO。对于已有的 OSM PBF，可先生成可审计、可 diff
 ```
 
 提取器支持机动车 `no_*`、`only_*` 和 `restriction:motorcar`，会跳过 `except=motorcar`。当前明确不展开 via-way、conditional 与复杂车型例外，并在命令输出中按原因计数。
+
+### 自定义代码与随机事件评测
+
+Benchmark 支持 `custom_code` 策略，在初始边界及后续决策事件调用 `route(ctx)`。报告 v5 保存源码 SHA-256、场景 SHA-256、实际道路事件、逐次代码决策和原生 A→B→A 路线回切次数；源码本身保存在报告 manifest。代码错误、无路或动作未采用会终止该次运行，不自动改用其他算法。
+
+场景可配置 `randomEvents`：候选道路、事件数、发生窗口、持续时间以及封路/降速类型。同一重复轮次的所有策略共享 `seed + repetition - 1` 生成的事件；事件对齐仿真 tick，结束时恢复道路。JSON/CSV 均包含实际生成的事件。详见 [Benchmark 指标与可重复性](docs/benchmark-metrics.md)。
+
+2026-09-25：新增格式 3 快照内容/地图校验、道路恢复收益扫描与换路稳定性参数，并实现含转向限制的双向 Dijkstra/A*。各项完成状态、验收与后续缺项见 [实现进度](docs/implementation-roadmap.md)。恢复扫描默认关闭，旧格式快照恢复时标记为未校验。

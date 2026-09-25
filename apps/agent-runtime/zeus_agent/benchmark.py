@@ -6,9 +6,11 @@ import csv
 import json
 import math
 import statistics
+import hashlib
+import random
 import time
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
@@ -24,7 +26,25 @@ SUPPORTED_ALGORITHMS = {"dijkstra", "astar", "bidijkstra", "biastar"}
 
 
 class ManifestModel(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    model_config = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
+
+
+class RandomRoadEvents(ManifestModel):
+    edge_ids: list[int] = Field(alias="edgeIds", min_length=1, max_length=10000)
+    count: int = Field(default=1, ge=1, le=100)
+    start_seconds: float = Field(default=1, alias="startSeconds", ge=0)
+    end_seconds: float = Field(default=300, alias="endSeconds", ge=0)
+    duration_seconds: float = Field(default=60, alias="durationSeconds", gt=0)
+    action: Literal["close", "speedFactor"] = "close"
+    value: float = Field(default=.5, ge=.05, le=1)
+
+    @model_validator(mode="after")
+    def validate_pool(self):
+        if any(edge < 0 or edge > 0xffffffff for edge in self.edge_ids):
+            raise ValueError("random event edge IDs must be uint32")
+        if self.end_seconds < self.start_seconds or self.count > len(set(self.edge_ids)):
+            raise ValueError("invalid random event window or insufficient distinct edges")
+        return self
 
 
 class BenchmarkScenario(ManifestModel):
@@ -38,6 +58,9 @@ class BenchmarkScenario(ManifestModel):
         default=30.0, alias="rerouteIntervalSeconds", ge=0)
     reroute_cost_ratio: float = Field(
         default=1.25, alias="rerouteCostRatio", ge=1.01)
+    reroute_recovery_interval_seconds: float = Field(default=0, alias="rerouteRecoveryIntervalSeconds", ge=0, le=3600)
+    reroute_min_gain_seconds: float = Field(default=0, alias="rerouteMinGainSeconds", ge=0, le=3600)
+    reroute_cooldown_seconds: float = Field(default=0, alias="rerouteCooldownSeconds", ge=0, le=3600)
     sample_interval_seconds: float = Field(
         default=10.0, alias="sampleIntervalSeconds", gt=0)
     max_decisions: int = Field(default=100, alias="maxDecisions", gt=0)
@@ -45,8 +68,43 @@ class BenchmarkScenario(ManifestModel):
     road_controls: list[RoadControl] = Field(default_factory=list, alias="roadControls")
     vehicle_controls: list[VehicleControl] = Field(
         default_factory=list, alias="vehicleControls")
+    random_events: RandomRoadEvents | None = Field(default=None, alias="randomEvents")
 
-    def to_scenario(self, algorithm: str = "astar") -> Scenario:
+    @model_validator(mode="after")
+    def validate_events(self):
+        if self.random_events:
+            spec = self.random_events
+            low = math.ceil(spec.start_seconds / self.step_seconds)
+            high = math.floor(spec.end_seconds / self.step_seconds)
+            if low > high:
+                raise ValueError("random event window contains no simulation tick")
+            if (high + math.ceil(spec.duration_seconds / self.step_seconds)) * self.step_seconds > self.duration_seconds:
+                raise ValueError("random events must finish within the scenario duration")
+            if set(spec.edge_ids) & {edge for event in self.road_controls for edge in event.edge_ids}:
+                raise ValueError("random event edges must not overlap manually controlled edges")
+        return self
+
+    def to_scenario(self, algorithm: str = "astar", repetition: int = 1) -> Scenario:
+        controls = list(self.road_controls)
+        if self.random_events:
+            spec = self.random_events
+            generator = random.Random(self.seed + repetition - 1)
+            low = math.ceil(spec.start_seconds / self.step_seconds)
+            high = math.floor(spec.end_seconds / self.step_seconds)
+            if low > high:
+                raise ValueError("random event window contains no simulation tick")
+            for edge in generator.sample(sorted(set(spec.edge_ids)), spec.count):
+                tick = generator.randint(low, high)
+                start = tick * self.step_seconds
+                end = start + math.ceil(spec.duration_seconds / self.step_seconds) * self.step_seconds
+                if end > self.duration_seconds:
+                    raise ValueError("rounded random event duration exceeds scenario")
+                controls.extend([
+                    RoadControl(time_seconds=start, edge_ids=[edge], action=spec.action, value=spec.value),
+                    RoadControl(time_seconds=end, edge_ids=[edge],
+                                action="open" if spec.action == "close" else "speedFactor", value=1),
+                ])
+        controls.sort(key=lambda event: event.time_seconds)
         return Scenario(
             map_id=self.map_id,
             origin=self.origin,
@@ -56,8 +114,11 @@ class BenchmarkScenario(ManifestModel):
             algorithm=algorithm,
             reroute_interval_seconds=self.reroute_interval_seconds,
             reroute_cost_ratio=self.reroute_cost_ratio,
+            reroute_recovery_interval_seconds=self.reroute_recovery_interval_seconds,
+            reroute_min_gain_seconds=self.reroute_min_gain_seconds,
+            reroute_cooldown_seconds=self.reroute_cooldown_seconds,
             sample_interval_seconds=self.sample_interval_seconds,
-            road_controls=tuple(self.road_controls),
+            road_controls=tuple(controls),
             vehicle_controls=tuple(self.vehicle_controls),
             max_decisions=self.max_decisions,
         )
@@ -65,11 +126,18 @@ class BenchmarkScenario(ManifestModel):
 
 class BenchmarkStrategy(ManifestModel):
     strategy_id: str = Field(alias="id", min_length=1)
-    kind: Literal["fixed", "reactive", "rule_agent", "model_agent"]
+    kind: Literal["fixed", "reactive", "rule_agent", "model_agent", "custom_code"]
     algorithm: str = "astar"
+    source: str | None = Field(default=None, max_length=32768)
+    steps: int = Field(default=5_000_000, ge=1000, le=5_000_000)
 
     @model_validator(mode="after")
     def validate_algorithm(self) -> "BenchmarkStrategy":
+        if self.kind == "custom_code" and (not self.source or not self.source.strip()
+                                           or len(self.source.encode()) > 32768):
+            raise ValueError("custom_code requires 1–32768 bytes of source")
+        if self.kind != "custom_code" and self.source is not None:
+            raise ValueError("source is only valid for custom_code strategies")
         if self.algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError(
                 "algorithm must be dijkstra, astar, bidijkstra or biastar")
@@ -132,6 +200,24 @@ class BenchmarkRun:
     real_time_factor: float
     compute_ms: float | None
     error: str | None
+    # Missing trace data (including old reports) must not look like zero errors.
+    guard_rejections: int | None = None
+    action_attempts: int | None = None
+    action_rejections: int | None = None
+    action_failures: int | None = None
+    fallbacks: int | None = None
+    route_change_requests: int | None = None
+    unchanged_route_requests: int | None = None
+    native_route_applications: int | None = None
+    native_route_failures: int | None = None
+    applied_route_changes: int | None = None
+    applied_unchanged_routes: int | None = None
+    route_overlap_ratio: float | None = None
+    route_reversals: int | None = None
+    source_revision: str | None = None
+    scenario_revision: str | None = None
+    resolved_road_controls: list[dict] = field(default_factory=list)
+    custom_decisions: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -159,6 +245,19 @@ class BenchmarkAggregate:
     model_latency_ms: MetricSummary | None
     model_cost_usd: MetricSummary | None
     real_time_factor: MetricSummary | None
+    guard_rejections: MetricSummary | None = None
+    action_attempts: MetricSummary | None = None
+    action_rejections: MetricSummary | None = None
+    action_failures: MetricSummary | None = None
+    fallbacks: MetricSummary | None = None
+    route_change_requests: MetricSummary | None = None
+    unchanged_route_requests: MetricSummary | None = None
+    native_route_applications: MetricSummary | None = None
+    native_route_failures: MetricSummary | None = None
+    applied_route_changes: MetricSummary | None = None
+    applied_unchanged_routes: MetricSummary | None = None
+    route_overlap_ratio: MetricSummary | None = None
+    route_reversals: MetricSummary | None = None
 
 
 @dataclass
@@ -209,6 +308,45 @@ def _congestion_exposure(trace: EpisodeTrace, threshold_mps: float) -> float:
 def _number(payload: dict, key: str) -> float | None:
     value = payload.get(key)
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _native_route_metrics(trace: EpisodeTrace) -> dict:
+    """Use application records, never the policy's accepted-request counters."""
+    unknown = dict.fromkeys((
+        "native_route_applications", "native_route_failures", "applied_route_changes",
+        "applied_unchanged_routes", "route_overlap_ratio", "route_reversals",
+    ))
+    playback = (trace.environment_result or {}).get("playback")
+    if not isinstance(playback, dict) or type(playback.get("route_comparison_version")) is not int \
+            or playback["route_comparison_version"] != 1:
+        return unknown
+    records = playback.get("reroutes")
+    if not isinstance(records, list) or any(
+        not isinstance(item, dict) or type(item.get("success")) is not bool
+        or type(item.get("vehicle_id")) is not int for item in records
+    ):
+        return unknown
+    vehicle_id = trace.final_observation.vehicle_id if trace.final_observation else 0
+    records = [item for item in records if item["vehicle_id"] == vehicle_id]
+    applied = [item for item in records if item["success"]]
+    metrics = {**unknown, "native_route_applications": len(applied),
+               "native_route_failures": len(records) - len(applied)}
+    if any(type(item.get("route_changed")) is not bool
+           or type(item.get("remaining_overlap_ratio")) not in (int, float)
+           or not math.isfinite(item["remaining_overlap_ratio"])
+           or not 0 <= item["remaining_overlap_ratio"] <= 1 for item in applied):
+        return metrics
+    changed = sum(item["route_changed"] for item in applied)
+    reversals = None
+    if type(playback.get("route_reversal_version")) is int and playback["route_reversal_version"] == 1 \
+            and all(type(item.get("route_reversed")) is bool
+                    and (not item["route_reversed"] or item["route_changed"]) for item in applied):
+        reversals = sum(item["route_reversed"] for item in applied)
+    return {**metrics, "applied_route_changes": changed,
+            "applied_unchanged_routes": len(applied) - changed,
+            "route_reversals": reversals,
+            "route_overlap_ratio": statistics.fmean(
+                item["remaining_overlap_ratio"] for item in applied) if applied else None}
 
 
 def _run_result(
@@ -269,6 +407,14 @@ def _run_result(
             simulation_time / trace.wall_seconds if trace.wall_seconds > 0 else 0.0),
         compute_ms=_number(summary, "computeMs"),
         error=trace.error or trace.result_error,
+        guard_rejections=trace.guard_rejections,
+        action_attempts=trace.action_attempts,
+        action_rejections=trace.action_rejections,
+        action_failures=trace.action_failures,
+        fallbacks=trace.fallbacks,
+        route_change_requests=trace.route_change_requests,
+        unchanged_route_requests=trace.unchanged_route_requests,
+        **_native_route_metrics(trace),
     )
 
 
@@ -366,6 +512,13 @@ def aggregate_runs(runs: list[BenchmarkRun]) -> list[BenchmarkAggregate]:
             model_latency_ms=_metric([run.model_latency_ms for run in group]),
             model_cost_usd=_metric([run.model_cost_usd for run in group]),
             real_time_factor=_metric([run.real_time_factor for run in group]),
+            **{name: _metric([getattr(run, name) for run in group]) for name in (
+                "guard_rejections", "action_attempts", "action_rejections",
+                "action_failures", "fallbacks", "route_change_requests",
+                "unchanged_route_requests",
+                "native_route_applications", "native_route_failures", "applied_route_changes",
+                "applied_unchanged_routes", "route_overlap_ratio", "route_reversals",
+            )},
         ))
     return aggregates
 
@@ -396,7 +549,7 @@ def run_benchmark(
                 run_id = (
                     f"{manifest.name}:{scenario_spec.scenario_id}:"
                     f"{strategy.strategy_id}:{repetition}")
-                scenario = scenario_spec.to_scenario(strategy.algorithm)
+                scenario = scenario_spec.to_scenario(strategy.algorithm, repetition)
                 if strategy.kind == "fixed":
                     policy = FixedRoutePolicy()
                     # The environment computes the initial route with the
@@ -412,17 +565,17 @@ def run_benchmark(
                     policy = RulePolicy()
                     algorithm_ids = None
                     provider = model if strategy.kind == "model_agent" else None
+                trace = None
                 try:
                     with client_factory(scenario.map_id) as client:
-                        trace = run_episode(
-                            client,
-                            scenario,
-                            policy,
-                            model=provider,
-                            algorithm_ids=algorithm_ids,
-                            collect_result=True,
-                            should_cancel=should_cancel,
-                        )
+                        if strategy.kind == "custom_code":
+                            from zeus_agent.custom_episode import run_custom_episode
+                            trace = run_custom_episode(client, scenario, strategy.source,
+                                                       strategy.steps, should_cancel)
+                        else:
+                            trace = run_episode(client, scenario, policy, model=provider,
+                                algorithm_ids=algorithm_ids, collect_result=True,
+                                should_cancel=should_cancel)
                     result = _run_result(
                         run_id, scenario_spec.scenario_id, strategy, repetition,
                         scenario_spec, trace,
@@ -434,6 +587,12 @@ def run_benchmark(
                     result = _failed_run(
                         run_id, scenario_spec.scenario_id, strategy, repetition,
                         scenario_spec.seed, error)
+                result.seed = scenario_spec.seed + repetition - 1 if scenario_spec.random_events else scenario_spec.seed
+                result.source_revision = hashlib.sha256(strategy.source.encode()).hexdigest() if strategy.source else None
+                result.scenario_revision = hashlib.sha256(scenario_spec.model_dump_json(by_alias=True).encode()).hexdigest()
+                result.resolved_road_controls = [event.model_dump(by_alias=True) for event in scenario.road_controls]
+                if trace is not None and strategy.kind == "custom_code":
+                    result.custom_decisions = trace.custom_decisions
                 runs.append(result)
                 if progress:
                     progress(index, total, result)
@@ -445,7 +604,7 @@ def run_benchmark(
         if cancelled:
             break
     return BenchmarkReport(
-        format_version=1,
+        format_version=5,
         name=manifest.name,
         manifest=manifest.model_dump(by_alias=True, mode="json"),
         started_at=started_at,
@@ -472,7 +631,8 @@ def export_report(
         return
     csv_file = Path(csv_path)
     csv_file.parent.mkdir(parents=True, exist_ok=True)
-    rows = [asdict(run) for run in report.runs]
+    rows = [{key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+             for key, value in asdict(run).items()} for run in report.runs]
     with csv_file.open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=list(rows[0]) if rows else [])
         if rows:

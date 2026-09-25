@@ -33,6 +33,7 @@ const DEFAULT_ORIGIN: [number, number] = [114.4911555, 30.9567005]
 const DEFAULT_DESTINATION: [number, number] = [114.8064655, 30.8130008]
 
 const STRATEGIES: StrategyDraft[] = [
+  { id: 'custom-code', kind: 'custom_code', algorithm: 'astar', enabled: false, label: '自定义代码', note: '逐个事件执行 route(ctx)', source: '', steps: 5000000 },
   { id: 'fixed-astar', kind: 'fixed', algorithm: 'astar', enabled: true, label: '固定算法', note: '仅初始规划，不动态切换' },
   { id: 'reactive-astar', kind: 'reactive', algorithm: 'astar', enabled: true, label: '反应式算法', note: '路线失效后使用单算法' },
   { id: 'rule-agent', kind: 'rule_agent', algorithm: 'astar', enabled: true, label: '规则 Agent', note: '比较完整工具注册表' },
@@ -101,7 +102,7 @@ export function BenchmarkComposer({
   const totalRuns = scenarios.length * enabledStrategies.length * repetitions
   const valid = Boolean(
     serviceOnline && name.trim() && scenario && scenarios.every((item) => item.mapId)
-    && enabledStrategies.length && repetitions > 0,
+    && enabledStrategies.length && enabledStrategies.every(item => item.kind !== 'custom_code' || item.source?.trim()) && repetitions > 0,
   )
 
   const selectedMapName = useMemo(() => (
@@ -162,7 +163,7 @@ export function BenchmarkComposer({
       modelInputUsdPerMillionTokens: inputPrice,
       modelOutputUsdPerMillionTokens: outputPrice,
       scenarios,
-      strategies: enabledStrategies.map(({ id, kind, algorithm }) => ({ id, kind, algorithm })),
+      strategies: enabledStrategies.map(({ id, kind, algorithm, source, steps }) => ({ id, kind, algorithm, ...(kind === 'custom_code' ? { source, steps } : {}) })),
     }).catch(() => undefined)
   }
 
@@ -228,9 +229,29 @@ export function BenchmarkComposer({
               <NumberField label="步长 s" value={scenario.stepSeconds} min={0.01} step={0.1} onChange={(value) => updateScenario({ stepSeconds: value })} />
               <NumberField label="采样间隔 s" value={scenario.sampleIntervalSeconds} min={0.1} onChange={(value) => updateScenario({ sampleIntervalSeconds: value })} />
               <NumberField label="重规划间隔 s" value={scenario.rerouteIntervalSeconds} min={0} onChange={(value) => updateScenario({ rerouteIntervalSeconds: value })} />
+              <NumberField label="恢复扫描 s（0 关闭）" value={scenario.rerouteRecoveryIntervalSeconds ?? 0} min={0} onChange={(value) => updateScenario({ rerouteRecoveryIntervalSeconds: value })} />
+              <NumberField label="原生换路最少节省 s" value={scenario.rerouteMinGainSeconds ?? 0} min={0} onChange={(value) => updateScenario({ rerouteMinGainSeconds: value })} />
+              <NumberField label="原生换路冷却 s" value={scenario.rerouteCooldownSeconds ?? 0} min={0} onChange={(value) => updateScenario({ rerouteCooldownSeconds: value })} />
               <NumberField label="重规划代价比" value={scenario.rerouteCostRatio} min={1.01} step={0.01} onChange={(value) => updateScenario({ rerouteCostRatio: value })} />
               <NumberField label="最大决策数" value={scenario.maxDecisions} min={1} onChange={(value) => updateScenario({ maxDecisions: value })} />
             </div>
+          </details>
+
+          <details className="bench-advanced">
+            <summary>种子随机道路事件</summary>
+            <label><input type="checkbox" checked={Boolean(scenario.randomEvents)} onChange={event => updateScenario({ randomEvents: event.target.checked ? { edgeIds: [], count: 1, startSeconds: 30, endSeconds: 300, durationSeconds: 60, action: 'close', value: .5 } : null })} /> 为每轮生成事件</label>
+            {scenario.randomEvents && <>
+              <label className="bench-field"><span>候选 Edge IDs（逗号分隔）</span><input key={scenario.id} defaultValue={scenario.randomEvents.edgeIds.join(',')} onChange={event => updateScenario({ randomEvents: { ...scenario.randomEvents!, edgeIds: event.target.value.split(',').map(v => v.trim()).filter(Boolean).map(Number) } })} /></label>
+              <div className="bench-grid-2">
+                <NumberField label="事件数" min={1} value={scenario.randomEvents.count} onChange={count => updateScenario({ randomEvents: { ...scenario.randomEvents!, count } })} />
+                <NumberField label="最早发生 s" min={0} value={scenario.randomEvents.startSeconds} onChange={startSeconds => updateScenario({ randomEvents: { ...scenario.randomEvents!, startSeconds } })} />
+                <NumberField label="最晚发生 s" min={0} value={scenario.randomEvents.endSeconds} onChange={endSeconds => updateScenario({ randomEvents: { ...scenario.randomEvents!, endSeconds } })} />
+                <NumberField label="持续 s" min={1} value={scenario.randomEvents.durationSeconds} onChange={durationSeconds => updateScenario({ randomEvents: { ...scenario.randomEvents!, durationSeconds } })} />
+                <label className="bench-field"><span>事件类型</span><select value={scenario.randomEvents.action} onChange={event => updateScenario({ randomEvents: { ...scenario.randomEvents!, action: event.target.value as 'close' | 'speedFactor' } })}><option value="close">封路</option><option value="speedFactor">降速</option></select></label>
+                <NumberField label="速度比例" min={.05} step={.05} value={scenario.randomEvents.value} onChange={value => updateScenario({ randomEvents: { ...scenario.randomEvents!, value } })} />
+              </div>
+              <p>种子按重复轮次递增，同轮所有策略共享事件。候选道路不可与手动事件重叠。</p>
+            </>}
           </details>
 
           <div className="bench-event-group">
@@ -272,6 +293,11 @@ export function BenchmarkComposer({
             </select>
           </article>)}
         </div>
+        {strategies.filter(item => item.enabled && item.kind === 'custom_code').map(strategy => <div key={strategy.id}>
+          <label className="bench-field"><span>route(ctx) 源码</span><textarea rows={14} spellCheck={false} value={strategy.source ?? ''} onChange={event => setStrategies(current => current.map(item => item.kind === 'custom_code' ? { ...item, source: event.target.value } : item))} /></label>
+          <button type="button" onClick={() => { const source = localStorage.getItem('zeus.algorithm.draft.v1'); if (source) setStrategies(current => current.map(item => item.kind === 'custom_code' ? { ...item, source } : item)) }}>载入算法草稿</button>
+          <p>提交时固化源码，每次决策均保存路径校验和动作应用记录。</p>
+        </div>)}
       </section>
 
       <details className="bench-pricing">

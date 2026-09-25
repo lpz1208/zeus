@@ -53,6 +53,11 @@ class EpisodeTrace:
     keeps: int = 0
     guard_rejections: int = 0
     fallbacks: int = 0
+    action_attempts: int = 0
+    action_rejections: int = 0
+    action_failures: int = 0
+    route_change_requests: int = 0
+    unchanged_route_requests: int = 0
     route_invalidated_events: int = 0
     arrived: bool = False
     finished: bool = False
@@ -74,6 +79,7 @@ class EpisodeTrace:
     error: str | None = None
     environment_result: dict | None = None
     result_error: str | None = None
+    custom_decisions: list[dict] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -110,6 +116,9 @@ class Scenario:
     algorithm: str = "astar"
     reroute_interval_seconds: float = 30.0
     reroute_cost_ratio: float = 1.25
+    reroute_recovery_interval_seconds: float = 0.0
+    reroute_min_gain_seconds: float = 0.0
+    reroute_cooldown_seconds: float = 0.0
     sample_interval_seconds: float = 10.0
     road_controls: tuple[RoadControl, ...] = ()
     vehicle_controls: tuple[VehicleControl, ...] = ()
@@ -168,6 +177,9 @@ def run_episode(
         sample_interval_seconds=scenario.sample_interval_seconds,
         reroute_interval_seconds=scenario.reroute_interval_seconds,
         reroute_cost_ratio=scenario.reroute_cost_ratio,
+        reroute_recovery_interval_seconds=scenario.reroute_recovery_interval_seconds,
+        reroute_min_gain_seconds=scenario.reroute_min_gain_seconds,
+        reroute_cooldown_seconds=scenario.reroute_cooldown_seconds,
         road_controls=list(scenario.road_controls),
         vehicle_controls=list(scenario.vehicle_controls),
     )
@@ -383,6 +395,11 @@ def _populate_trace(trace: EpisodeTrace, state: dict) -> None:
         0, trace.decisions - trace.commits - state.get("fallbacks", 0))
     trace.guard_rejections = state.get("guard_rejections", 0)
     trace.fallbacks = state.get("fallbacks", 0)
+    trace.action_attempts = state.get("action_attempts", 0)
+    trace.action_rejections = state.get("action_rejections", 0)
+    trace.action_failures = state.get("action_failures", 0)
+    trace.route_change_requests = state.get("route_change_requests", 0)
+    trace.unchanged_route_requests = state.get("unchanged_route_requests", 0)
     trace.route_invalidated_events = state.get("route_invalidated_events", 0)
     trace.error = state.get("action_error")
     trace.model_name = state.get("model_name", "")

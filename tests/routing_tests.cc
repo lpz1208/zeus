@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,6 +17,7 @@
 #include "zeus/map/types.h"
 #include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
+#include "zeus/routing/algorithm_lab.h"
 
 namespace {
 
@@ -147,11 +149,7 @@ void runRoutingOverlayTest() {
         std::vector<double> factors(fixture.data.edges.size(), 1.0);
         const zeus::routing::RoutingOverlay overlay{enabled, factors};
 
-        const std::vector<zeus::routing::Algorithm> algorithms = turn_aware
-            ? std::vector<zeus::routing::Algorithm>{
-                  zeus::routing::Algorithm::kDijkstra,
-                  zeus::routing::Algorithm::kAStar}
-            : std::vector<zeus::routing::Algorithm>{
+        const std::vector<zeus::routing::Algorithm> algorithms = {
                   zeus::routing::Algorithm::kDijkstra,
                   zeus::routing::Algorithm::kAStar,
                   zeus::routing::Algorithm::kBidirectionalDijkstra,
@@ -582,6 +580,8 @@ void runTurnRestrictionTest() {
         const auto result = setup.planner->plan(
             makeRequest({-90.0, 1.0}, {190.0, 1.0}, algorithm));
         require(result.ok, "turn-restricted route succeeds for every algorithm selection");
+        require(result.effective_algorithm == algorithm,
+                "turn-restricted bidirectional requests execute without downgrade");
         require(result.path.edges == std::vector<zeus::map::EdgeIndex>({0, 2, 3, 4}),
                 "prohibited straight transition forces the legal detour");
     }
@@ -597,6 +597,83 @@ void runTurnPenaltyTest() {
             "a sufficiently expensive straight turn changes the chosen route");
     require(near(result.stats.time_s, (90.0 + 100.0 + std::sqrt(20000.0) + 90.0) / 20.0),
             "turn-aware result reports the legal detour travel time");
+}
+
+void runTurnBidirectionalDifferentialTest() {
+    using namespace zeus::routing;
+    std::mt19937 random(20260925);
+    for (int scenario = 0; scenario < 12; ++scenario) {
+        Fixture fixture;
+        for (int y = 0; y < 5; ++y)
+            for (int x = 0; x < 5; ++x) fixture.addNode(x * 100, y * 100);
+        for (std::uint32_t node = 0; node < 25; ++node) {
+            for (const int delta : {1, 5}) {
+                if ((delta == 1 && node % 5 == 4) || node + delta >= 25) continue;
+                fixture.addEdge(node, node + delta, 5 + random() % 20);
+                fixture.addEdge(node + delta, node, 5 + random() % 20);
+            }
+        }
+        const auto count = fixture.data.edges.size();
+        for (std::size_t from = 0; from < count; ++from) {
+            for (std::size_t to = 0; to < count; ++to) {
+                if (fixture.data.edges[from].to != fixture.data.edges[to].from) continue;
+                const auto value = random() % 5;
+                if (value <= 1) fixture.addTurn(from, to, value == 0, value == 1 ? random() % 25 : 0);
+            }
+        }
+        PlanSetup setup(fixture.data);
+        for (int sample = 0; sample < 50; ++sample) {
+            std::vector<std::uint8_t> enabled(count, 1);
+            std::vector<double> factors(count, 1);
+            for (std::size_t edge = 0; edge < count; ++edge) {
+                enabled[edge] = random() % 10 != 0;
+                factors[edge] = 1.0 + (random() % 20) / 10.0;
+            }
+            const auto start = static_cast<zeus::map::EdgeIndex>(random() % count);
+            const auto goal = static_cast<zeus::map::EdgeIndex>(random() % count);
+            enabled[goal] = 1;
+            RoutingOverlay overlay{enabled, factors};
+            auto request = makeRequest({0, 0}, {400, 400});
+            request.overlay = &overlay;
+            if (sample % 3 != 0) {
+                request.origin_position = RoutePosition{start, static_cast<double>(random() % 101)};
+                request.destination_position = RoutePosition{goal, static_cast<double>(random() % 101)};
+            } else {
+                // Exercise both matched directed twins and multi-source/goal labels.
+                const auto& a = fixture.data.nodes[fixture.data.edges[start].from].point;
+                const auto& b = fixture.data.nodes[fixture.data.edges[start].to].point;
+                const auto& c = fixture.data.nodes[fixture.data.edges[goal].from].point;
+                const auto& d = fixture.data.nodes[fixture.data.edges[goal].to].point;
+                request.origin = {(a.x + b.x) / 2, (a.y + b.y) / 2};
+                request.destination = {(c.x + d.x) / 2, (c.y + d.y) / 2};
+            }
+            const auto reference = setup.planner->plan(request);
+            for (const auto algorithm : {Algorithm::kBidirectionalDijkstra, Algorithm::kBidirectionalAStar}) {
+                request.algorithm = algorithm;
+                request.record_trace = true;
+                const auto actual = setup.planner->plan(request);
+                const auto label = std::to_string(scenario) + "/" + std::to_string(sample) + "/" + algorithmName(algorithm);
+                require(actual.ok == reference.ok, "bidirectional turn reachability " + label);
+                if (!actual.ok) continue;
+                require(actual.effective_algorithm == algorithm, "bidirectional execution metadata " + label);
+                require(near(actual.stats.time_s, reference.stats.time_s, 1e-6),
+                        "bidirectional optimal cost " + label + " expected=" + std::to_string(reference.stats.time_s) +
+                        " actual=" + std::to_string(actual.stats.time_s));
+                require(actual.stats.expanded_nodes == 0 || !actual.search_trace.empty(),
+                        "turn-aware bidirectional search preserves settle trace");
+                double time = 0;
+                for (std::size_t i = 0; i < actual.path.edges.size(); ++i) {
+                    const auto edge = actual.path.edges[i];
+                    require(i == 0 || enabled[edge], "route never re-enters a closed edge");
+                    if (i > 0) time += setup.runtime->turnPenaltySeconds(actual.path.edges[i - 1], edge);
+                    const double begin = i == 0 ? actual.path.start_offset_m : 0;
+                    const double end = i + 1 == actual.path.edges.size() ? actual.path.end_offset_m : fixture.data.edges[edge].length_m;
+                    time += (end - begin) / fixture.data.edges[edge].speed_limit_mps * factors[edge];
+                }
+                require(near(time, actual.stats.time_s, 1e-6), "returned path has legal turns and exact reported cost " + label);
+            }
+        }
+    }
 }
 
 void runAlgorithmCapabilityRegistryTest() {
@@ -744,6 +821,52 @@ void runKShortestTest() {
     }
 }
 
+void runAlgorithmLabTest() {
+    Fixture fixture;
+    auto a = fixture.addNode(0, 0), b = fixture.addNode(100, 0);
+    auto c = fixture.addNode(200, 0), d = fixture.addNode(100, 100);
+    fixture.addEdge(a, b, 10, 10);
+    fixture.addEdge(b, c, 10, 11);
+    fixture.addEdge(b, d, 10, 12);
+    fixture.addEdge(d, b, 10, 13);
+    fixture.addTurn(0, 1, false, 7);
+    PlanSetup setup(fixture.data);
+    auto request = makeRequest({25,0}, {150,0}, zeus::routing::Algorithm::kDijkstra);
+    request.origin_position = zeus::routing::RoutePosition{0,25};
+    request.destination_position = zeus::routing::RoutePosition{1,50};
+    zeus::routing::AlgorithmLab lab(*setup.runtime, request);
+    auto route = lab.validate({-1,0,-2});
+    require(near(route.stats.time_s,19.5), "lab includes partial edges and turn penalty");
+    require(near(route.stats.time_s, lab.baseline().stats.time_s), "lab matches authoritative baseline");
+    require(near(route.path.start_offset_m,25) && near(route.path.end_offset_m,50), "lab preserves endpoint offsets");
+    for (auto states : std::vector<std::vector<int>>{{-1,-2},{-1,2,-2},{-1,999,-2},{0,-2},{-1,0}}) {
+        bool rejected = false;
+        try { (void)lab.validate(states); } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "lab rejects malformed, disconnected or unknown routes");
+    }
+    fixture.data.turn_transitions.clear();
+    fixture.addTurn(0,1,true);
+    PlanSetup forbidden(fixture.data);
+    zeus::routing::AlgorithmLab restricted(*forbidden.runtime, request);
+    bool rejected = false;
+    try { (void)restricted.validate({-1,0,-2}); } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "lab rejects forbidden turn into destination");
+    route = restricted.validate({-1,0,2,3,-2});
+    require(near(route.stats.time_s,32.5), "lab accepts legal detour around turn restriction");
+    require(near(route.stats.time_s,restricted.baseline().stats.time_s), "detour agrees with Dijkstra");
+    std::vector<std::uint8_t> enabled{1,1,0,1};
+    zeus::routing::RoutingOverlay overlay{enabled,{}};
+    request.overlay = &overlay;
+    zeus::routing::AlgorithmLab closed(*forbidden.runtime,request);
+    require(!closed.baseline().ok, "closed detour is unreachable");
+    require(closed.neighbors(0).empty(), "closed and forbidden transitions omitted");
+    request.overlay = nullptr;
+    request.destination_position = zeus::routing::RoutePosition{0,75};
+    zeus::routing::AlgorithmLab direct(*setup.runtime,request);
+    route = direct.validate({-1,-2});
+    require(near(route.stats.time_s,5) && route.path.edges.size()==1, "same edge direct path is sliced once");
+}
+
 }  // namespace
 
 int main() {
@@ -764,9 +887,11 @@ int main() {
         runBidirectionalTwinTest();
         runBidirectionalDeterminismTest();
         runTurnRestrictionTest();
+        runTurnBidirectionalDifferentialTest();
         runTurnPenaltyTest();
         runAlgorithmCapabilityRegistryTest();
         runKShortestTest();
+        runAlgorithmLabTest();
         std::cout << "all routing tests passed\n";
         return 0;
     } catch (const std::exception& error) {

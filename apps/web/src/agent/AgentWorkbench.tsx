@@ -55,6 +55,7 @@ export function AgentWorkbench({
 
   const selectedRoute = useMemo<RouteGeoJSON | null>(() => {
     const candidate = agent.candidates.find((item) => item.candidateId === agent.selectedCandidate)
+    if (candidate?.geojson) return candidate.geojson
     if (candidate?.edges) return routeForEdges(data, candidate.edges)
     if (agent.session) return routeForEdges(data, agent.observation?.remainingEdgeIds)
     return agent.previewRoute
@@ -68,12 +69,12 @@ export function AgentWorkbench({
       .filter((item) => item.ok && item.edges?.length &&
         item.candidateId !== agent.selectedCandidate)
       .slice(0, 6)
-      .flatMap((item) => routeForEdges(data, item.edges)?.features ?? [])
+      .flatMap((item) => item.geojson?.features ?? routeForEdges(data, item.edges)?.features ?? [])
     return features.length ? { type: 'FeatureCollection', features } : null
   }, [agent.candidates, agent.selectedCandidate, data])
 
   return (
-    <main className="agent-shell">
+    <main className={`agent-shell${agent.tab === 'code' ? ' is-code' : ''}`}>
       <header className="agent-topbar">
         <button className="agent-back" type="button" onClick={onExit}>
           <ArrowLeft size={15} /> 地图工作台

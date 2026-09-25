@@ -1,6 +1,6 @@
 .PHONY: build build-map build-server build-web test test-proto run clean \
 	run-control agent-runtime-setup agent-runtime-test agent-runtime-e2e \
-	agent-benchmark-service
+	agent-benchmark-service algorithm-e2e
 
 build: build-map build-server build-web
 
@@ -25,7 +25,11 @@ test: build-map test-proto
 	ctest --test-dir build --output-on-failure
 	cd apps/control-server && GOCACHE=$(CURDIR)/.cache/go-build go test ./...
 	npm --prefix apps/web run typecheck
+	npm --prefix apps/web run test:navigation
 	cd apps/agent-runtime && UV_CACHE_DIR=$(CURDIR)/.cache/uv uv run pytest -q
+
+algorithm-e2e: build-map build-server
+	node --experimental-strip-types scripts/algorithm-e2e.mjs $(E2E_ARGS)
 
 agent-runtime-setup:
 	cd apps/agent-runtime && UV_CACHE_DIR=$(CURDIR)/.cache/uv uv sync
