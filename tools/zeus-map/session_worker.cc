@@ -17,10 +17,12 @@
 #include <vector>
 
 #include "zeus/routing/kshortest.h"
+#include "zeus/routing/incremental_search.h"
 #include "zeus/routing/algorithm_lab.h"
 #include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
 #include "zeus/simulation/playback_exporter.h"
+#include "zeus/simulation/routing_forecast.h"
 #include "zeus/simulation/simulation_engine.h"
 #include "zeus/simulation/simulation_session.h"
 
@@ -119,6 +121,7 @@ struct AppliedAction {
 struct WorkerSession {
     std::unique_ptr<zeus::simulation::SimulationSession> session;
     std::map<std::string, Candidate> candidates;
+    zeus::routing::SpeedSchedule speed_schedule;
     std::uint64_t next_candidate = 1;
     zeus::simulation::SimulationConfig config;
     std::vector<zeus::simulation::VehicleDemand> demands;
@@ -339,6 +342,7 @@ private:
         entry->config = config;
         entry->demands = demands;
         entry->controls = controls;
+        entry->speed_schedule = zeus::simulation::routingSpeedSchedule(runtime_.data().edges.size(), controls, config.step_seconds);
         entry->signals = signals;
 
         out << "{\"sessionId\": " << jsonString(session_id)
@@ -360,6 +364,7 @@ private:
             }
         }
         out << "]}";
+        clearRepairs(session_id);
         sessions_[session_id] = std::move(entry);
         return 0;
     }
@@ -658,6 +663,12 @@ private:
         request.destination = entry.demands[vehicle_id].destination;
         request.algorithm = algorithm;
         request.overlay = &overlay;
+        if (algorithm == zeus::routing::Algorithm::kTimeDependent) {
+            request.speed_schedule = &entry.speed_schedule;
+            request.departure_time_s = std::max(state.simulation_time_s,
+                zeus::simulation::routingDepartureTime(entry.demands[vehicle_id].depart_time_s, entry.config.step_seconds));
+            request.cost_reference_time_s = (state.tick > 0 ? state.tick - 1 : 0) * entry.config.step_seconds;
+        }
         request.k_paths = k_paths;
         request.record_trace = record_trace;
         request.destination_position = zeus::routing::RoutePosition{
@@ -666,8 +677,32 @@ private:
             request.origin_position =
                 zeus::routing::RoutePosition{agent->edge, agent->offset_s};
         }
-        const zeus::routing::RouteResult planned = planner_.plan(request);
+        zeus::routing::IncrementalSearch* repair = nullptr;
+        if (zeus::routing::isIncremental(algorithm)) {
+            const auto key = std::make_pair(fields[1], vehicle_id);
+            auto found = repairs_.find(key);
+            if (found == repairs_.end()) {
+                // Bound retained graph labels to four vehicle contexts per worker.
+                if (repairs_.size() >= 4) {
+                    const auto oldest = std::min_element(repairs_.begin(), repairs_.end(),
+                        [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
+                    repairs_.erase(oldest);
+                }
+                found = repairs_.emplace(key, RepairContext{
+                    std::make_unique<zeus::routing::IncrementalSearch>(runtime_), 0}).first;
+            }
+            found->second.used = ++repair_clock_;
+            repair = found->second.search.get();
+        }
+        const zeus::routing::RouteResult planned = planner_.plan(request, repair);
 
+        std::erase_if(entry.candidates, [version = state.state_version](const auto& item) {
+            return item.second.based_on_state_version != version;
+        });
+        if (entry.candidates.size() + std::max<std::size_t>(1, planned.alternatives.size()) > 128)
+            throw std::invalid_argument("candidate limit reached");
+        if ((zeus::routing::isIncremental(algorithm) || algorithm == zeus::routing::Algorithm::kTimeDependent || algorithm == zeus::routing::Algorithm::kAlt || algorithm == zeus::routing::Algorithm::kCH) && planned.path.edges.size() > 9999)
+            throw std::invalid_argument("exact candidate exceeds 9999 edges");
         const std::string candidate_id = "cand-" + std::to_string(entry.next_candidate++);
         out << "{\"candidateId\": " << jsonString(candidate_id)
             << ", \"vehicleId\": " << vehicle_id
@@ -685,13 +720,36 @@ private:
         candidate.time_s = planned.stats.time_s;
         candidate.length_m = planned.stats.length_m;
         candidate.edges = planned.path.edges;
+        // Persist the selected path; application/replay must not depend on
+        // whether a warm search context is still resident.
+        if (zeus::routing::isIncremental(algorithm) || algorithm == zeus::routing::Algorithm::kTimeDependent || algorithm == zeus::routing::Algorithm::kAlt || algorithm == zeus::routing::Algorithm::kCH) candidate.exact_path = planned.path;
         entry.candidates[candidate_id] = candidate;
+        if (algorithm == zeus::routing::Algorithm::kCH) {
+            out << ", \"chShortcuts\": " << planned.stats.ch_shortcuts
+                << ", \"chCoreStates\": " << planned.stats.ch_core_states
+                << ", \"chBytes\": " << planned.stats.ch_bytes
+                << ", \"chPreprocessMs\": " << jsonNumber(planned.stats.ch_preprocess_ms)
+                << ", \"chReused\": " << (planned.stats.ch_reused ? "true" : "false")
+                << ", \"fallbackReason\": " << jsonString(planned.stats.fallback_reason);
+        }
+        if (algorithm == zeus::routing::Algorithm::kAlt) {
+            out << ", \"landmarkCount\": " << planned.stats.landmark_count
+                << ", \"landmarkBytes\": " << planned.stats.landmark_bytes
+                << ", \"landmarkPreprocessMs\": " << jsonNumber(planned.stats.landmark_preprocess_ms)
+                << ", \"landmarkReused\": " << (planned.stats.landmark_reused ? "true" : "false");
+        }
+        if (algorithm == zeus::routing::Algorithm::kTimeDependent) {
+            out << ", \"departureTimeSeconds\": " << jsonNumber(request.departure_time_s)
+                << ", \"arrivalTimeSeconds\": " << jsonNumber(request.departure_time_s + planned.stats.time_s);
+        }
         out << ", \"effectiveAlgorithm\": "
             << jsonString(zeus::routing::algorithmName(planned.effective_algorithm))
             << ", \"basedOnStateVersion\": " << state.state_version
             << ", \"ok\": true"
             << ", \"timeS\": " << jsonNumber(planned.stats.time_s)
             << ", \"lengthM\": " << jsonNumber(planned.stats.length_m)
+            << ", \"incrementalReused\": " << (planned.stats.incremental_reused ? "true" : "false")
+            << ", \"updatedEdges\": " << planned.stats.updated_edges
             << ", \"expandedNodes\": " << planned.stats.expanded_nodes
             << ", \"edges\": [";
         for (std::size_t i = 0; i < planned.path.edges.size(); ++i) {
@@ -1139,6 +1197,7 @@ private:
         entry->config = snapshot.config;
         entry->demands = snapshot.demands;
         entry->controls = snapshot.controls;
+        entry->speed_schedule = zeus::simulation::routingSpeedSchedule(runtime_.data().edges.size(), entry->controls, entry->config.step_seconds);
         entry->signals = snapshot.signals;
         entry->session = std::make_unique<zeus::simulation::SimulationSession>(
             engine_, entry->config, entry->demands, entry->controls, entry->signals);
@@ -1245,11 +1304,21 @@ private:
         }
         WorkerSession& entry = requireSession(fields[1]);
         entry.session->close();
+        clearRepairs(fields[1]);
         sessions_.erase(fields[1]);
         out << "{}";
         return 0;
     }
 
+    struct RepairContext {
+        std::unique_ptr<zeus::routing::IncrementalSearch> search;
+        std::uint64_t used;
+    };
+    void clearRepairs(const std::string& session) {
+        std::erase_if(repairs_, [&](const auto& entry) { return entry.first.first == session; });
+    }
+    std::map<std::pair<std::string, std::uint32_t>, RepairContext> repairs_;
+    std::uint64_t repair_clock_ = 0;
     const zeus::map::MapRuntime& runtime_;
     zeus::routing::RoutePlanner planner_;
     zeus::simulation::SimulationEngine engine_;

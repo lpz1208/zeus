@@ -8,6 +8,10 @@
 #include <utility>
 
 #include "zeus/routing/kshortest.h"
+#include "zeus/routing/incremental_search.h"
+#include "zeus/routing/time_dependent.h"
+#include "zeus/routing/landmarks.h"
+#include "zeus/routing/contraction_hierarchy.h"
 
 namespace zeus::routing {
 namespace {
@@ -86,7 +90,14 @@ zeus::map::EdgeIndex RoutePlanner::findTwin(zeus::map::EdgeIndex edge_index) con
     return found->second.front();
 }
 
-RouteResult RoutePlanner::plan(const RouteRequest& request) const {
+RouteResult RoutePlanner::plan(const RouteRequest& request, IncrementalSearch* incremental) const {
+    if (!std::isfinite(request.departure_time_s) || request.departure_time_s < 0 ||
+        !std::isfinite(request.cost_reference_time_s) || request.cost_reference_time_s < 0)
+        throw std::invalid_argument("route times must be finite and nonnegative");
+    if (request.speed_schedule && request.algorithm != Algorithm::kTimeDependent)
+        throw std::invalid_argument("speed schedule requires tddijkstra");
+    const SpeedSchedule empty_schedule;
+    const auto& schedule = request.speed_schedule ? *request.speed_schedule : empty_schedule;
     const auto start_time = std::chrono::steady_clock::now();
 
     RouteResult result;
@@ -244,7 +255,10 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
                 continue;
             }
             const double length = query.goals[g].offset_s - query.starts[s].offset_s;
-            const double time = length / std::max(
+            const double time = request.algorithm == Algorithm::kTimeDependent
+                ? schedule.duration(runtime_, query.starts[s].edge, length, request.departure_time_s,
+                    costFactor(query.starts[s].edge), request.cost_reference_time_s)
+                : length / std::max(
                                           kMinSpeedMps,
                                           static_cast<double>(
                                               runtime_.edge(query.starts[s].edge).speed_limit_mps)) *
@@ -320,7 +334,52 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
         return result;
     }
 
-    SearchOutput search = runtime_.hasTurnTransitions()
+    SearchOutput search;
+    if (request.algorithm == Algorithm::kCH) {
+        if (ContractionHierarchy::baseWeights(request.overlay)) {
+            bool built = false;
+            const auto begin = std::chrono::steady_clock::now();
+            std::call_once(ch_once_, [&] {
+                hierarchy_ = std::make_shared<const ContractionHierarchy>(runtime_);
+                built = true;
+            });
+            result.stats.ch_reused = !built && hierarchy_->available();
+            result.stats.ch_shortcuts = hierarchy_->shortcuts();
+            result.stats.ch_core_states = hierarchy_->coreStates();
+            result.stats.ch_bytes = hierarchy_->bytes();
+            if (built) result.stats.ch_preprocess_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+            if (hierarchy_->available()) search = hierarchy_->search(query, incoming_, direct.time_s);
+            else result.stats.fallback_reason = "ch_base_graph_budget";
+        } else result.stats.fallback_reason = "ch_dynamic_weights";
+        if (!result.stats.fallback_reason.empty()) {
+            result.effective_algorithm = Algorithm::kBidirectionalDijkstra;
+            query.algorithm = result.effective_algorithm;
+            search = runtime_.hasTurnTransitions()
+                ? runTurnAwareBidirectionalSearch(runtime_, incoming_, query, max_speed_mps_, direct.time_s)
+                : runBidirectionalSearch(runtime_, incoming_, query, max_speed_mps_, direct.time_s);
+        }
+    } else if (request.algorithm == Algorithm::kAlt) {
+        bool built = false;
+        const auto begin = std::chrono::steady_clock::now();
+        std::call_once(landmark_once_, [&] {
+            landmarks_ = std::make_shared<const LandmarkIndex>(runtime_, incoming_);
+            built = true;
+        });
+        result.stats.landmark_reused = !built;
+        result.stats.landmark_count = landmarks_->count();
+        result.stats.landmark_bytes = landmarks_->tableBytes();
+        if (built) result.stats.landmark_preprocess_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+        search = runAltSearch(runtime_, query, *landmarks_, direct.time_s);
+    } else if (request.algorithm == Algorithm::kTimeDependent) {
+        search = runTimeDependentSearch(runtime_, query, request, schedule, direct.time_s);
+    } else if (isIncremental(request.algorithm)) {
+        if (incremental && &incremental->runtime() != &runtime_)
+            throw std::invalid_argument("incremental context belongs to another map");
+        if (incremental) search = incremental->run(query);
+        else { IncrementalSearch cold(runtime_); search = cold.run(query); }
+    } else search = runtime_.hasTurnTransitions()
                                     ? (isBidirectional(request.algorithm)
                                           ? runTurnAwareBidirectionalSearch(
                                                 runtime_, incoming_, query, max_speed_mps_, direct.time_s)
@@ -334,6 +393,8 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
                                                 runtime_, query, max_speed_mps_,
                                                 direct.time_s);
 
+    result.stats.incremental_reused = search.incremental_reused;
+    result.stats.updated_edges = search.updated_edges;
     bool use_search = search.found && search.total_time_s < direct.time_s;
     if (!use_search && direct.time_s == kInfinity) {
         result.failure = RouteFailure::kUnreachable;
@@ -348,9 +409,9 @@ RouteResult RoutePlanner::plan(const RouteRequest& request) const {
         result.path.edges.push_back(start.edge);
         result.path.edges.insert(
             result.path.edges.end(), search.node_edges.begin(), search.node_edges.end());
-        if (goal.edge != start.edge || !search.node_edges.empty()) {
-            result.path.edges.push_back(goal.edge);
-        }
+        // A searched path traverses the final partial edge even when it is
+        // the origin self-loop again. Same-edge direct travel is handled below.
+        result.path.edges.push_back(goal.edge);
         result.path.start_offset_m = start.offset_s;
         result.path.end_offset_m = goal.offset_s;
         result.stats.time_s = search.total_time_s;

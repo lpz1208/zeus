@@ -7,6 +7,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
+import { formatCHStatus } from '../../agent/agentGeo'
 import type { MapLibraryApi } from '../../hooks/useMapLibrary'
 import { TracePanel } from '../../components/TracePanel'
 import type { RouteSimApi } from '../useRouteSimulation'
@@ -51,8 +52,21 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
             <option value="bidijkstra">BI-DIJKSTRA</option>
             <option value="biastar">BI-A*</option>
             <option value="kshortest">K-SHORTEST</option>
+            <option value="lpa">LPA*（单次搜索）</option>
+            <option value="dstar">D* Lite（单次搜索）</option>
+            <option value="tddijkstra">时间依赖 DIJKSTRA</option>
+            <option value="alt">ALT（地标 A*）</option>
+            <option value="ch">CH（收缩层级）</option>
           </select>
         </label>
+        {routeAlgorithm === 'tddijkstra' && (
+          <label className="wb-algo">
+            <span>预览出发秒</span>
+            <input className="wb-k-input wb-departure-input" type="number" min={0} max={1e9} step="any"
+              value={routeSim.routeDeparture}
+              onChange={event => routeSim.setRouteDeparture(Number(event.target.value))} />
+          </label>
+        )}
         {routeAlgorithm === 'kshortest' && (
           <label className="wb-algo" title="K 最短路候选条数（1-8）">
             <span>K</span>
@@ -72,6 +86,7 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
           </button>
         )}
       </div>
+      {routeAlgorithm === 'tddijkstra' && <p className="wb-forecast-note">使用场景中的道路变速事件预测通行时间；封路仍由仿真实时处理。</p>}
       {!activeMap ? (
         <div className="wb-route-state"><Route size={18} /><span>发布道路地图后可用路径规划。</span></div>
       ) : routeBusy ? (
@@ -83,6 +98,7 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
               <article><span>距离</span><strong>{(routeResult.lengthM / 1000).toFixed(2)}<small>km</small></strong></article>
               <article><span>预计时长</span><strong>{formatDuration(routeResult.timeS)}</strong></article>
               <article><span>扩展节点</span><strong>{formatNumber(routeResult.expandedNodes)}</strong></article>
+              {routeResult.algorithm === 'alt' && <article><span>地标预处理</span><strong>{routeResult.landmarkCount ?? 0}<small> 个 · {routeResult.landmarkReused ? '已复用' : `${(routeResult.landmarkPreprocessMs ?? 0).toFixed(1)} ms`}</small></strong></article>}
               <article><span>计算耗时</span><strong>{routeResult.computeMs.toFixed(1)}<small>ms</small></strong></article>
               <article><span>途经边</span><strong>{formatNumber(routeResult.edges)}</strong></article>
               <article>
@@ -94,6 +110,7 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
                 </strong>
               </article>
             </div>
+            {routeResult.algorithm === 'ch' && <p className="wb-forecast-note">{formatCHStatus(routeResult)}</p>}
             <div className="wb-snaps">
               <div className="wb-snap">
                 <span>起点吸附</span>

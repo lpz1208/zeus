@@ -269,13 +269,21 @@ var colorPattern = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 var issuePattern = regexp.MustCompile(`^issue=([^: ]+):([^ ]+) source=([^ ]+) location=([^,]+),([^ ]+) message="(.*)"$`)
 var matchPattern = regexp.MustCompile(`^match\[[0-9]+\]\.edge=([^ ]+) road_id=([^ ]+) source=([^ ]+) offset_s=([^ ]+) distance=([^ ]+) heading_delta=([^ ]+) confidence=([^ ]+) projected=([^,]+),([^ ]+)$`)
 
+type RouteSpeedChange struct {
+	EdgeID      uint32  `json:"edgeId"`
+	TimeSeconds float64 `json:"timeSeconds"`
+	SpeedFactor float64 `json:"speedFactor"`
+}
+
 type RouteRequest struct {
-	FromLon     *float64 `json:"fromLon"`
-	FromLat     *float64 `json:"fromLat"`
-	ToLon       *float64 `json:"toLon"`
-	ToLat       *float64 `json:"toLat"`
-	Algorithm   string   `json:"algorithm"`
-	MaxDistance float64  `json:"maxDistance"`
+	DepartureTimeSeconds float64            `json:"departureTimeSeconds"`
+	SpeedChanges         []RouteSpeedChange `json:"speedChanges,omitempty"`
+	FromLon              *float64           `json:"fromLon"`
+	FromLat              *float64           `json:"fromLat"`
+	ToLon                *float64           `json:"toLon"`
+	ToLat                *float64           `json:"toLat"`
+	Algorithm            string             `json:"algorithm"`
+	MaxDistance          float64            `json:"maxDistance"`
 	// KPaths requests k-shortest candidates (clamped to [1,8]); only the
 	// kshortest selection produces more than one alternative.
 	KPaths int `json:"kPaths"`
@@ -300,8 +308,20 @@ type RouteAlternative struct {
 }
 
 type RouteResponse struct {
-	OK        bool   `json:"ok"`
-	Algorithm string `json:"algorithm"`
+	CHShortcuts          int64    `json:"chShortcuts,omitempty"`
+	CHCoreStates         int64    `json:"chCoreStates,omitempty"`
+	CHBytes              int64    `json:"chBytes,omitempty"`
+	CHPreprocessMs       float64  `json:"chPreprocessMs,omitempty"`
+	CHReused             bool     `json:"chReused"`
+	FallbackReason       string   `json:"fallbackReason,omitempty"`
+	LandmarkCount        int      `json:"landmarkCount,omitempty"`
+	LandmarkBytes        int64    `json:"landmarkBytes,omitempty"`
+	LandmarkPreprocessMs float64  `json:"landmarkPreprocessMs,omitempty"`
+	LandmarkReused       bool     `json:"landmarkReused"`
+	DepartureTimeSeconds *float64 `json:"departureTimeSeconds,omitempty"`
+	ArrivalTimeSeconds   *float64 `json:"arrivalTimeSeconds,omitempty"`
+	OK                   bool     `json:"ok"`
+	Algorithm            string   `json:"algorithm"`
 	// EffectiveAlgorithm is what actually ran; bidirectional selections
 	// use restriction-safe edge-state search on turn-restricted maps.
 	EffectiveAlgorithm string          `json:"effectiveAlgorithm"`
@@ -1273,10 +1293,20 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	if algorithm != "dijkstra" && algorithm != "astar" &&
 		algorithm != "bidijkstra" && algorithm != "biastar" &&
-		algorithm != "kshortest" {
+		algorithm != "kshortest" && algorithm != "lpa" && algorithm != "dstar" && algorithm != "tddijkstra" && algorithm != "alt" && algorithm != "ch" {
 		writeError(w, http.StatusBadRequest,
-			"algorithm must be dijkstra, astar, bidijkstra, biastar or kshortest")
+			"algorithm must be dijkstra, astar, bidijkstra, biastar, kshortest, lpa, dstar, tddijkstra, alt or ch")
 		return
+	}
+	if err := validateTimeDependentRequest(algorithm, request.DepartureTimeSeconds, request.SpeedChanges); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for _, change := range request.SpeedChanges {
+		if record.Summary.DirectedEdges > 0 && uint64(change.EdgeID) >= uint64(record.Summary.DirectedEdges) {
+			writeError(w, http.StatusBadRequest, "speed change edge is outside map range")
+			return
+		}
 	}
 	maxDistance := request.MaxDistance
 	if maxDistance <= 0 {
@@ -1323,15 +1353,17 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	workerResult, err := s.routeWorkers.Route(r.Context(), record.Runtime, RouteWorkerRequest{
-		FromLon:     *request.FromLon,
-		FromLat:     *request.FromLat,
-		ToLon:       *request.ToLon,
-		ToLat:       *request.ToLat,
-		Algorithm:   algorithm,
-		MaxDistance: maxDistance,
-		OutputPath:  outputPath,
-		KPaths:      kPaths,
-		TracePath:   tracePath,
+		DepartureTimeSeconds: request.DepartureTimeSeconds,
+		SpeedChanges:         request.SpeedChanges,
+		FromLon:              *request.FromLon,
+		FromLat:              *request.FromLat,
+		ToLon:                *request.ToLon,
+		ToLat:                *request.ToLat,
+		Algorithm:            algorithm,
+		MaxDistance:          maxDistance,
+		OutputPath:           outputPath,
+		KPaths:               kPaths,
+		TracePath:            tracePath,
 	})
 	if err != nil {
 		status := http.StatusUnprocessableEntity
@@ -1874,9 +1906,9 @@ func buildSimulateArgs(request SimulateRequest) ([]string, error) {
 		algorithm = "dijkstra"
 	}
 	switch algorithm {
-	case "dijkstra", "astar", "bidijkstra", "biastar":
+	case "dijkstra", "astar", "bidijkstra", "biastar", "lpa", "dstar", "tddijkstra", "alt", "ch":
 	default:
-		return nil, errors.New("algorithm must be dijkstra, astar, bidijkstra or biastar")
+		return nil, errors.New("algorithm must be dijkstra, astar, bidijkstra, biastar, lpa, dstar, tddijkstra, alt or ch")
 	}
 	count := request.Count
 	if count == 0 {
@@ -2257,6 +2289,32 @@ func parseRoute(output string) RouteResponse {
 			response.Edges, _ = strconv.Atoi(value)
 		case "length_m":
 			response.LengthM, _ = strconv.ParseFloat(value, 64)
+		case "departure_time_s":
+			parsed, _ := strconv.ParseFloat(value, 64)
+			response.DepartureTimeSeconds = &parsed
+		case "arrival_time_s":
+			parsed, _ := strconv.ParseFloat(value, 64)
+			response.ArrivalTimeSeconds = &parsed
+		case "ch_shortcuts":
+			response.CHShortcuts, _ = strconv.ParseInt(value, 10, 64)
+		case "ch_core_states":
+			response.CHCoreStates, _ = strconv.ParseInt(value, 10, 64)
+		case "ch_bytes":
+			response.CHBytes, _ = strconv.ParseInt(value, 10, 64)
+		case "ch_preprocess_ms":
+			response.CHPreprocessMs, _ = strconv.ParseFloat(value, 64)
+		case "ch_reused":
+			response.CHReused = value == "1"
+		case "fallback_reason":
+			response.FallbackReason = value
+		case "landmark_count":
+			response.LandmarkCount, _ = strconv.Atoi(value)
+		case "landmark_bytes":
+			response.LandmarkBytes, _ = strconv.ParseInt(value, 10, 64)
+		case "landmark_preprocess_ms":
+			response.LandmarkPreprocessMs, _ = strconv.ParseFloat(value, 64)
+		case "landmark_reused":
+			response.LandmarkReused = value == "1"
 		case "time_s":
 			response.TimeS, _ = strconv.ParseFloat(value, 64)
 		case "expanded_nodes":

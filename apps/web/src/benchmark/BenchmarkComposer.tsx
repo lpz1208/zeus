@@ -289,7 +289,7 @@ export function BenchmarkComposer({
             <button type="button" aria-label={`${strategy.label}${strategy.enabled ? '已启用' : '未启用'}`} onClick={() => setStrategies((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, enabled: !item.enabled } : item))}><i /></button>
             <div><strong>{strategy.label}</strong><small>{strategy.note}</small></div>
             <select value={strategy.algorithm} onChange={(event) => setStrategies((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, algorithm: event.target.value as RouteAlgorithm, id: `${item.kind.replace('_', '-')}-${event.target.value}` } : item))}>
-              {(['astar', 'dijkstra', 'biastar', 'bidijkstra'] as RouteAlgorithm[]).map((algorithm) => <option key={algorithm}>{algorithm}</option>)}
+              {(['astar', 'dijkstra', 'biastar', 'bidijkstra', 'lpa', 'dstar', 'tddijkstra', 'alt', 'ch'] as RouteAlgorithm[]).map((algorithm) => <option key={algorithm}>{algorithm}</option>)}
             </select>
           </article>)}
         </div>

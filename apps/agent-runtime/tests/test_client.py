@@ -97,6 +97,30 @@ def test_plan_returns_k_shortest_alternatives(fake_environment):
     assert fake_environment.last_plan_body.get("kPaths") == 3
 
 
+@pytest.mark.parametrize("algorithm,metrics", [
+    ("ch", {"chShortcuts": 75, "chCoreStates": 4, "chBytes": 4096,
+            "chPreprocessMs": 13.5, "chReused": True}),
+    ("ch", {"fallbackReason": "ch_dynamic_weights", "effectiveAlgorithm": "bidijkstra"}),
+    ("alt", {"landmarkCount": 8, "landmarkBytes": 1024,
+             "landmarkPreprocessMs": 12.125, "landmarkReused": True}),
+    ("dstar", {"incrementalReused": True, "updatedEdges": 3}),
+    ("tddijkstra", {"departureTimeSeconds": 12.125, "arrivalTimeSeconds": 42.5}),
+])
+def test_plan_preserves_routing_metrics(algorithm, metrics):
+    from zeus_agent.client import HttpEnvironmentClient
+
+    client = HttpEnvironmentClient(map_id="m1", base_url="http://testserver",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "candidateId": "candidate", "algorithm": algorithm,
+            "timeS": 30.375, "edges": [1, 2], **metrics,
+        })))
+    candidate = client.plan("session", 0, algorithm)[0]
+    decoded = candidate.model_dump(by_alias=True)
+    for key, value in metrics.items():
+        assert decoded[key] == value
+    assert candidate.edges == [1, 2]
+
+
 def test_action_request_uses_camel_aliases(fake_environment):
     client = make_client(fake_environment)
     client.create_session(CreateSessionRequest(

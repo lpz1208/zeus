@@ -1,18 +1,19 @@
 // Runs the real Web navigation loop against Go, Python and C++ in an isolated
 // data directory. No model provider, browser, or external map download required.
 import assert from 'node:assert/strict'
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn, execFile, execFileSync } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdtemp, mkdir, writeFile, readFile, copyFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseArgs } from 'node:util'
+import { parseArgs, promisify } from 'node:util'
 import { setTimeout as delay } from 'node:timers/promises'
 import { runAlgorithmNavigation } from '../apps/web/src/agent/algorithmNavigation.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const execFileAsync = promisify(execFile)
 const { values } = parseArgs({ options: {
   map: { type: 'string' }, origin: { type: 'string' }, destination: { type: 'string' },
   'closed-edge': { type: 'string' },
@@ -111,6 +112,180 @@ function verified(result) {
   assert.ok(Math.abs(result.timeS - result.baseline.timeS) < 0.001, 'Dijkstra costs disagree')
 }
 
+async function reusableRoutingScenario(condition, closed, duration, selectedAlgorithm) {
+  const alt = selectedAlgorithm === 'alt'
+  const ch = selectedAlgorithm === 'ch'
+  const preprocessed = alt || ch
+  const reused = candidate => ch ? candidate.chReused : alt ? candidate.landmarkReused : candidate.incrementalReused
+  const vehicle = { fromLon: condition.fromLon, fromLat: condition.fromLat,
+    toLon: condition.toLon, toLat: condition.toLat, algorithm: selectedAlgorithm, agent: true }
+  const settings = { durationSeconds: duration, stepSeconds: 1, sampleIntervalSeconds: 5,
+    exitHeadwayFfSeconds: 1.4, exitHeadwayJamSeconds: 2, rerouteIntervalSeconds: 0, rerouteCostRatio: 1.25 }
+  const created = await request(`${mapAPI}/agent/sessions`, { ...settings, vehicles: [vehicle],
+    rerouteRecoveryIntervalSeconds: 1,
+    roadControls: [{ timeSeconds: 1, edgeIds: [closed], action: 'close' },
+      { timeSeconds: 3, edgeIds: [closed], action: 'open' }],
+    vehicleControls: [{ timeSeconds: 0, vehicleId: 0, action: 'hold' },
+      { timeSeconds: 8, vehicleId: 0, action: 'release' }],
+  })
+  let path = `${mapAPI}/agent/sessions/${created.sessionId}`
+  const plan = (algorithm = selectedAlgorithm, vehicleId = 0) => request(`${path}/plan`, { algorithm, vehicleId, recordTrace: true })
+  const apply = async (boundary, candidate) => {
+    assert.ok(boundary.decisionId)
+    const action = await request(`${path}/actions`, { kind: 'commit_route', vehicleId: 0,
+      candidateId: candidate.candidateId, decisionId: boundary.decisionId,
+      basedOnStateVersion: boundary.state.stateVersion })
+    assert.equal(action.accepted, true)
+    return request(`${path}/step`, { ticks: 1 })
+  }
+  const first = await plan()
+  const repeat = await plan()
+  assert.equal(reused(first), preprocessed, 'vehicle initialization shares preprocessed indexes')
+  assert.equal(reused(repeat), true)
+  if (!preprocessed) assert.equal(repeat.expandedNodes, 0)
+  if (alt) {
+    assert.ok(first.landmarkCount > 0 && first.landmarkCount <= 8)
+    assert.ok(first.landmarkBytes > 0 && first.landmarkBytes <= 256 * 1024 * 1024)
+    assert.equal(repeat.landmarkPreprocessMs, 0)
+    assert.equal(repeat.landmarkBytes, first.landmarkBytes)
+  }
+  if (ch) {
+    assert.equal(first.effectiveAlgorithm, 'ch')
+    assert.ok(first.chBytes > 0)
+    assert.equal(repeat.chPreprocessMs, 0)
+  }
+  assert.deepEqual(repeat.edges, first.edges)
+  const closedBoundary = await request(`${path}/step`, { ticks: 2 })
+  const repaired = await plan()
+  const baseline = await plan('dijkstra')
+  assert.equal(reused(repaired), !ch)
+  if (ch) {
+    assert.equal(repaired.effectiveAlgorithm, 'bidijkstra')
+    assert.equal(repaired.fallbackReason, 'ch_dynamic_weights')
+  }
+  if (!preprocessed) assert.ok(repaired.updatedEdges >= 1)
+  assert.ok(!repaired.edges.includes(closed))
+  assert.ok(Math.abs(repaired.timeS - baseline.timeS) < .001)
+  await apply(closedBoundary, repaired)
+  const openBoundary = await request(`${path}/step`, { ticks: 1 })
+  assert.equal(openBoundary.state.decisionReason, 'route_improved')
+  const recovered = await plan()
+  assert.equal(reused(recovered), true)
+  if (ch) assert.equal(recovered.effectiveAlgorithm, 'ch')
+  assert.deepEqual(recovered.edges, first.edges)
+  await apply(openBoundary, recovered)
+  const before = await request(path)
+  const saved = await request(`${path}/snapshots`, {})
+  await request(path, undefined, 'DELETE')
+  await stopServer()
+  await startServer()
+  const restored = await request(`${mapAPI}/agent/snapshots/${saved.snapshotId}/restore`, {})
+  path = `${mapAPI}/agent/sessions/${restored.state.sessionId}`
+  const after = await request(path)
+  assert.deepEqual(after.agents, before.agents, `${selectedAlgorithm} exact path changed after restart`)
+  assert.equal(reused(await plan()), preprocessed, 'restoring vehicles rebuilds indexes during initialization')
+  assert.equal(reused(await plan()), true)
+  const moving = await request(`${path}/step`, { ticks: 12 })
+  assert.equal(moving.state.finished, false, 'vehicle should still be travelling after release')
+  const moved = await plan()
+  const movedBaseline = await plan('dijkstra')
+  if (ch && moved.effectiveAlgorithm !== 'ch') assert.equal(moved.fallbackReason, 'ch_dynamic_weights')
+  else assert.equal(reused(moved), true)
+  assert.ok(Math.abs(moved.timeS - movedBaseline.timeS) < .001, 'moving-origin costs disagree')
+  if (!preprocessed) assert.equal((await plan()).expandedNodes, 0)
+  const complete = await request(`${path}/step`, { untilEvent: true, maxTicks: 20000 })
+  assert.equal(complete.state.finished, true)
+  const result = await request(`${path}/result`)
+  assert.equal(result.summary.arrived, 1)
+  await request(path, undefined, 'DELETE')
+  // Landmark tables belong to the planner and are shared across vehicle queries.
+  // Incremental labels instead retain only four vehicle contexts.
+  const fleet = await request(`${mapAPI}/agent/sessions`, { ...settings,
+    vehicles: Array.from({ length: 5 }, () => ({ ...vehicle, departSeconds: 100 })) })
+  path = `${mapAPI}/agent/sessions/${fleet.sessionId}`
+  for (let vehicleId = 0; vehicleId < 5; ++vehicleId)
+    assert.equal(reused(await plan(selectedAlgorithm, vehicleId)), preprocessed)
+  assert.equal(reused(await plan(selectedAlgorithm, 4)), true)
+  assert.equal(reused(await plan(selectedAlgorithm, 0)), preprocessed)
+  const alternate = selectedAlgorithm === 'dstar' ? 'lpa' : 'dstar'
+  assert.equal((await plan(alternate, 0)).incrementalReused, false, 'algorithm switch resets labels')
+  assert.equal((await plan(alternate, 0)).incrementalReused, true)
+  assert.equal(reused(await plan(selectedAlgorithm, 0)), preprocessed)
+  await request(path, undefined, 'DELETE')
+  console.log(`${selectedAlgorithm}: warm reuse -> closure repair -> reopening -> restart -> movement -> arrival; initial plan expansions ${first.expandedNodes}, unchanged ${repeat.expandedNodes}, repair ${repaired.expandedNodes}; bounded cache and algorithm switch verified`)
+}
+
+async function timeDependentScenario(condition, closed, baseline) {
+  const routePoints = { fromLon: condition.fromLon, fromLat: condition.fromLat, toLon: condition.toLon, toLat: condition.toLat }
+  const route = (departureTimeSeconds, speedChanges = []) => request(`${mapAPI}/route`, {
+    ...routePoints, algorithm: 'tddijkstra', departureTimeSeconds, speedChanges, recordTrace: true,
+  })
+  const speedChanges = [{ edgeId: closed, timeSeconds: 0, speedFactor: .05 },
+    { edgeId: closed, timeSeconds: 1000, speedFactor: 1 }]
+  const early = await route(0, speedChanges)
+  const late = await route(2000, speedChanges)
+  assert.equal(early.ok, true)
+  assert.equal(late.ok, true)
+  assert.equal(late.effectiveAlgorithm, 'tddijkstra')
+  assert.equal(late.departureTimeSeconds, 2000)
+  assert.ok(early.timeS > late.timeS)
+  assert.ok(Math.abs(late.timeS - baseline.timeS) < .001)
+  assert.ok(Math.abs(late.arrivalTimeSeconds - 2000 - late.timeS) < .002)
+  for (const invalid of [{ algorithm: 'astar', speedChanges }, { departureTimeSeconds: -1 },
+    { speedChanges: [{ edgeId: closed, timeSeconds: 0, speedFactor: 0 }] },
+    { speedChanges: [{ edgeId: 4294967295, timeSeconds: 0, speedFactor: 1 }] }]) {
+    await request(`${mapAPI}/route`, { ...routePoints, algorithm: 'tddijkstra', ...invalid }, 'POST', 400)
+  }
+  const created = await request(`${mapAPI}/agent/sessions`, {
+    durationSeconds: Math.max(900, baseline.timeS * 4 + 400), stepSeconds: 1,
+    sampleIntervalSeconds: 5, rerouteIntervalSeconds: 0,
+    exitHeadwayFfSeconds: 1.4, exitHeadwayJamSeconds: 2, rerouteCostRatio: 1.25,
+    vehicles: [{ fromLon: condition.fromLon, fromLat: condition.fromLat,
+      toLon: condition.toLon, toLat: condition.toLat, algorithm: 'tddijkstra', agent: true, departSeconds: 100 }],
+    roadControls: [{ timeSeconds: 0, edgeIds: [closed], action: 'speedFactor', value: .05 },
+      { timeSeconds: 10, edgeIds: [closed], action: 'speedFactor', value: 1 }],
+  })
+  let path = `${mapAPI}/agent/sessions/${created.sessionId}`
+  const plan = () => request(`${path}/plan`, { algorithm: 'tddijkstra', vehicleId: 0, recordTrace: true })
+  const first = await plan()
+  assert.equal(first.departureTimeSeconds, 100)
+  assert.ok(Math.abs(first.timeS - late.timeS) < .001)
+  let boundary = await request(`${path}/step`, { ticks: 10 })
+  assert.equal(boundary.state.simulationTimeS, 10)
+  const beforeRecoveryTick = await plan()
+  assert.ok(Math.abs(beforeRecoveryTick.timeS - first.timeS) < .001,
+    'pending recovery must replace the still-published speed penalty exactly once')
+  if (!boundary.decisionId) boundary = await request(`${path}/decisions`, { vehicleId: 0, basedOnStateVersion: boundary.state.stateVersion })
+  assert.ok(boundary.decisionId)
+  const action = await request(`${path}/actions`, { kind: 'commit_route', vehicleId: 0,
+    candidateId: beforeRecoveryTick.candidateId, decisionId: boundary.decisionId,
+    basedOnStateVersion: boundary.state.stateVersion })
+  assert.equal(action.accepted, true)
+  await request(`${path}/step`, { ticks: 1 })
+  const saved = await request(`${path}/snapshots`, {})
+  const before = await request(path)
+  await request(path, undefined, 'DELETE')
+  await stopServer()
+  await startServer()
+  const restored = await request(`${mapAPI}/agent/snapshots/${saved.snapshotId}/restore`, {})
+  path = `${mapAPI}/agent/sessions/${restored.state.sessionId}`
+  const resumed = await request(path)
+  assert.deepEqual(resumed.agents, before.agents)
+  const after = await plan()
+  assert.deepEqual(after.edges, first.edges)
+  assert.ok(Math.abs(after.timeS - first.timeS) < .001)
+  if (resumed.decisionId) {
+    const kept = await request(`${path}/actions`, { kind: 'keep_route', vehicleId: 0,
+      decisionId: resumed.decisionId, basedOnStateVersion: resumed.stateVersion })
+    assert.equal(kept.accepted, true)
+  }
+  const complete = await request(`${path}/step`, { untilEvent: true, maxTicks: 20000 })
+  assert.equal(complete.state.finished, true)
+  assert.equal((await request(`${path}/result`)).summary.arrived, 1)
+  await request(path, undefined, 'DELETE')
+  console.log(`tddijkstra: departure forecasts ${early.timeS}s / ${late.timeS}s -> tick-boundary recovery -> exact commit -> restart -> arrival`)
+}
+
 async function main() {
   await prepareMap()
   await startServer()
@@ -120,12 +295,36 @@ async function main() {
   const initial = await request(`${mapAPI}/algorithms/run`, condition)
   verified(initial)
   assert.ok(initial.runId && !initial.storageError, initial.storageError)
-  for (const algorithm of ['bidijkstra', 'biastar']) {
+  let staticBaseline
+  for (const algorithm of ['dijkstra', 'bidijkstra', 'biastar', 'lpa', 'dstar', 'tddijkstra', 'alt', 'ch']) {
     const route = await request(`${mapAPI}/route`, {
       fromLon: origin[0], fromLat: origin[1], toLon: destination[0], toLat: destination[1], algorithm,
     })
     assert.equal(route.ok, true)
     assert.equal(route.effectiveAlgorithm, algorithm)
+    if (algorithm === 'dijkstra') staticBaseline = route
+    if (algorithm === 'ch') {
+      assert.equal(route.chReused, false)
+      assert.ok(route.chBytes > 0)
+      const warm = await request(`${mapAPI}/route`, {
+        fromLon: origin[0], fromLat: origin[1], toLon: destination[0], toLat: destination[1], algorithm,
+      })
+      assert.equal(warm.chReused, true)
+      assert.equal(warm.chPreprocessMs ?? 0, 0)
+      assert.deepEqual(edgeIDs(warm), edgeIDs(route))
+      console.log(`ch static: ${route.chShortcuts ?? 0} shortcuts, ${route.chCoreStates ?? 0} core states, ${route.chBytes} bytes; preprocessing ${route.chPreprocessMs}ms; warm ${warm.computeMs}ms, ${warm.expandedNodes} expansions vs Dijkstra ${staticBaseline.expandedNodes}`)
+    }
+    if (algorithm === 'alt') {
+      assert.equal(route.landmarkReused, false)
+      assert.ok(route.landmarkCount > 0 && route.landmarkBytes > 0)
+      const warm = await request(`${mapAPI}/route`, {
+        fromLon: origin[0], fromLat: origin[1], toLon: destination[0], toLat: destination[1], algorithm,
+      })
+      assert.equal(warm.landmarkReused, true)
+      assert.equal(warm.landmarkPreprocessMs ?? 0, 0)
+      assert.deepEqual(edgeIDs(warm), edgeIDs(route))
+      console.log(`alt static: ${route.landmarkCount} landmarks, ${route.landmarkBytes} bytes; preprocessing ${route.landmarkPreprocessMs}ms; warm ${warm.computeMs}ms, ${warm.expandedNodes} expansions vs Dijkstra ${staticBaseline.expandedNodes}`)
+    }
     assert.ok(Math.abs(route.timeS - initial.baseline.timeS) < .001, `${algorithm} disagrees with Dijkstra`)
   }
   const edges = edgeIDs(initial)
@@ -140,6 +339,10 @@ async function main() {
   assert.ok(!edgeIDs(detour).includes(closed), 'closed road appears in detour')
   assert.notEqual(initial.snapshotId, detour.snapshotId, 'closure must change snapshot')
   console.log(`static: ${initial.edges} edges; closure ${closed} -> ${detour.edges} edges; C++ verified`)
+
+  await timeDependentScenario(condition, closed, initial)
+  for (const algorithm of ['lpa', 'dstar', 'alt', 'ch'])
+    await reusableRoutingScenario(condition, closed, Math.max(600, detour.timeS * 3 + 300), algorithm)
 
   let debug = await request(`${mapAPI}/algorithms/debug`, condition)
   assert.equal(debug.kind, 'paused')
@@ -315,11 +518,13 @@ async function main() {
     scenarios: [{ id: 'closure', mapId: 'map_e2e', origin, destination,
       durationSeconds: Math.max(600, detour.timeS * 3 + 300), rerouteIntervalSeconds: 30,
       roadControls: [{ timeSeconds: 5, edgeIds: [closed], action: 'close' }] }],
-    strategies: [{ id: 'custom', kind: 'custom_code', source: template }],
+    strategies: [{ id: 'custom', kind: 'custom_code', source: template }, { id: 'lpa', kind: 'reactive', algorithm: 'lpa' }, { id: 'dstar', kind: 'reactive', algorithm: 'dstar' }, { id: 'td', kind: 'reactive', algorithm: 'tddijkstra' }, { id: 'alt', kind: 'reactive', algorithm: 'alt' }, { id: 'ch', kind: 'reactive', algorithm: 'ch' }],
   }
   const manifestFile = join(dir, 'benchmark.json')
   await writeFile(manifestFile, JSON.stringify(benchmarkManifest))
-  const benchmarkOutput = execFileSync('uv', ['run', '--project', 'apps/agent-runtime', 'python', '-c', `
+  // Keep draining the server's piped logs while Python drives HTTP requests.
+  // A synchronous child wait can fill the pipe and block the control server.
+  const { stdout: benchmarkOutput } = await execFileAsync('uv', ['run', '--project', 'apps/agent-runtime', 'python', '-c', `
 import json, sys
 from zeus_agent.benchmark import BenchmarkManifest, run_benchmark
 from zeus_agent.client import HttpEnvironmentClient
@@ -331,6 +536,9 @@ assert run.source_revision and run.scenario_revision
 assert run.custom_decisions and all(record['status'] == 'applied' for record in run.custom_decisions)
 assert run.applied_route_changes >= 1
 assert run.route_reversals == 0
+for incremental in report.runs[1:]:
+    assert incremental.success, incremental.error
+    assert incremental.applied_route_changes >= 1
 print(json.dumps({'success': run.success, 'decisions': run.decisions, 'overlap': run.route_overlap_ratio}))
 `, base, manifestFile], { cwd: root, encoding: 'utf8', timeout: 120000,
     env: { ...process.env, UV_CACHE_DIR: join(root, '.cache/uv') } })

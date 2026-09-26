@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/lpz1208/zeus/actions/workflows/ci.yml/badge.svg)](https://github.com/lpz1208/zeus/actions/workflows/ci.yml)
 
-Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。当前仓库已完成作为 Agent Environment 基础的地图引擎、五算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线（Yen K 最短路一次产出多条可对比候选，搜索扩展过程可动画回放），按车辆、道路和路口编排控制事件，配置转向级信号相位与独立饱和放行率，运行多车仿真并通过时间滑块回放车辆轨迹。封路、限速、降容和可选的周期拥堵扫描会更新动态路由权重并重规划受影响车辆，路段还可配置密度插值的出口放行间隔。
+Zeus 是一个独立开发的地理空间导航智能体仿真与评测平台。当前仓库已完成作为 Agent Environment 基础的地图引擎、十算法路由内核和确定性中观交通仿真 MVP：道路 Shapefile 或 GeoJSON 可以编译为只读 `.zmap`，OSM 道路可自动执行机动车画像清洗；用户可在 Web 点选 OD、规划路线（Yen K 最短路一次产出多条可对比候选，搜索扩展过程可动画回放），按车辆、道路和路口编排控制事件，配置转向级信号相位与独立饱和放行率，运行多车仿真并通过时间滑块回放车辆轨迹。封路、限速、降容和可选的周期拥堵扫描会更新动态路由权重并重规划受影响车辆，路段还可配置密度插值的出口放行间隔。
 
-平台已经把同步仿真演进为有状态 Environment：Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A*、双向搜索和 Yen K 最短路作为 Tools 动态选择，并通过带状态版本的 Action 提交路线；任意算法的搜索 settle 序列可记录并在 Web 以波前动画回放。LLM 不替代路径算法，也不进入逐 tick 热路径；D* Lite 和时间依赖路由仍在后续计划中。
+平台已经把同步仿真演进为有状态 Environment：Navigation Agent 通过结构化 Observation 感知道路世界，把 Dijkstra、A*、双向搜索、Yen K 最短路、LPA*、D* Lite 和时间依赖 Dijkstra 作为 Tools 动态选择，并通过带状态版本的 Action 提交路线；任意算法的搜索 settle 序列可记录并在 Web 以波前动画回放。LLM 不替代路径算法，也不进入逐 tick 热路径。时间依赖路由使用已配置的道路变速事件预测通行时间，模型边界见 [实现说明](docs/time-dependent-routing.md)。
 
 ## 快速启动
 
@@ -80,7 +80,7 @@ printf 'reset\ts1\t900\t1\t30\t1.4\t2.0\t0\t1.25\t0\tod.csv\t\t\nstep_event\ts1\
   | ./build/zeus-map session-worker city.zmap
 ```
 
-HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选（可带 `kPaths` 与 `recordTrace`，K 最短路一次返回多条各自可提交的候选）、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v2` 五算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界可创建带版本的持久化快照，并通过确定性动作重放恢复成独立 Session；快照落在地图数据目录中，控制服务或 Worker 重启后仍可恢复。
+HTTP 侧由 `/api/maps/{id}/agent/sessions` 系列端点驱动：创建（OD 第 7 列 `agent` 标记）、step(untilEvent) 返回 decisionId、plan 产候选（可带 `kPaths` 与 `recordTrace`，K 最短路一次返回多条各自可提交的候选）、actions 提交 commit_route/keep_route（state version + 仿真时间 TTL 校验）、result 内联导出；`GET /api/maps/{id}/agent/tools` 返回 `routing-tools-v2` 十算法能力注册表。动作只有在 C++ Worker 接受后才关闭决策；墙上超时会实际提交 keep fallback，活动决策未解决前不能继续 step；run 使用非阻塞 resume，之后可以 pause/observe。暂停边界可创建带版本的持久化快照，并通过确定性动作重放恢复成独立 Session；快照落在地图数据目录中，控制服务或 Worker 重启后仍可恢复。
 
 `apps/agent-runtime` 提供 A2 单导航智能体闭环（Python，uv 管理）：`EnvironmentClient` HTTP 传输抽象、`RulePolicy` 确定性基线、LangGraph 八节点主决策图（纯循环仅作故障兜底）、Action Guard、Gymnasium 风格适配器，以及严格 JSON 输出的 Chat Completions 兼容 `ModelProvider`。模型只能选择环境签发的 `candidateId`，失败时确定性降级为规则策略。成功和失败尝试中供应商已返回的 token 用量都会累计，失败耗时也进入模型延迟统计；未返回用量的超时请求无法推算实际计费。运行时支持 SQLite Checkpointer、稳定 `thread_id` 中断/恢复，以及可查询的 Observation→Tools→Decision→Guard→Action DecisionTrace。`make agent-runtime-test` 跑单测；起服务后 `make agent-runtime-e2e` 在真实地图上验证封路→失效→重规划→到达全链路。
 
@@ -183,3 +183,9 @@ Benchmark 支持 `custom_code` 策略，在初始边界及后续决策事件调�
 场景可配置 `randomEvents`：候选道路、事件数、发生窗口、持续时间以及封路/降速类型。同一重复轮次的所有策略共享 `seed + repetition - 1` 生成的事件；事件对齐仿真 tick，结束时恢复道路。JSON/CSV 均包含实际生成的事件。详见 [Benchmark 指标与可重复性](docs/benchmark-metrics.md)。
 
 2026-09-25：新增格式 3 快照内容/地图校验、道路恢复收益扫描与换路稳定性参数，并实现含转向限制的双向 Dijkstra/A*。各项完成状态、验收与后续缺项见 [实现进度](docs/implementation-roadmap.md)。恢复扫描默认关闭，旧格式快照恢复时标记为未校验。
+
+已接入 `lpa`（LPA*）与 `dstar`（D* Lite）增量路由：Agent 会话复用搜索状态，支持动态封路/恢复和费用变化；普通路由执行单次搜索。使用方法、性能边界与快照契约 v3 兼容性见 [增量路由说明](docs/incremental-routing.md)。
+
+已接入 `alt`（地标 A*）：按需预处理有向地标距离并复用，界面显示地标数量和预处理状态；实际搜索保留禁转、封路、动态费用与部分道路起终点语义。内存预算、冷启动成本和使用方式见 [ALT 说明](docs/alt-routing.md)。
+
+已接入 `ch`（收缩层级）：静态路况复用包含转向语义的捷径索引，预处理达到预算时保留精确可搜索的核心图；封路或费用变化时明确回退至双向 Dijkstra，界面显示实际算法和原因。使用方式及边界见 [CH 说明](docs/ch-routing.md)。

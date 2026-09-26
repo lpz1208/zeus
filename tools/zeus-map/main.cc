@@ -23,6 +23,7 @@
 #include "zeus/map/osm_road_preprocessor.h"
 #include "zeus/map/shapefile_importer.h"
 #include "zeus/routing/kshortest.h"
+#include "zeus/routing/time_dependent.h"
 #include "zeus/routing/algorithm_lab.h"
 #include "zeus/routing/route_exporter.h"
 #include "zeus/routing/route_planner.h"
@@ -60,6 +61,7 @@ void printUsage() {
         << "  zeus-map pose <map.zmap> --edge INDEX --offset METERS [--lateral METERS]\n"
         << "  zeus-map route <map.zmap> (--lon LON --lat LAT --dest-lon LON --dest-lat LAT\n"
         << "                       | --x X --y Y --dest-x X --dest-y Y) [options]\n"
+        << "  route: --departure-time <seconds> --speed-changes 'edge,time,factor;...' (tddijkstra)\n"
         << "  zeus-map route-worker <map.zmap>  # framed requests on stdin/stdout\n"
         << "  zeus-map session-worker <map.zmap>  # framed agent sessions on stdin/stdout\n"
         << "  zeus-map simulate <map.zmap> (--lon LON --lat LAT --dest-lon LON --dest-lat LAT\n"
@@ -90,14 +92,14 @@ void printUsage() {
         << "  --max-distance METERS\n"
         << "  --limit COUNT\n\n"
         << "Route options:\n"
-        << "  --algorithm dijkstra|astar|bidijkstra|biastar\n"
+        << "  --algorithm dijkstra|astar|bidijkstra|biastar|lpa|dstar|tddijkstra|alt|ch\n"
         << "  --max-distance METERS      endpoint snap distance\n"
         << "  --output FILE              write the route as WGS84 GeoJSON\n\n"
         << "Simulate options:\n"
         << "  --count N                  vehicles for the single OD pair (default 1)\n"
         << "  --spread SECONDS           linear departure window (default 0)\n"
         << "  --od-file FILE             lon,lat,dest_lon,dest_lat,depart_s[,algorithm][,agent] rows\n"
-        << "  --algorithm dijkstra|astar|bidijkstra|biastar\n"
+        << "  --algorithm dijkstra|astar|bidijkstra|biastar|lpa|dstar|tddijkstra|alt|ch\n"
         << "  --duration SECONDS         simulation horizon (default 3600)\n"
         << "  --step SECONDS             tick length (default 1)\n"
         << "  --sample-interval SECONDS  trajectory sampling (default 30)\n"
@@ -274,6 +276,33 @@ int executeRoute(
         request.record_trace = true;
     }
 
+    if (options.contains("departure-time")) request.departure_time_s = std::stod(options.at("departure-time"));
+    std::vector<zeus::routing::SpeedChange> changes;
+    if (options.contains("speed-changes")) {
+        std::istringstream rows(options.at("speed-changes"));
+        std::string row;
+        while (std::getline(rows, row, ';')) {
+            std::istringstream columns(row);
+            std::string edge, time, factor, extra;
+            if (!std::getline(columns, edge, ',') || !std::getline(columns, time, ',') ||
+                !std::getline(columns, factor, ',') || std::getline(columns, extra, ','))
+                throw std::invalid_argument("speed changes must be edge,time,factor triples separated by semicolons");
+            std::size_t used = 0;
+            const auto id = std::stoull(edge, &used);
+            if (used != edge.size() || id >= runtime.data().edges.size()) throw std::invalid_argument("invalid speed change edge");
+            const double timestamp = std::stod(time, &used);
+            if (used != time.size()) throw std::invalid_argument("invalid speed change time");
+            const double value = std::stod(factor, &used);
+            if (used != factor.size()) throw std::invalid_argument("invalid speed change factor");
+            changes.push_back({static_cast<zeus::map::EdgeIndex>(id), timestamp, value});
+            if (changes.size() > 100000) throw std::invalid_argument("too many speed changes");
+        }
+    }
+    if ((!changes.empty() || request.departure_time_s != 0) && request.algorithm != zeus::routing::Algorithm::kTimeDependent)
+        throw std::invalid_argument("scheduled speeds and departure time require tddijkstra");
+    const zeus::routing::SpeedSchedule schedule(runtime.data().edges.size(), changes);
+    if (request.algorithm == zeus::routing::Algorithm::kTimeDependent) request.speed_schedule = &schedule;
+
     const zeus::routing::RouteResult result = planner.plan(request);
     output << std::fixed << std::setprecision(3);
     if (!result.ok) {
@@ -308,6 +337,24 @@ int executeRoute(
            << "time_s=" << result.stats.time_s << '\n'
            << "expanded_nodes=" << result.stats.expanded_nodes << '\n'
            << "compute_ms=" << result.stats.compute_ms << '\n';
+    if (request.algorithm == zeus::routing::Algorithm::kTimeDependent) {
+        output << "departure_time_s=" << request.departure_time_s << '\n'
+               << "arrival_time_s=" << request.departure_time_s + result.stats.time_s << '\n';
+    }
+    if (request.algorithm == zeus::routing::Algorithm::kCH) {
+        output << "ch_shortcuts=" << result.stats.ch_shortcuts << '\n'
+               << "ch_core_states=" << result.stats.ch_core_states << '\n'
+               << "ch_bytes=" << result.stats.ch_bytes << '\n'
+               << "ch_preprocess_ms=" << result.stats.ch_preprocess_ms << '\n'
+               << "ch_reused=" << result.stats.ch_reused << '\n'
+               << "fallback_reason=" << result.stats.fallback_reason << '\n';
+    }
+    if (request.algorithm == zeus::routing::Algorithm::kAlt) {
+        output << "landmark_count=" << result.stats.landmark_count << '\n'
+               << "landmark_bytes=" << result.stats.landmark_bytes << '\n'
+               << "landmark_preprocess_ms=" << result.stats.landmark_preprocess_ms << '\n'
+               << "landmark_reused=" << result.stats.landmark_reused << '\n';
+    }
     if (!result.alternatives.empty()) {
         output << "alternatives=" << result.alternatives.size() << '\n';
         for (std::size_t i = 0; i < result.alternatives.size(); ++i) {
@@ -356,8 +403,8 @@ int runRouteWorker(const zeus::map::MapRuntime& runtime) {
         int exit_code = 1;
         try {
             const std::vector<std::string> fields = splitTabs(line);
-            if (fields.size() != 9) {
-                throw std::invalid_argument("route worker request must contain 9 tab fields");
+            if (fields.size() != 9 && fields.size() != 11) {
+                throw std::invalid_argument("route worker request must contain 9 or 11 tab fields");
             }
             Options options;
             options["lon"] = fields[0];
@@ -374,6 +421,10 @@ int runRouteWorker(const zeus::map::MapRuntime& runtime) {
             }
             if (!fields[8].empty()) {
                 options["trace-output"] = fields[8];
+            }
+            if (fields.size() == 11) {
+                options["departure-time"] = fields[9];
+                options["speed-changes"] = fields[10];
             }
             exit_code = executeRoute(runtime, planner, options, payload);
         } catch (const std::exception& error) {

@@ -596,10 +596,10 @@ func writeAgentOdFile(request *AgentSessionRequest) (string, error) {
 			algorithm = "dijkstra"
 		}
 		switch algorithm {
-		case "dijkstra", "astar", "bidijkstra", "biastar":
+		case "dijkstra", "astar", "bidijkstra", "biastar", "lpa", "dstar", "tddijkstra", "alt", "ch":
 		default:
 			return "", fmt.Errorf(
-				"vehicles[%d].algorithm must be dijkstra, astar, bidijkstra or biastar", index)
+				"vehicles[%d].algorithm must be dijkstra, astar, bidijkstra, biastar, lpa, dstar, tddijkstra, alt or ch", index)
 		}
 		agent := ""
 		if vehicle.Agent {
@@ -765,10 +765,10 @@ func (s *Server) handleAgentPlan(w http.ResponseWriter, r *http.Request) {
 		request.Algorithm = "astar"
 	}
 	switch request.Algorithm {
-	case "dijkstra", "astar", "bidijkstra", "biastar", "kshortest":
+	case "dijkstra", "astar", "bidijkstra", "biastar", "kshortest", "lpa", "dstar", "tddijkstra", "alt", "ch":
 	default:
 		writeError(w, http.StatusBadRequest,
-			"algorithm must be dijkstra, astar, bidijkstra, biastar or kshortest")
+			"algorithm must be dijkstra, astar, bidijkstra, biastar, kshortest, lpa, dstar, tddijkstra, alt or ch")
 		return
 	}
 	if request.VehicleID < 0 {
@@ -1168,7 +1168,7 @@ func (s *Server) replayAgentSnapshot(
 					strconv.FormatFloat(path.EndOffsetM, 'g', -1, 64), strings.Join(edges, ","))
 			} else {
 				switch action.Algorithm {
-				case "dijkstra", "astar", "bidijkstra", "biastar", "kshortest":
+				case "dijkstra", "astar", "bidijkstra", "biastar", "kshortest", "lpa", "dstar", "tddijkstra", "alt", "ch":
 				default:
 					return state, record, fmt.Errorf(
 						"snapshot contains invalid algorithm %q", action.Algorithm)

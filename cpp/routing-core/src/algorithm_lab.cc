@@ -45,7 +45,8 @@ std::vector<LabTransition> AlgorithmLab::neighbors(int state) const {
     if (state == -2) return next;
     if (state == -1) {
         for (const auto& start : starts_) {
-            if (!enabled(start.edge)) continue;
+            if (!enabled(start.edge) &&
+                (!request_.origin_position || request_.origin_position->edge != start.edge)) continue;
             const auto length = runtime_.edge(start.edge).length_m - start.offset_s;
             next.push_back({int(start.edge), start.edge, seconds(start.edge, length), length});
             for (const auto& goal : goals_) {
@@ -59,7 +60,11 @@ std::vector<LabTransition> AlgorithmLab::neighbors(int state) const {
         if (state < 0 || std::size_t(state) >= runtime_.data().edges.size()) {
             throw std::invalid_argument("unknown routing state");
         }
-        if (!enabled(state)) return next;
+        // A vehicle may finish its exact current edge after it closes. Every
+        // transition into another edge still checks enabled(), so this cannot
+        // be used to re-enter the closed edge later in the path.
+        if (!enabled(state) &&
+            (!request_.origin_position || request_.origin_position->edge != static_cast<zeus::map::EdgeIndex>(state))) return next;
         const auto node = runtime_.edge(state).to;
         for (auto edge : runtime_.outgoingEdges(node)) {
             const auto turn = runtime_.turnPenaltySeconds(state, edge);

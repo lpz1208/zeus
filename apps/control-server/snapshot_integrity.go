@@ -14,7 +14,7 @@ import (
 
 // A contract version, not a claim that arbitrary future engine binaries replay
 // identically. Bump when replay semantics change incompatibly.
-const agentReplayContract = "zeus-session-replay-v2"
+const agentReplayContract = "zeus-session-replay-v3"
 const agentSnapshotMaxBytes = 64 << 20
 
 func snapshotDigest(artifact agentSnapshotArtifact) (string, error) {

@@ -31,6 +31,8 @@ struct SearchQuery {
 
 struct SearchOutput {
     bool found = false;
+    bool incremental_reused = false;
+    std::uint64_t updated_edges = 0;
     double total_time_s = 0.0;
     std::size_t start_index = 0;
     std::size_t goal_index = 0;

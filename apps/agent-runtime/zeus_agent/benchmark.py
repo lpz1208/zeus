@@ -22,7 +22,7 @@ from zeus_agent.model import ModelProvider
 from zeus_agent.policy import FixedRoutePolicy, ReactiveAlgorithmPolicy, RulePolicy
 from zeus_agent.runner import EpisodeTrace, Scenario, run_episode
 
-SUPPORTED_ALGORITHMS = {"dijkstra", "astar", "bidijkstra", "biastar"}
+SUPPORTED_ALGORITHMS = {"dijkstra", "astar", "bidijkstra", "biastar", "lpa", "dstar", "tddijkstra", "alt", "ch"}
 
 
 class ManifestModel(BaseModel):
@@ -140,7 +140,7 @@ class BenchmarkStrategy(ManifestModel):
             raise ValueError("source is only valid for custom_code strategies")
         if self.algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError(
-                "algorithm must be dijkstra, astar, bidijkstra or biastar")
+                "algorithm must be dijkstra, astar, bidijkstra, biastar, lpa, dstar, tddijkstra, alt or ch")
         return self
 
 

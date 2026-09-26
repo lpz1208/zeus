@@ -188,16 +188,16 @@ POST /api/maps/{id}/route
 1. 起终点各取吸附最优的一条边（含 twin），不从边中段向其他方向离开；需要掉头的场景通过路口绕行完成，多候选多源搜索留待后续。
 2. 并列最优路径下 Dijkstra 与 A* 可能返回不同但等价的边序列。
 3. OSM PBF 已能自动生成转向 sidecar，但当前只支持单 via-node 的机动车 `no_*` / `only_*`；via-way、conditional 和完整车型例外尚未进入运行时模型。
-4. 欧氏距离/全图最大限速启发式仍偏弱；已消除双向 A* 的全图势函数预扫描，ALT/CH 仍未实现。
+4. 欧氏距离/全图最大限速启发式仍偏弱；已消除双向 A* 的全图势函数预扫描，ALT 地标 A* 已实现（[边界说明](alt-routing.md)），静态 CH 已实现（[模型边界](ch-routing.md)）。
 5. 当前每张地图默认只有一个串行路由 Worker；高并发阶段需要按地图分片多个只读 Worker，或将线程安全搜索上下文下沉到同一进程线程池。
 
 ## 9. 下一步
 
-现有五算法（Dijkstra、A\*、双向 Dijkstra、双向 A\*、Yen K 最短路）已接入 `routing-tools-v2` Navigation Tool Registry：C++ 注册表统一声明算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性、精确性和启发式能力；Agent Session 的候选 ID 与独立 Action Guard 提交流程也已贯通。K 最短路在边态图上以"根路径末边 + 前缀代价（含转向罚时）"为 spur 伪起点、以禁边 overlay 实现 loopless Yen 语义（禁入根节点集 + 禁当前分叉边；B 堆按 (时间, 边序列) 确定性排序；K 上限 8、spur 搜索预算防爆）；一次 plan 为每条候选登记独立 candidateId，compare/guard 无需感知算法差异。前向搜索可按请求记录 settle 序列（order/nodeId/f/g；2 万步预算内全录、超限等距采样并强制保留末步），经 plan 响应内嵌 `searchTrace` 或 route 命令 trace 文件输出，Web 两处工作台以波前动画回放。
+现有十算法（Dijkstra、A\*、双向 Dijkstra、双向 A\*、Yen K 最短路、LPA*、D* Lite、时间依赖 Dijkstra、ALT、CH）已接入 `routing-tools-v2` Navigation Tool Registry：C++ 注册表统一声明算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性、精确性和启发式能力；Agent Session 的候选 ID 与独立 Action Guard 提交流程也已贯通。K 最短路在边态图上以"根路径末边 + 前缀代价（含转向罚时）"为 spur 伪起点、以禁边 overlay 实现 loopless Yen 语义（禁入根节点集 + 禁当前分叉边；B 堆按 (时间, 边序列) 确定性排序；K 上限 8、spur 搜索预算防爆）；一次 plan 为每条候选登记独立 candidateId，compare/guard 无需感知算法差异。前向搜索可按请求记录 settle 序列（order/nodeId/f/g；2 万步预算内全录、超限等距采样并强制保留末步），经 plan 响应内嵌 `searchTrace` 或 route 命令 trace 文件输出，Web 两处工作台以波前动画回放。
 
-1. 按动态重规划研究需要评估 D* Lite、LPA* 和时间依赖路由的实现顺序。
+1. LPA*、D* Lite 与 FIFO 分时速度 Dijkstra 已实现；ALT 与静态 CH 已实现，后续评估可定制 CH 与持久化预处理。
 2. 支持 via-way、conditional restriction 和车型 AccessMask。
-3. restriction-safe 双向 edge-state 搜索，以及 ALT landmark 预处理。
+3. 已完成 restriction-safe 双向 edge-state 搜索和 ALT landmark 预处理；持久化地标文件与跨进程共享仍待评估。
 4. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。
 5. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。
 
@@ -205,6 +205,10 @@ POST /api/maps/{id}/route
 
 ### 转向限制感知双向搜索验收（2026-09-25）
 
-双向 Dijkstra/A* 的能力版本为 2，`effectiveAlgorithm` 保留请求的双向算法。600 组固定种子场景分别与单向 Dijkstra 对拍，覆盖非对称禁转/惩罚、动态禁边/费用、精确部分边起终点、当前边已关闭但车辆仍可驶出、吸附双向 twin、多源/多目标及不可达情况。每条成功路径另行累计真实转向/部分边费用并验证没有驶入封闭道路。双向边态搜索支持 settle 轨迹。该实现仍为每请求搜索，尚不包含增量修复、时间依赖或 ALT/CH。
+双向 Dijkstra/A* 的能力版本为 2，`effectiveAlgorithm` 保留请求的双向算法。600 组固定种子场景分别与单向 Dijkstra 对拍，覆盖非对称禁转/惩罚、动态禁边/费用、精确部分边起终点、当前边已关闭但车辆仍可驶出、吸附双向 twin、多源/多目标及不可达情况。每条成功路径另行累计真实转向/部分边费用并验证没有驶入封闭道路。双向边态搜索支持 settle 轨迹。双向算法仍为每请求搜索，尚不包含时间依赖或 ALT/CH；增量修复由独立的 LPA*、D* Lite 算法提供。
 
-路径并列最优时，算法升级可能选择不同道路序列；新的持久化快照使用重放契约 `zeus-session-replay-v2`，不把不同契约当作可验证重放。旧格式 1/2 仍按未校验兼容路径读取。
+路径并列最优时，算法升级可能选择不同道路序列；该次变更引入重放契约 `zeus-session-replay-v2`；随后 LPA* 及精确路径校验修正升级为 v3，不把不同契约当作可验证重放。旧格式 1/2 仍按未校验兼容路径读取。
+
+LPA* 与 D* Lite 的状态生命周期、适用范围、指标和重放契约变更见 [增量路由说明](incremental-routing.md)。
+
+时间依赖算法的速度积分、出发时间与模型边界见 [时间依赖路由说明](time-dependent-routing.md)。

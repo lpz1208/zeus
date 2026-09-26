@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -22,13 +23,15 @@ const (
 var errRouteWorkersClosed = errors.New("route worker manager is closed")
 
 type RouteWorkerRequest struct {
-	FromLon     float64
-	FromLat     float64
-	ToLon       float64
-	ToLat       float64
-	Algorithm   string
-	MaxDistance float64
-	OutputPath  string
+	DepartureTimeSeconds float64
+	SpeedChanges         []RouteSpeedChange
+	FromLon              float64
+	FromLat              float64
+	ToLon                float64
+	ToLat                float64
+	Algorithm            string
+	MaxDistance          float64
+	OutputPath           string
 	// KPaths requests k-shortest candidates; 0 or 1 means a single path.
 	KPaths int
 	// TracePath receives the search settle trace; empty disables recording.
@@ -276,7 +279,29 @@ func (s *routeWorkerSession) Close() {
 	})
 }
 
+func validateTimeDependentRequest(algorithm string, departure float64, changes []RouteSpeedChange) error {
+	if math.IsNaN(departure) || math.IsInf(departure, 0) || departure < 0 || departure > 1e9 {
+		return errors.New("departureTimeSeconds must be between 0 and 1e9")
+	}
+	if (departure != 0 || len(changes) > 0) && algorithm != "tddijkstra" {
+		return errors.New("departure time and speed changes require tddijkstra")
+	}
+	if len(changes) > 100000 {
+		return errors.New("too many speed changes")
+	}
+	for _, change := range changes {
+		if math.IsNaN(change.TimeSeconds) || math.IsInf(change.TimeSeconds, 0) || change.TimeSeconds < 0 || change.TimeSeconds > 1e9 ||
+			math.IsNaN(change.SpeedFactor) || math.IsInf(change.SpeedFactor, 0) || change.SpeedFactor < .05 || change.SpeedFactor > 3 {
+			return errors.New("speed changes require timeSeconds in [0,1e9] and speedFactor in [0.05,3]")
+		}
+	}
+	return nil
+}
+
 func encodeRouteWorkerRequest(request RouteWorkerRequest) (string, error) {
+	if err := validateTimeDependentRequest(request.Algorithm, request.DepartureTimeSeconds, request.SpeedChanges); err != nil {
+		return "", err
+	}
 	if strings.ContainsAny(request.OutputPath, "\t\r\n") ||
 		strings.ContainsAny(request.TracePath, "\t\r\n") {
 		return "", errors.New("route output path contains a protocol delimiter")
@@ -303,6 +328,13 @@ func encodeRouteWorkerRequest(request RouteWorkerRequest) (string, error) {
 		if field == "" || strings.ContainsAny(field, "\t\r\n") {
 			return "", errors.New("route request contains an invalid protocol field")
 		}
+	}
+	if request.Algorithm == "tddijkstra" {
+		rows := make([]string, 0, len(request.SpeedChanges))
+		for _, change := range request.SpeedChanges {
+			rows = append(rows, strconv.FormatUint(uint64(change.EdgeID), 10)+","+formatFloat(change.TimeSeconds)+","+formatFloat(change.SpeedFactor))
+		}
+		fields = append(fields, formatFloat(request.DepartureTimeSeconds), strings.Join(rows, ";"))
 	}
 	return strings.Join(fields, "\t"), nil
 }

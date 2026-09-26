@@ -182,6 +182,11 @@ export type RouteAlgorithm =
   | 'bidijkstra'
   | 'biastar'
   | 'kshortest'
+  | 'lpa'
+  | 'dstar'
+  | 'tddijkstra'
+  | 'alt'
+  | 'ch'
 
 export interface RouteMatch {
   edge: number
@@ -192,7 +197,15 @@ export interface RouteMatch {
   confidence: number
 }
 
+export interface RouteSpeedChange {
+  edgeId: number
+  timeSeconds: number
+  speedFactor: number
+}
+
 export interface RouteRequest {
+  departureTimeSeconds?: number
+  speedChanges?: RouteSpeedChange[]
   fromLon: number
   fromLat: number
   toLon: number
@@ -226,6 +239,18 @@ export interface SearchTrace {
 }
 
 export interface RouteResponse {
+  chShortcuts?: number
+  chCoreStates?: number
+  chBytes?: number
+  chPreprocessMs?: number
+  chReused?: boolean
+  fallbackReason?: string
+  landmarkCount?: number
+  landmarkBytes?: number
+  landmarkPreprocessMs?: number
+  landmarkReused?: boolean
+  departureTimeSeconds?: number
+  arrivalTimeSeconds?: number
   ok: boolean
   algorithm: string
   effectiveAlgorithm?: string
@@ -804,6 +829,20 @@ export interface AgentStepResponse {
 }
 
 export interface AgentRouteCandidate {
+  chShortcuts?: number
+  chCoreStates?: number
+  chBytes?: number
+  chPreprocessMs?: number
+  chReused?: boolean
+  fallbackReason?: string
+  landmarkCount?: number
+  landmarkBytes?: number
+  landmarkPreprocessMs?: number
+  landmarkReused?: boolean
+  departureTimeSeconds?: number
+  arrivalTimeSeconds?: number
+  incrementalReused?: boolean
+  updatedEdges?: number
   candidateId: string
   vehicleId: number
   algorithm: RouteAlgorithm | 'custom'

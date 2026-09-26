@@ -21,6 +21,7 @@
 #include "zeus/simulation/playback_exporter.h"
 #include "zeus/simulation/simulation_engine.h"
 #include "zeus/simulation/simulation_session.h"
+#include "zeus/simulation/routing_forecast.h"
 
 namespace {
 
@@ -606,6 +607,39 @@ void runDynamicWeightControlRerouteTest() {
     run(zeus::simulation::ControlAction::kSetCapacityFactor);
 }
 
+void runTimeDependentDepartureTest() {
+    using namespace zeus::simulation;
+    Fixture fixture;
+    const auto a = fixture.addNode(0, 0), b = fixture.addNode(100, 0);
+    const auto c = fixture.addNode(300, 0), d = fixture.addNode(400, 0);
+    const auto e = fixture.addNode(200, 100);
+    const auto first = fixture.addEdge(a, b, 10);
+    const auto direct = fixture.addEdge(b, c, 10);
+    const auto goal = fixture.addEdge(c, d, 10);
+    const auto detour = fixture.addEdge(b, e, 10);
+    fixture.addEdge(e, c, 10);
+    SimSetup setup(fixture.data);
+    auto config = quickConfig(250);
+    config.reroute_interval_seconds = 0;
+    auto early = demand(10, .5, 390, .5, 0);
+    early.algorithm = zeus::routing::Algorithm::kTimeDependent;
+    auto late = early; late.depart_time_s = 100;
+    const std::vector<SimulationControlEvent> controls{
+        {5, ControlScope::kEdge, direct, ControlAction::kSetSpeedFactor, .1},
+        {60, ControlScope::kEdge, direct, ControlAction::kSetSpeedFactor, 1}};
+    const auto result = setup.engine->run(config, {early, late}, controls);
+    require(result.ok && result.stats.arrived == 2, "time-dependent vehicles arrive");
+    const auto& early_path = result.routes[result.vehicles[0].route_id].edges;
+    const auto& late_path = result.routes[result.vehicles[1].route_id].edges;
+    require(early_path[1] == detour && late_path == std::vector<zeus::map::EdgeIndex>{first, direct, goal},
+            "same OD at different departure times must not share cached forecasts");
+    const auto rounded = routingSpeedSchedule(fixture.data.edges.size(),
+        std::vector<SimulationControlEvent>{{.75, ControlScope::kEdge, first, ControlAction::kSetSpeedFactor, .5},
+            {.25, ControlScope::kEdge, first, ControlAction::kSetSpeedFactor, 2}}, 1);
+    require(near(rounded.duration(*setup.runtime, first, 100, 1), 20),
+            "rounded speed changes retain chronological last-event precedence");
+}
+
 void runRecoveryRerouteTest() {
     using namespace zeus::simulation;
     Fixture fixture;
@@ -622,7 +656,8 @@ void runRecoveryRerouteTest() {
     SimSetup setup(fixture.data);
     const auto run = [&](double interval, double gain, double cooldown,
                          ControlAction action, bool close_detour = false,
-                         double depart = 20) {
+                         double depart = 20,
+                         zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra) {
         auto config = quickConfig(120);
         config.reroute_recovery_interval_seconds = interval;
         config.reroute_min_gain_seconds = gain;
@@ -634,7 +669,9 @@ void runRecoveryRerouteTest() {
              action == ControlAction::kClose ? ControlAction::kOpen : action, 1},
         };
         if (close_detour) controls.push_back({3, ControlScope::kEdge, detour, ControlAction::kClose, 1});
-        return setup.engine->run(config, {demand(10, .5, 290, .5, depart)}, controls);
+        auto vehicle = demand(10, .5, 290, .5, depart);
+        vehicle.algorithm = algorithm;
+        return setup.engine->run(config, {vehicle}, controls);
     };
     for (const auto action : {ControlAction::kClose, ControlAction::kSetSpeedFactor,
                                ControlAction::kSetCapacityFactor}) {
@@ -655,6 +692,12 @@ void runRecoveryRerouteTest() {
     require(driving.stats.reroute_succeeded == 2 && driving.reroutes.back().time_s == 6 &&
                 driving.reroutes.back().old_route_offset_m > 10,
             "driving recovery plans from the current offset after cooldown");
+    for (const auto algorithm : {zeus::routing::Algorithm::kLpaStar, zeus::routing::Algorithm::kDStarLite, zeus::routing::Algorithm::kAlt, zeus::routing::Algorithm::kCH}) {
+        const auto incremental = run(1, 0, 5, ControlAction::kClose, false, 0, algorithm);
+        require(incremental.stats.arrived == 1 && incremental.stats.reroute_succeeded == 2 &&
+                    incremental.reroutes.back().time_s == 6,
+                "native incremental vehicles repair closure and recovery routes with cooldown");
+    }
     const auto small_gain = run(1, 100, 0, ControlAction::kClose);
     require(small_gain.stats.reroute_succeeded == 1,
             "optional recovery below minimum gain keeps the detour");
@@ -1742,6 +1785,7 @@ int main() {
         runClosureRerouteTest();
         runClosureRerouteFailureTest();
         runDynamicWeightControlRerouteTest();
+        runTimeDependentDepartureTest();
         runRecoveryRerouteTest();
         runAgentRecoveryNotificationTest();
         runPeriodicCongestionRerouteTest();

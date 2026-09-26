@@ -64,7 +64,7 @@ Zeus 是一个面向地理空间智能体研究的动态道路仿真与评测平
 - Agent 决策过程的 Web 时间线和回放。
 - 固定算法、事件触发重规划、规则 Agent 与模型 Agent 的批量对照评测。
 - Benchmark 任务持久化、并发门禁、取消/重启恢复、Web 进度与 JSON/CSV 报告。
-- 五算法注册表（含 Yen K 最短路）、多候选比较与搜索波前回放。
+- 十算法注册表（含增量路由与时间依赖路由）、多候选比较与搜索波前回放。
 - 自定义 Python 子集算法、静态运行/调试、实验历史和车辆精确路径执行；自动代码导航支持页面循环和独立后台任务，后台任务可在重启后手动恢复。
 
 当前运行时使用 HTTP 与常驻 C++ Worker 帧协议，Protobuf 为目标契约，gRPC 尚未接入。Memory、分层多智能体与生产级鉴权/隔离不属于当前已交付能力。
@@ -591,7 +591,7 @@ RouteResult 包含道路或车道序列、几何、总距离、预计时间、�
 - 动态权重 A*。
 - 时间依赖最短路径。
 
-后续增加 ALT、Contraction Hierarchies、D* Lite、LPA* 和多目标路线。
+LPA* 与 D* Lite 增量路由已接入，详见 [增量路由说明](incremental-routing.md)。ALT 地标 A* 已接入（[实现说明](alt-routing.md)）；CH 收缩层级已接入（[实现说明](ch-routing.md)）；后续增加多目标路线。
 
 ### 9.3 代价模型
 
@@ -998,7 +998,7 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 
 - 有状态 SimulationSession 和 reset/observe/step/snapshot。
 - Observation、Action、Tool 和 DecisionTrace Protobuf。
-- 五算法 Tool Registry 与规则策略基线。
+- 十算法 Tool Registry 与规则策略基线。
 - Python LangGraph Agent Runtime 和独立 ModelProvider。
 - 事件触发 Agent、Action Guard、超时及确定性 fallback。
 - Web Agent 决策时间线、回放和单智能体对照评测。
@@ -1073,7 +1073,7 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 6. C++ 依赖管理使用 Conan 还是 vcpkg。
 7. MVP 是否需要用户登录和多租户权限。
 8. 自定义算法已允许本地运行 Python 子集；公开部署的系统隔离与鉴权方案待确定。
-9. Yen K 最短路已实现；D* Lite 与时间依赖算法的后续实现顺序待确定。
+9. Yen K 最短路、LPA* 与 D* Lite 已实现；FIFO 分时速度路由已接入（[模型边界](time-dependent-routing.md)），ALT 与静态 CH 已接入（[CH 模型边界](ch-routing.md)），后续推进 via-way 与 conditional/access。
 10. 区域 Agent 的初始划分采用固定网格、行政区还是动态路网社区。
 11. 本科毕设实验规模采用“万级车辆 + 百级规则/轻量 Agent + 1–5 个 LLM Agent”的具体上限。
 

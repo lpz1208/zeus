@@ -202,7 +202,24 @@ class VehicleObservation(SessionState):
         return None
 
 
-class RouteCandidate(CamelModel):
+class RoutingStatistics(CamelModel):
+    ch_shortcuts: int = 0
+    ch_core_states: int = 0
+    ch_bytes: int = 0
+    ch_preprocess_ms: float = 0
+    ch_reused: bool = False
+    fallback_reason: str | None = None
+    landmark_count: int = 0
+    landmark_bytes: int = 0
+    landmark_preprocess_ms: float = 0
+    landmark_reused: bool = False
+    departure_time_seconds: float | None = None
+    arrival_time_seconds: float | None = None
+    incremental_reused: bool = False
+    updated_edges: int = 0
+
+
+class RouteCandidate(RoutingStatistics):
     candidate_id: str
     vehicle_id: int = 0
     algorithm: str = "dijkstra"
@@ -232,7 +249,7 @@ class PlanAlternative(CamelModel):
     edges: list[int] = Field(default_factory=list)
 
 
-class PlanResponse(CamelModel):
+class PlanResponse(RoutingStatistics):
     """Plan response: the best candidate at top level, plus the k-shortest
     alternatives array when the environment produced more than one path."""
 
@@ -429,12 +446,8 @@ class HttpEnvironmentClient:
         }
         if not response.alternatives:
             return [RouteCandidate.model_validate({
-                **shared,
+                **response.model_dump(),
                 "candidate_id": response.candidate_id or "",
-                "time_s": response.time_s,
-                "length_m": response.length_m,
-                "expanded_nodes": response.expanded_nodes,
-                "edges": response.edges,
             })]
         return [
             RouteCandidate.model_validate({

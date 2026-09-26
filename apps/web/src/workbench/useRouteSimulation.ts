@@ -51,6 +51,8 @@ function loadSession<T>(key: string, fallback: T): T {
 export interface RouteSimApi {
   routeMode: boolean
   routeAlgorithm: RouteAlgorithm
+  routeDeparture: number
+  setRouteDeparture(seconds: number): void
   routeStart: [number, number] | null
   routeEnd: [number, number] | null
   routeResult: RouteResponse | null
@@ -106,6 +108,10 @@ export function useRouteSimulation(
 
   const [routeMode, setRouteMode] = useState(false)
   const [routeAlgorithm, setRouteAlgorithmState] = useState<RouteAlgorithm>('dijkstra')
+  const [routeDeparture, setRouteDepartureState] = useState(0)
+  const departureRef = useRef(routeDeparture)
+  departureRef.current = routeDeparture
+  const routeRequestVersion = useRef(0)
   const [routeK, setRouteKState] = useState(3)
   const [selectedAltIndex, setSelectedAltIndex] = useState(0)
   const [routeStart, setRouteStart] = useState<[number, number] | null>(null)
@@ -135,12 +141,18 @@ export function useRouteSimulation(
     } catch { /* storage full or blocked */ }
   }, [simControls])
 
+  const controlsRef = useRef(simControls)
+  controlsRef.current = simControls
+  const stepRef = useRef(simConfig.stepSeconds)
+  stepRef.current = simConfig.stepSeconds
+
   const computeRoute = useCallback(async (
     from: [number, number],
     to: [number, number],
     algorithm: RouteAlgorithm,
   ) => {
     if (!activeMap) return
+    const version = ++routeRequestVersion.current
     setRouteBusy(true)
     setError('')
     try {
@@ -153,13 +165,21 @@ export function useRouteSimulation(
         maxDistance: 100,
         kPaths: algorithm === 'kshortest' ? routeKRef.current : undefined,
         recordTrace: true,
+        departureTimeSeconds: algorithm === 'tddijkstra' ? departureRef.current : undefined,
+        speedChanges: algorithm === 'tddijkstra' ? [...controlsRef.current.roadControls]
+          .sort((a, b) => a.timeSeconds - b.timeSeconds)
+          .filter(control => control.action === 'speedFactor')
+          .flatMap(control => control.edgeIds.map(edgeId => ({ edgeId,
+            timeSeconds: Math.max(0, Math.ceil((control.timeSeconds - 1e-9) / stepRef.current) * stepRef.current),
+            speedFactor: control.value ?? 1 }))) : undefined,
       })
+      if (version !== routeRequestVersion.current) return
       setRouteResult(result)
       onRouteReadyRef.current()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '路径规划失败。')
+      if (version === routeRequestVersion.current) setError(reason instanceof Error ? reason.message : '路径规划失败。')
     } finally {
-      setRouteBusy(false)
+      if (version === routeRequestVersion.current) setRouteBusy(false)
     }
   }, [activeMap])
 
@@ -177,6 +197,8 @@ export function useRouteSimulation(
 
   const handleRoutePoint = useCallback((longitude: number, latitude: number) => {
     if (!startRef.current || endRef.current) {
+      ++routeRequestVersion.current
+      setRouteBusy(false)
       setRouteStart([longitude, latitude])
       setRouteEnd(null)
       setRouteResult(null)
@@ -194,6 +216,19 @@ export function useRouteSimulation(
       void computeRoute(startRef.current, endRef.current, algorithm)
     }
   }
+
+  const setRouteDeparture = (seconds: number) => {
+    const value = Number.isFinite(seconds) ? Math.max(0, Math.min(1e9, seconds)) : 0
+    departureRef.current = value
+    setRouteDepartureState(value)
+    if (algorithmRef.current === 'tddijkstra' && startRef.current && endRef.current)
+      void computeRoute(startRef.current, endRef.current, algorithmRef.current)
+  }
+
+  useEffect(() => {
+    if (algorithmRef.current === 'tddijkstra' && startRef.current && endRef.current)
+      void computeRoute(startRef.current, endRef.current, algorithmRef.current)
+  }, [simControls.roadControls, simConfig.stepSeconds, computeRoute])
 
   const setRouteK = (k: number) => {
     const clamped = Math.max(1, Math.min(8, Math.round(k) || 1))
@@ -253,6 +288,8 @@ export function useRouteSimulation(
   }
 
   const clearRoute = () => {
+    ++routeRequestVersion.current
+    setRouteBusy(false)
     setRouteStart(null)
     setRouteEnd(null)
     setRouteResult(null)
@@ -291,6 +328,8 @@ export function useRouteSimulation(
   }
 
   const resetForMapChange = () => {
+    ++routeRequestVersion.current
+    setRouteBusy(false)
     setRouteStart(null)
     setRouteEnd(null)
     setRouteResult(null)
@@ -299,7 +338,7 @@ export function useRouteSimulation(
   }
 
   return {
-    routeMode, routeAlgorithm, routeK, setRouteK, routeStart, routeEnd, routeResult, routeBusy,
+    routeMode, routeAlgorithm, routeDeparture, setRouteDeparture, routeK, setRouteK, routeStart, routeEnd, routeResult, routeBusy,
     selectedAltIndex, selectAlternative: setSelectedAltIndex,
     routeMainData, routeGhostData, tracePlayback,
     simConfig, patchSimConfig, simResult, simBusy, simControls, scenarioDirty,

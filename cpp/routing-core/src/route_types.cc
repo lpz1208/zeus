@@ -8,7 +8,7 @@
 namespace zeus::routing {
 namespace {
 
-constexpr std::array<AlgorithmCapability, 5> kCapabilities = {{
+constexpr std::array<AlgorithmCapability, 10> kCapabilities = {{
     {Algorithm::kDijkstra, "1", "forward", true, false, false, false,
      true, true, false},
     {Algorithm::kAStar, "1", "forward", true, false, false, false,
@@ -17,6 +17,16 @@ constexpr std::array<AlgorithmCapability, 5> kCapabilities = {{
      false, false, true, true, false},
     {Algorithm::kBidirectionalAStar, "2", "bidirectional", true, false,
      false, false, true, true, true},
+    {Algorithm::kCH, "1", "bidirectional", false, false, false, false,
+     true, true, false},
+    {Algorithm::kAlt, "1", "forward", true, false, false, false,
+     true, true, true},
+    {Algorithm::kTimeDependent, "1", "forward", true, false, false, true,
+     true, true, false},
+    {Algorithm::kLpaStar, "1", "backward", true, true, false, false,
+     true, true, false},
+    {Algorithm::kDStarLite, "1", "backward", true, true, false, false,
+     true, true, true},
     {Algorithm::kKShortest, "1", "forward", true, false, true, false,
      true, true, false},
 }};
@@ -25,6 +35,16 @@ constexpr std::array<AlgorithmCapability, 5> kCapabilities = {{
 
 const char* algorithmName(Algorithm algorithm) {
     switch (algorithm) {
+        case Algorithm::kCH:
+            return "ch";
+        case Algorithm::kAlt:
+            return "alt";
+        case Algorithm::kTimeDependent:
+            return "tddijkstra";
+        case Algorithm::kDStarLite:
+            return "dstar";
+        case Algorithm::kLpaStar:
+            return "lpa";
         case Algorithm::kAStar:
             return "astar";
         case Algorithm::kBidirectionalDijkstra:
@@ -45,6 +65,26 @@ bool parseAlgorithm(const std::string& value, Algorithm& algorithm) {
     for (const char character : value) {
         normalized.push_back(static_cast<char>(std::tolower(
             static_cast<unsigned char>(character))));
+    }
+    if (normalized == "ch") {
+        algorithm = Algorithm::kCH;
+        return true;
+    }
+    if (normalized == "alt") {
+        algorithm = Algorithm::kAlt;
+        return true;
+    }
+    if (normalized == "tddijkstra") {
+        algorithm = Algorithm::kTimeDependent;
+        return true;
+    }
+    if (normalized == "dstar" || normalized == "dstar-lite" || normalized == "d*lite") {
+        algorithm = Algorithm::kDStarLite;
+        return true;
+    }
+    if (normalized == "lpa" || normalized == "lpa*") {
+        algorithm = Algorithm::kLpaStar;
+        return true;
     }
     if (normalized == "dijkstra") {
         algorithm = Algorithm::kDijkstra;
@@ -70,9 +110,13 @@ bool parseAlgorithm(const std::string& value, Algorithm& algorithm) {
     return false;
 }
 
+bool isIncremental(Algorithm algorithm) {
+    return algorithm == Algorithm::kLpaStar || algorithm == Algorithm::kDStarLite;
+}
+
 bool isBidirectional(Algorithm algorithm) {
     return algorithm == Algorithm::kBidirectionalDijkstra ||
-           algorithm == Algorithm::kBidirectionalAStar;
+           algorithm == Algorithm::kBidirectionalAStar || algorithm == Algorithm::kCH;
 }
 
 std::span<const AlgorithmCapability> algorithmCapabilities() {

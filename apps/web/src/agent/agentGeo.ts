@@ -12,6 +12,20 @@ export const algorithmLabels: Record<RouteAlgorithm | 'custom', string> = {
   bidijkstra: 'Bi-Dijkstra',
   biastar: 'Bi-A*',
   kshortest: 'K-Shortest',
+  lpa: 'LPA*',
+  dstar: 'D* Lite',
+  tddijkstra: '时间依赖 Dijkstra',
+  alt: 'ALT（地标 A*）',
+  ch: 'CH（收缩层级）',
+}
+
+export function formatCHStatus(result: {
+  fallbackReason?: string; chReused?: boolean; chPreprocessMs?: number;
+  chShortcuts?: number; chCoreStates?: number;
+}): string {
+  if (result.fallbackReason === 'ch_dynamic_weights') return '路况已变化 · 改用双向 Dijkstra'
+  if (result.fallbackReason) return '预处理超出预算 · 改用双向 Dijkstra'
+  return `${result.chReused ? '复用预处理' : `预处理 ${(result.chPreprocessMs ?? 0).toFixed(1)} ms`} · ${result.chShortcuts ?? 0} 条捷径${result.chCoreStates ? ` · ${result.chCoreStates} 个核心状态` : ''}`
 }
 
 export function formatTime(seconds: number): string {

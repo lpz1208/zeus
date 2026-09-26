@@ -7,11 +7,14 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
 #include "zeus/routing/route_types.h"
+#include "zeus/routing/incremental_search.h"
+#include "zeus/simulation/routing_forecast.h"
 #include "zeus/routing/algorithm_lab.h"
 #include "zeus/simulation/vehicle_store.h"
 
@@ -54,12 +57,13 @@ struct RouteKey {
     std::uint64_t destination_x_bits = 0;
     std::uint64_t destination_y_bits = 0;
     zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
+    double departure_s = 0;
 
     bool operator<(const RouteKey& other) const {
         return std::tie(origin_x_bits, origin_y_bits, destination_x_bits, destination_y_bits,
-                        algorithm) <
+                        algorithm, departure_s) <
                std::tie(other.origin_x_bits, other.origin_y_bits,
-                        other.destination_x_bits, other.destination_y_bits, other.algorithm);
+                        other.destination_x_bits, other.destination_y_bits, other.algorithm, other.departure_s);
     }
 };
 
@@ -74,14 +78,16 @@ struct DynamicRouteKey {
     std::uint64_t destination_offset_bits = 0;
     zeus::routing::Algorithm algorithm = zeus::routing::Algorithm::kDijkstra;
 
+    double departure_s = 0;
+
     bool operator<(const DynamicRouteKey& other) const {
         return std::tie(old_route_id, exact_origin, origin_edge, origin_offset_bits,
                         origin_x_bits, origin_y_bits, destination_edge,
-                        destination_offset_bits, algorithm) <
+                        destination_offset_bits, algorithm, departure_s) <
                std::tie(other.old_route_id, other.exact_origin, other.origin_edge,
                         other.origin_offset_bits, other.origin_x_bits,
                         other.origin_y_bits, other.destination_edge,
-                        other.destination_offset_bits, other.algorithm);
+                        other.destination_offset_bits, other.algorithm, other.departure_s);
     }
 };
 
@@ -285,6 +291,22 @@ SimulationResult SimulationEngine::run(
         capacity[i] = static_cast<std::uint32_t>(std::max(1.0, jam_slots));
     }
 
+    const auto speed_schedule = routingSpeedSchedule(edge_count, sorted_controls, result.config.step_seconds);
+
+    // One lazily allocated context per engine run, bounded independently of
+    // fleet size. A different destination resets it; no cross-thread sharing.
+    const bool retain_incremental = std::any_of(demands.begin(), demands.end(), [](const auto& vehicle) {
+        return !vehicle.agent_controlled && zeus::routing::isIncremental(vehicle.algorithm);
+    });
+    std::unique_ptr<zeus::routing::IncrementalSearch> incremental;
+    const auto planRoute = [&](zeus::routing::RouteRequest request) {
+        if (request.algorithm == zeus::routing::Algorithm::kTimeDependent)
+            request.speed_schedule = &speed_schedule;
+        if (retain_incremental && zeus::routing::isIncremental(request.algorithm) && !incremental)
+            incremental = std::make_unique<zeus::routing::IncrementalSearch>(runtime_);
+        return planner_.plan(request, incremental.get());
+    };
+
     // Route pool: demands with identical OD and algorithm plan exactly once.
     // A cache value of -1 marks a demand that cannot be routed.
     std::map<RouteKey, std::int32_t> route_cache;
@@ -300,13 +322,17 @@ SimulationResult SimulationEngine::run(
             !std::isfinite(demand.depart_time_s) || demand.depart_time_s < 0.0) {
             throw std::invalid_argument("invalid vehicle demand");
         }
-        auto [entry, inserted] = route_cache.try_emplace(routeKey(demand), -2);
+        auto key = routeKey(demand);
+        if (demand.algorithm == zeus::routing::Algorithm::kTimeDependent)
+            key.departure_s = routingDepartureTime(demand.depart_time_s, result.config.step_seconds);
+        auto [entry, inserted] = route_cache.try_emplace(key, -2);
         if (entry->second == -2) {
             zeus::routing::RouteRequest request;
             request.origin = demand.origin;
             request.destination = demand.destination;
             request.algorithm = demand.algorithm;
-            const zeus::routing::RouteResult planned = planner_.plan(request);
+            request.departure_time_s = key.departure_s;
+            const zeus::routing::RouteResult planned = planRoute(request);
             if (planned.ok) {
                 result.routes.push_back(planned.path);
                 entry->second = static_cast<std::int32_t>(result.routes.size() - 1);
@@ -535,7 +561,7 @@ SimulationResult SimulationEngine::run(
 
     const auto remainingRouteTime = [&](
         const zeus::routing::RoutePath& route, std::size_t first_index,
-        double first_offset) {
+        double first_offset, bool timed = false, double departure = 0, double reference = 0) {
         double total = 0.0;
         for (std::size_t route_index = first_index;
              route_index < route.edges.size(); ++route_index) {
@@ -556,7 +582,10 @@ SimulationResult SimulationEngine::run(
             const double end = route_index + 1 == route.edges.size()
                                    ? route.end_offset_m
                                    : edge.length_m;
-            total += std::max(0.0, end - begin) /
+            total += timed
+                ? speed_schedule.duration(runtime_, edge_index, std::max(0.0, end - begin),
+                    departure + total, routing_edge_cost_factors[edge_index], reference)
+                : std::max(0.0, end - begin) /
                      freeSpeedMps(edge) * routing_edge_cost_factors[edge_index];
         }
         return total;
@@ -632,6 +661,8 @@ SimulationResult SimulationEngine::run(
             key.destination_offset_bits =
                 std::bit_cast<std::uint64_t>(old_route.end_offset_m);
             key.algorithm = demand.algorithm;
+            if (demand.algorithm == zeus::routing::Algorithm::kTimeDependent)
+                key.departure_s = std::max(now, routingDepartureTime(demand.depart_time_s, result.config.step_seconds));
 
             auto [cached, inserted] = cache.try_emplace(key);
             if (inserted) {
@@ -643,13 +674,15 @@ SimulationResult SimulationEngine::run(
                     request.destination = demand.destination;
                     request.algorithm = demand.algorithm;
                     request.overlay = &overlay;
+                    request.departure_time_s = std::max(now, routingDepartureTime(demand.depart_time_s, result.config.step_seconds));
+                    request.cost_reference_time_s = now;
                     request.destination_position = zeus::routing::RoutePosition{
                         key.destination_edge, old_route.end_offset_m};
                     if (key.exact_origin) {
                         request.origin_position = zeus::routing::RoutePosition{
                             key.origin_edge, store.offsets_[i]};
                     }
-                    const zeus::routing::RouteResult planned = planner_.plan(request);
+                    const zeus::routing::RouteResult planned = planRoute(request);
                     ++result.stats.route_plans;
                     if (planned.ok) {
                         const std::size_t current_index = key.exact_origin
@@ -659,7 +692,9 @@ SimulationResult SimulationEngine::run(
                                                           ? store.offsets_[i]
                                                           : old_route.start_offset_m;
                         const double current_time = remainingRouteTime(
-                            old_route, current_index, current_offset);
+                            old_route, current_index, current_offset,
+                            demand.algorithm == zeus::routing::Algorithm::kTimeDependent,
+                            request.departure_time_s, now);
                         const bool same_path =
                             planned.path.edges.size() ==
                                 old_route.edges.size() - current_index &&
@@ -740,6 +775,8 @@ SimulationResult SimulationEngine::run(
         request.origin = demands[i].origin;
         request.destination = demands[i].destination;
         request.algorithm = injection.algorithm;
+        request.departure_time_s = std::max(now, routingDepartureTime(demands[i].depart_time_s, result.config.step_seconds));
+        request.cost_reference_time_s = now;
         request.overlay = &overlay;
         request.destination_position = zeus::routing::RoutePosition{
             old_route.edges.back(), old_route.end_offset_m};
@@ -756,7 +793,7 @@ SimulationResult SimulationEngine::run(
                 return;
             }
         } else {
-            planned = planner_.plan(request);
+            planned = planRoute(request);
         }
         ++result.stats.route_plans;
         if (!planned.ok) {
@@ -835,10 +872,15 @@ SimulationResult SimulationEngine::run(
                     route.edges.begin() + static_cast<std::ptrdiff_t>(store.route_indices_[i]),
                     route.edges.end());
                 state.remaining_eta_s =
-                    remainingRouteTime(route, store.route_indices_[i], store.offsets_[i]);
+                    remainingRouteTime(route, store.route_indices_[i], store.offsets_[i],
+                        demands[i].algorithm == zeus::routing::Algorithm::kTimeDependent,
+                        snapshot.simulation_time_s, (committed_ticks > 0 ? committed_ticks - 1 : 0) * step);
             } else if (store.states_[i] == VehicleState::kWaiting) {
                 state.remaining_edges = route.edges;
-                state.remaining_eta_s = remainingRouteTime(route, 0, route.start_offset_m);
+                state.remaining_eta_s = remainingRouteTime(route, 0, route.start_offset_m,
+                    demands[i].algorithm == zeus::routing::Algorithm::kTimeDependent,
+                    std::max(snapshot.simulation_time_s, routingDepartureTime(demands[i].depart_time_s, step)),
+                    (committed_ticks > 0 ? committed_ticks - 1 : 0) * step);
             }
             snapshot.agents.push_back(std::move(state));
         }

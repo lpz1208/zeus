@@ -19,6 +19,11 @@ enum class Algorithm : std::uint8_t {
     kBidirectionalDijkstra = 2,
     kBidirectionalAStar = 3,
     kKShortest = 4,
+    kLpaStar = 5,
+    kDStarLite = 6,
+    kTimeDependent = 7,
+    kAlt = 8,
+    kCH = 9,
 };
 
 // Stable metadata exposed to navigation agents. Algorithms remain ordinary
@@ -38,6 +43,7 @@ struct AlgorithmCapability {
 };
 
 [[nodiscard]] const char* algorithmName(Algorithm algorithm);
+[[nodiscard]] bool isIncremental(Algorithm algorithm);
 [[nodiscard]] bool parseAlgorithm(const std::string& value, Algorithm& algorithm);
 [[nodiscard]] bool isBidirectional(Algorithm algorithm);
 [[nodiscard]] std::span<const AlgorithmCapability> algorithmCapabilities();
@@ -72,6 +78,7 @@ struct RoutePosition {
     double offset_s = 0.0;
 };
 
+class SpeedSchedule;
 struct RouteRequest {
     zeus::map::Point2d origin;
     zeus::map::Point2d destination;
@@ -89,6 +96,10 @@ struct RouteRequest {
     std::optional<RoutePosition> origin_position;
     std::optional<RoutePosition> destination_position;
     const RoutingOverlay* overlay = nullptr;
+    // Absolute scenario seconds; only tddijkstra consumes scheduled speeds.
+    double departure_time_s = 0;
+    double cost_reference_time_s = 0;
+    const SpeedSchedule* speed_schedule = nullptr;
 };
 
 struct RouteEndpointMatch {
@@ -105,6 +116,18 @@ struct RoutePath {
 };
 
 struct RouteStatistics {
+    std::size_t ch_shortcuts = 0;
+    std::size_t ch_core_states = 0;
+    std::size_t ch_bytes = 0;
+    double ch_preprocess_ms = 0;
+    bool ch_reused = false;
+    std::string fallback_reason;
+    std::size_t landmark_count = 0;
+    std::size_t landmark_bytes = 0;
+    double landmark_preprocess_ms = 0;
+    bool landmark_reused = false;
+    bool incremental_reused = false;
+    std::uint64_t updated_edges = 0;
     double length_m = 0.0;
     double time_s = 0.0;
     std::uint64_t expanded_nodes = 0;

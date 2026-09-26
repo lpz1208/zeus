@@ -238,7 +238,7 @@ commit_route(candidate_id, expected_state_version)
 keep_route(reason_code)
 ```
 
-现有 `dijkstra`、`astar`、`bidirectional_dijkstra`、`bidirectional_astar` 首先接入注册表；D* Lite、LPA*、K Shortest Paths 和时间依赖路由作为后续算法版本增加。
+现有 `dijkstra`、`astar`、`bidijkstra`、`biastar`、`kshortest`、`lpa`、`dstar`、`tddijkstra`、`alt` 与 `ch` 已接入注册表。时间依赖算法的预测范围见 [实现说明](time-dependent-routing.md)。
 
 ### 7.3 一次动态切换示例
 
@@ -383,7 +383,7 @@ latency / token usage / failure and fallback
 - 动作注入已实现：原生算法候选在下一 tick 边界按记录的算法确定性重规划；自定义候选提交精确路径，并在提交与执行时分别校验版本、位置和道路合法性，执行失败保留原路线。`keep` 为版本校验确认；agent 车辆被排除出自动重规划。
 - Go 控制面：`SessionWorkerManager`（按地图常驻、LRU、挂死重启）+ `/api/maps/{id}/agent/sessions/*` 端点（创建/观察/plan/step/actions/run/pause/result/关闭），决策边界自动开 `DecisionCoordinator` 屏障（默认 5 分钟墙上 TTL，可配置）；超时 fallback 会把版本校验的 keep_route 实际提交到 C++。actions 采用两阶段语义，只有 Worker 明确接受后才关闭屏障，拒绝时保留决策供修正；每个 Session 有活动决策门禁，未处理前拒绝继续 step。HTTP `/run` 使用非阻塞 resume，因此 `/pause` 可在后续请求中生效。
 - 持久化 Snapshot/Restore 已实现：只允许在暂停或完成边界创建快照，按版本化 JSON 保存地图、请求、目标 tick 和已接受的 commit/keep 动作日志；restore 通过确定性重放创建独立 Session，控制服务或 Worker 重启后仍可加载。Go 已提供创建、恢复和删除快照端点；恢复到决策边界时会为新 Session 打开独立 Decision Barrier。
-- 五算法 Tool Registry 已实现（含 Yen K 最短路，routing-tools-v2）：C++ `algorithmCapabilities()` 是能力元数据的唯一来源，`session-worker tools` 与 `GET /api/maps/{id}/agent/tools` 暴露 registry version、算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性和精确性声明；单车 Observation 同步携带该能力列表。
+- 十算法 Tool Registry 已实现（含 Yen K 最短路，routing-tools-v2）：C++ `algorithmCapabilities()` 是能力元数据的唯一来源，`session-worker tools` 与 `GET /api/maps/{id}/agent/tools` 暴露 registry version、算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性和精确性声明；单车 Observation 同步携带该能力列表。
 - 同步落地保真度修复：出口放行间隔默认 1.4/2.0 s 且到达免闸、min_speed_ratio 默认 0（饱和路段真停，含动态代价除零保护）、移动序按队列序放行、per-edge KPI（entries/vehicle_seconds/mean_speed，playback 导出）、建图期自动生成转向罚时（U-turn 5 s、急左转 2 s、支路进干路 3 s，max-merge sidecar）。
 - A2 单导航智能体最小闭环已交付（apps/agent-runtime，uv + LangGraph + httpx + pydantic）：
   - `EnvironmentClient` Protocol + HTTP 实现（传输抽象；HTTP-first 是 A2 的明确决策，目标 gRPC 边界未放弃）；

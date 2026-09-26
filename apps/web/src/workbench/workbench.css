@@ -984,6 +984,8 @@
   background: var(--paper); font-size: 11px; font-weight: 700;
   font-family: inherit; color: var(--ink);
 }
+.wb-departure-input { width: 116px; }
+.wb-forecast-note { margin: 10px 0; color: var(--quiet); font-size: 11px; line-height: 1.5; }
 .wb-alts { margin-top: 12px; }
 .wb-alts-label {
   font-size: 9.5px; letter-spacing: 0.12em; color: var(--quiet);
