@@ -4,8 +4,8 @@
 #include "zeus/routing/route_planner.h"
 
 namespace zeus::routing {
-// Edge-state graph. -1 is the virtual origin; -2 is the virtual destination.
-// Keeping the incoming edge in the state makes turn restrictions unavoidable.
+// Road/history state graph. -1 is the virtual origin; -2 is the destination.
+// State IDs are opaque; physical roads are exposed separately in edge.
 struct LabTransition {
     int state;
     zeus::map::EdgeIndex edge;

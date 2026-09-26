@@ -676,6 +676,7 @@ private:
         if (agent->state == zeus::simulation::VehicleState::kDriving) {
             request.origin_position =
                 zeus::routing::RoutePosition{agent->edge, agent->offset_s};
+            request.origin_turn_state = agent->turn_state;
         }
         zeus::routing::IncrementalSearch* repair = nullptr;
         if (zeus::routing::isIncremental(algorithm)) {
@@ -701,7 +702,7 @@ private:
         });
         if (entry.candidates.size() + std::max<std::size_t>(1, planned.alternatives.size()) > 128)
             throw std::invalid_argument("candidate limit reached");
-        if ((zeus::routing::isIncremental(algorithm) || algorithm == zeus::routing::Algorithm::kTimeDependent || algorithm == zeus::routing::Algorithm::kAlt || algorithm == zeus::routing::Algorithm::kCH) && planned.path.edges.size() > 9999)
+        if ((zeus::routing::isIncremental(algorithm) || algorithm == zeus::routing::Algorithm::kTimeDependent || algorithm == zeus::routing::Algorithm::kAlt || algorithm == zeus::routing::Algorithm::kCH || runtime_.hasTurnSequences()) && planned.path.edges.size() > 9999)
             throw std::invalid_argument("exact candidate exceeds 9999 edges");
         const std::string candidate_id = "cand-" + std::to_string(entry.next_candidate++);
         out << "{\"candidateId\": " << jsonString(candidate_id)
@@ -722,15 +723,14 @@ private:
         candidate.edges = planned.path.edges;
         // Persist the selected path; application/replay must not depend on
         // whether a warm search context is still resident.
-        if (zeus::routing::isIncremental(algorithm) || algorithm == zeus::routing::Algorithm::kTimeDependent || algorithm == zeus::routing::Algorithm::kAlt || algorithm == zeus::routing::Algorithm::kCH) candidate.exact_path = planned.path;
+        if (zeus::routing::isIncremental(algorithm) || algorithm == zeus::routing::Algorithm::kTimeDependent || algorithm == zeus::routing::Algorithm::kAlt || algorithm == zeus::routing::Algorithm::kCH || runtime_.hasTurnSequences()) candidate.exact_path = planned.path;
         entry.candidates[candidate_id] = candidate;
         if (algorithm == zeus::routing::Algorithm::kCH) {
             out << ", \"chShortcuts\": " << planned.stats.ch_shortcuts
                 << ", \"chCoreStates\": " << planned.stats.ch_core_states
                 << ", \"chBytes\": " << planned.stats.ch_bytes
                 << ", \"chPreprocessMs\": " << jsonNumber(planned.stats.ch_preprocess_ms)
-                << ", \"chReused\": " << (planned.stats.ch_reused ? "true" : "false")
-                << ", \"fallbackReason\": " << jsonString(planned.stats.fallback_reason);
+                << ", \"chReused\": " << (planned.stats.ch_reused ? "true" : "false");
         }
         if (algorithm == zeus::routing::Algorithm::kAlt) {
             out << ", \"landmarkCount\": " << planned.stats.landmark_count
@@ -742,6 +742,7 @@ private:
             out << ", \"departureTimeSeconds\": " << jsonNumber(request.departure_time_s)
                 << ", \"arrivalTimeSeconds\": " << jsonNumber(request.departure_time_s + planned.stats.time_s);
         }
+        out << ", \"fallbackReason\": " << jsonString(planned.stats.fallback_reason);
         out << ", \"effectiveAlgorithm\": "
             << jsonString(zeus::routing::algorithmName(planned.effective_algorithm))
             << ", \"basedOnStateVersion\": " << state.state_version
@@ -842,6 +843,7 @@ private:
             agent->destination_edge, agent->route_end_offset_m};
         if (agent->state == zeus::simulation::VehicleState::kDriving) {
             request.origin_position = zeus::routing::RoutePosition{agent->edge, agent->offset_s};
+            request.origin_turn_state = agent->turn_state;
         }
         const zeus::routing::AlgorithmLab lab(runtime_, request);
         if (fields[0] == "algorithm-context") {

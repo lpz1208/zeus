@@ -12,6 +12,7 @@
 #include "zeus/routing/time_dependent.h"
 #include "zeus/routing/landmarks.h"
 #include "zeus/routing/contraction_hierarchy.h"
+#include "zeus/routing/sequence_search.h"
 
 namespace zeus::routing {
 namespace {
@@ -246,6 +247,8 @@ RouteResult RoutePlanner::plan(const RouteRequest& request, IncrementalSearch* i
         appendGoal(destination_twin);
     }
 
+    if (request.origin_turn_state) (void)SequenceGraph(runtime_).initial(request, query.starts.front().edge);
+
     // Direct travel along one matched edge, no intersection search needed.
     DirectOption direct;
     for (std::size_t s = 0; s < query.starts.size(); ++s) {
@@ -271,7 +274,7 @@ RouteResult RoutePlanner::plan(const RouteRequest& request, IncrementalSearch* i
 
     // K-shortest selection assembles its own result (best path plus the
     // full candidate list) and never mixes with the single-path search below.
-    if (request.algorithm == Algorithm::kKShortest && request.k_paths > 1) {
+    if (!runtime_.hasTurnSequences() && request.algorithm == Algorithm::kKShortest && request.k_paths > 1) {
         const KShortestResult selection =
             runKShortestPaths(runtime_, query, max_speed_mps_, request.k_paths);
         const bool use_search =
@@ -335,7 +338,11 @@ RouteResult RoutePlanner::plan(const RouteRequest& request, IncrementalSearch* i
     }
 
     SearchOutput search;
-    if (request.algorithm == Algorithm::kCH) {
+    if (runtime_.hasTurnSequences()) {
+        result.effective_algorithm = request.algorithm == Algorithm::kTimeDependent ? Algorithm::kTimeDependent : Algorithm::kDijkstra;
+        if (result.effective_algorithm != request.algorithm) result.stats.fallback_reason = "via_way_history";
+        search = runSequenceSearch(runtime_, query, request, schedule, direct.time_s);
+    } else if (request.algorithm == Algorithm::kCH) {
         if (ContractionHierarchy::baseWeights(request.overlay)) {
             bool built = false;
             const auto begin = std::chrono::steady_clock::now();

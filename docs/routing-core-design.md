@@ -187,7 +187,7 @@ POST /api/maps/{id}/route
 
 1. 起终点各取吸附最优的一条边（含 twin），不从边中段向其他方向离开；需要掉头的场景通过路口绕行完成，多候选多源搜索留待后续。
 2. 并列最优路径下 Dijkstra 与 A* 可能返回不同但等价的边序列。
-3. OSM PBF 已能自动生成转向 sidecar，但当前只支持单 via-node 的机动车 `no_*` / `only_*`；via-way、conditional 和完整车型例外尚未进入运行时模型。
+3. OSM PBF 已支持机动车 via-node/via-way `no_*` / `only_*`；via-way 使用保留历史的状态图，加速入口明确回退（[边界说明](via-way-routing.md)）。conditional 和完整车型例外尚未进入运行时模型。
 4. 欧氏距离/全图最大限速启发式仍偏弱；已消除双向 A* 的全图势函数预扫描，ALT 地标 A* 已实现（[边界说明](alt-routing.md)），静态 CH 已实现（[模型边界](ch-routing.md)）。
 5. 当前每张地图默认只有一个串行路由 Worker；高并发阶段需要按地图分片多个只读 Worker，或将线程安全搜索上下文下沉到同一进程线程池。
 
@@ -196,7 +196,7 @@ POST /api/maps/{id}/route
 现有十算法（Dijkstra、A\*、双向 Dijkstra、双向 A\*、Yen K 最短路、LPA*、D* Lite、时间依赖 Dijkstra、ALT、CH）已接入 `routing-tools-v2` Navigation Tool Registry：C++ 注册表统一声明算法版本、搜索方向、动态权重、增量修复、K 候选、时间依赖、确定性、精确性和启发式能力；Agent Session 的候选 ID 与独立 Action Guard 提交流程也已贯通。K 最短路在边态图上以"根路径末边 + 前缀代价（含转向罚时）"为 spur 伪起点、以禁边 overlay 实现 loopless Yen 语义（禁入根节点集 + 禁当前分叉边；B 堆按 (时间, 边序列) 确定性排序；K 上限 8、spur 搜索预算防爆）；一次 plan 为每条候选登记独立 candidateId，compare/guard 无需感知算法差异。前向搜索可按请求记录 settle 序列（order/nodeId/f/g；2 万步预算内全录、超限等距采样并强制保留末步），经 plan 响应内嵌 `searchTrace` 或 route 命令 trace 文件输出，Web 两处工作台以波前动画回放。
 
 1. LPA*、D* Lite 与 FIFO 分时速度 Dijkstra 已实现；ALT 与静态 CH 已实现，后续评估可定制 CH 与持久化预处理。
-2. 支持 via-way、conditional restriction 和车型 AccessMask。
+2. 支持 conditional restriction 和车型 AccessMask，优化 via-way 状态图查询。
 3. 已完成 restriction-safe 双向 edge-state 搜索和 ALT landmark 预处理；持久化地标文件与跨进程共享仍待评估。
 4. 路由 Worker 分片、空闲 TTL 和无需临时文件的 GeoJSON 帧输出。
 5. 固定 OD 矩阵的 P50/P95 基准与 SUMO duarouter 离线对拍。

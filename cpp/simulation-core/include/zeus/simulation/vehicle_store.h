@@ -18,6 +18,7 @@ public:
         states_.reserve(count);
         route_ids_.reserve(count);
         route_indices_.reserve(count);
+        turn_states_.reserve(count);
         offsets_.reserve(count);
         requested_departs_.reserve(count);
         actual_departs_.reserve(count);
@@ -34,6 +35,7 @@ public:
         states_.push_back(VehicleState::kWaiting);
         route_ids_.push_back(route_id);
         route_indices_.push_back(0);
+        turn_states_.push_back(0);
         offsets_.push_back(0.0);
         requested_departs_.push_back(demand.depart_time_s);
         actual_departs_.push_back(std::numeric_limits<double>::quiet_NaN());
@@ -51,6 +53,7 @@ public:
     std::vector<VehicleState> states_;
     std::vector<std::uint32_t> route_ids_;
     std::vector<std::uint32_t> route_indices_;
+    std::vector<std::uint32_t> turn_states_;
     std::vector<double> offsets_;
     std::vector<double> requested_departs_;
     std::vector<double> actual_departs_;

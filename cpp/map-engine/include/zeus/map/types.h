@@ -34,7 +34,7 @@ enum class Direction : std::uint8_t {
 };
 
 struct MapMetadata {
-    std::uint32_t format_version = 2;
+    std::uint32_t format_version = 3;
     std::string source_path;
     std::string source_crs_wkt;
     std::string runtime_crs_wkt;
@@ -78,12 +78,19 @@ struct TurnTransition {
     bool prohibited = false;
 };
 
+// Ordered directed roads: from, one or more via segments, then to.
+struct TurnSequence {
+    std::vector<EdgeIndex> edges;
+    bool only = false;
+};
+
 struct MapData {
     MapMetadata metadata;
     std::vector<Node> nodes;
     std::vector<DirectedEdge> edges;
     std::vector<Point2d> geometry_points;
     std::vector<TurnTransition> turn_transitions;
+    std::vector<TurnSequence> turn_sequences;
 };
 
 struct VehicleMapPosition {

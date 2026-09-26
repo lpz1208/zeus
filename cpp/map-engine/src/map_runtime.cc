@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <limits>
 #include <numbers>
+#include <map>
+#include <set>
+#include <queue>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -67,6 +70,7 @@ struct MapRuntime::Impl {
     explicit Impl(MapData input) : map(std::move(input)) {
         buildAdjacency();
         buildTurnTransitions();
+        buildTurnSequences();
         buildSpatialIndex();
     }
 
@@ -151,6 +155,53 @@ struct MapRuntime::Impl {
         spatial_index = decltype(spatial_index)(values.begin(), values.end());
     }
 
+    struct Prefix {
+        std::map<EdgeIndex, std::uint32_t> next;
+        std::set<EdgeIndex> required;
+        std::uint32_t fail = 0;
+        EdgeIndex edge = kInvalidEdge;
+        bool forbidden = false;
+    };
+    std::vector<Prefix> prefixes{1};
+
+    void buildTurnSequences() {
+        if (map.turn_sequences.size() > 100000) throw std::runtime_error("too many turn sequences");
+        for (const auto& rule : map.turn_sequences) {
+            if (rule.edges.size() < 3 || rule.edges.size() > 256)
+                throw std::runtime_error("turn sequence must contain 3..256 roads");
+            std::uint32_t state = 0;
+            for (std::size_t i = 0; i < rule.edges.size(); ++i) {
+                const auto edge = rule.edges[i];
+                if (edge >= map.edges.size() || (i && map.edges[rule.edges[i - 1]].to != map.edges[edge].from))
+                    throw std::runtime_error("disconnected turn sequence");
+                // Shared only_* prefixes permit the union of their next roads.
+                if (rule.only && i) prefixes[state].required.insert(edge);
+                auto found = prefixes[state].next.find(edge);
+                if (found == prefixes[state].next.end()) {
+                    if (prefixes.size() >= 100000) throw std::runtime_error("turn sequence automaton exceeds state budget");
+                    const auto next = static_cast<std::uint32_t>(prefixes.size());
+                    prefixes[state].next.emplace(edge, next);
+                    prefixes.emplace_back(); prefixes.back().edge = edge;
+                    state = next;
+                } else state = found->second;
+            }
+            if (!rule.only) prefixes[state].forbidden = true;
+        }
+        std::queue<std::uint32_t> queue;
+        for (const auto& [edge, state] : prefixes[0].next) queue.push(state);
+        while (!queue.empty()) {
+            const auto state = queue.front(); queue.pop();
+            for (const auto& [edge, next] : prefixes[state].next) {
+                auto fail = prefixes[state].fail;
+                while (fail && !prefixes[fail].next.contains(edge)) fail = prefixes[fail].fail;
+                const auto found = prefixes[fail].next.find(edge);
+                prefixes[next].fail = found == prefixes[fail].next.end() ? 0 : found->second;
+                prefixes[next].forbidden = prefixes[next].forbidden || prefixes[prefixes[next].fail].forbidden;
+                queue.push(next);
+            }
+        }
+    }
+
     void buildTurnTransitions() {
         for (const TurnTransition& transition : map.turn_transitions) {
             if (transition.from_edge >= map.edges.size() ||
@@ -203,6 +254,26 @@ std::span<const EdgeIndex> MapRuntime::outgoingEdges(NodeIndex node) const {
     const std::uint32_t begin = impl_->outgoing_offsets[node];
     const std::uint32_t end = impl_->outgoing_offsets[node + 1];
     return std::span<const EdgeIndex>(impl_->outgoing_edges.data() + begin, end - begin);
+}
+
+bool MapRuntime::hasTurnSequences() const { return !impl_->map.turn_sequences.empty(); }
+std::uint32_t MapRuntime::turnStateCount() const { return impl_->prefixes.size(); }
+EdgeIndex MapRuntime::turnStateEdge(std::uint32_t state) const {
+    if (state >= impl_->prefixes.size()) throw std::invalid_argument("invalid turn history state");
+    return impl_->prefixes[state].edge;
+}
+std::uint32_t MapRuntime::advanceTurnState(std::uint32_t state, EdgeIndex next) const {
+    if (state >= impl_->prefixes.size() || next >= impl_->map.edges.size())
+        throw std::invalid_argument("invalid turn history state or edge");
+    if (impl_->prefixes[state].forbidden) return kInvalidEdge;
+    for (auto suffix = state; suffix; suffix = impl_->prefixes[suffix].fail) {
+        const auto& required = impl_->prefixes[suffix].required;
+        if (!required.empty() && !required.contains(next)) return kInvalidEdge;
+    }
+    while (state && !impl_->prefixes[state].next.contains(next)) state = impl_->prefixes[state].fail;
+    const auto found = impl_->prefixes[state].next.find(next);
+    const auto result = found == impl_->prefixes[state].next.end() ? 0 : found->second;
+    return impl_->prefixes[result].forbidden ? kInvalidEdge : result;
 }
 
 bool MapRuntime::hasTurnTransitions() const {

@@ -72,7 +72,7 @@
 
 ### 2.5 运行时地图
 
-`.zmap` v2 保存：
+`.zmap` v3 保存：
 
 - 地图元数据和坐标系。
 - 拓扑节点。
@@ -81,14 +81,15 @@
 - 源要素 ID 和基础道路属性。
 - 每条有向边的可用车道数。
 - `(from_edge,to_edge)` 禁止转换和转向惩罚。
+- via-way 有序道路序列及 no/only 类型。
 
-加载器继续兼容 v1 地图，旧边按 1 车道且无转向转换读取。
+加载器兼容 v1/v2 地图：v1 旧边按 1 车道且无转向转换读取，v2 保留转换数据；两者均无道路序列规则。
 
 加载后构建：
 
 - CSR 风格出边数组。
 - 边级包围盒 R-tree、每边对应的连续 segment 范围。
-- edge-to-edge 转换哈希表。
+- edge-to-edge 转换哈希表和 via-way 前缀自动机。
 - 只读 `MapRuntime`。
 
 运行时不保留源矢量文件、OGRFeature 或 OGRGeometry 对象。
@@ -337,9 +338,9 @@ default_bidirectional
 
 ## 7. 当前限制
 
-1. `.zmap` v2 是 MVP 二进制格式，尚未实现跨字节序和内存映射；加载器兼容 v1。
+1. `.zmap` v3 是 MVP 二进制格式，尚未实现跨字节序和内存映射；加载器兼容 v1/v2。
 2. 当前只处理第一个矢量图层。
-3. 已有 edge-to-edge 转换和 OSM PBF via-node restriction 提取器，但尚未支持 via-way、conditional、完整车型和时间段例外。
+3. 已有 edge-to-edge 转换和 OSM PBF via-node/via-way 提取器；[via-way](via-way-routing.md) 支持有界道路链展开。conditional、完整车型和时间段例外尚未支持。
 4. 重叠共线道路只会被基础验证发现一部分，尚未完整处理。
 5. 接近道路中部但没有真正相交的悬挂端点不会自动吸附到道路中部。
 6. 没有 z-level、bridge、tunnel 信息时，二维相交默认视为同层连接；真实立交数据必须提供高程语义或人工修复。
@@ -354,7 +355,7 @@ default_bidirectional
 
 1. 为大规模道路和参考数据构建 MVT 分块导出与 LOD。
 2. 增加近失配端点、重叠共线、疑似立交的专项检查。
-3. 扩展 OSM restriction 到 via-way、conditional、车型 AccessMask 和时间段规则。
+3. 扩展 OSM restriction 到 conditional、车型 AccessMask 和时间段规则，完善闭环 via-way。
 4. 将 `.zmap` 升级为扁平数组和 mmap 加载格式。
 5. 增加地图版本 manifest、内容哈希和 JSON 质检报告。
 6. 增加 OSM 清洗画像模板和按项目保存的参数预设。
@@ -370,7 +371,7 @@ default_bidirectional
 - 同层十字交叉。
 - 小距离端点吸附。
 
-测试覆盖 SHP/GeoJSON 导入、道路切分、方向边、验证、`.zmap` v2 保存加载、v1 真实武汉地图兼容读取、边级 R-tree 匹配和 `edge + offset_s` 世界坐标计算。长曲线含 33 个重叠 segment 的 Golden Map 会同时返回另一条邻近边，防止候选挤出。转向 sidecar、PBF relation 解析、车道数、转换序列化和吸附折叠后孤儿节点清理也有回归覆盖。
+测试覆盖 SHP/GeoJSON 导入、道路切分、方向边、验证、`.zmap` v3 保存加载、v1/v2 兼容读取、边级 R-tree 匹配和 `edge + offset_s` 世界坐标计算。长曲线含 33 个重叠 segment 的 Golden Map 会同时返回另一条邻近边，防止候选挤出。转向 sidecar、PBF relation 解析、车道数、转换序列化和吸附折叠后孤儿节点清理也有回归覆盖。
 
 OSM 清洗测试覆盖道路等级筛选、访问权限、服务道路开关、短边和重复几何过滤、
 GeometryCollection 线提取、mph 转换、道路等级默认限速、高速/环岛隐式单行和

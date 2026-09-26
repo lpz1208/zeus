@@ -646,6 +646,42 @@ void runDefaultTurnPenaltyTest() {
             "straight movement stays free");
 }
 
+void runViaWayImportTest() {
+    const auto directory = std::filesystem::temp_directory_path() / ("zeus-via-import-" + std::to_string(getpid()));
+    std::filesystem::create_directories(directory);
+    const auto source = directory / "roads.geojson", rules = directory / "turns.csv", binary = directory / "map.zmap";
+    std::ofstream(source) << R"({"type":"FeatureCollection","crs":{"type":"name","properties":{"name":"EPSG:3857"}},"features":[
+      {"type":"Feature","properties":{"id":"f","oneway":"yes"},"geometry":{"type":"LineString","coordinates":[[-100,0],[0,0]]}},
+      {"type":"Feature","properties":{"id":"v#part1","oneway":"yes"},"geometry":{"type":"LineString","coordinates":[[0,0],[100,0]]}},
+      {"type":"Feature","properties":{"id":"v#part2","oneway":"yes"},"geometry":{"type":"LineString","coordinates":[[100,0],[200,0]]}},
+      {"type":"Feature","properties":{"id":"t","oneway":"yes"},"geometry":{"type":"LineString","coordinates":[[200,0],[300,0]]}}
+    ]})";
+    zeus::map::ImportOptions options;
+    options.id_field = "id"; options.oneway_field = "oneway";
+    options.target_crs = "EPSG:3857"; options.turn_restrictions_file = rules.string();
+    for (const auto kind : {"no_via", "only_via"}) {
+        std::ofstream(rules) << "f,0,0,t," << kind << ",v\n";
+        const auto imported = zeus::map::ShapefileImporter().importFile(source.string(), options);
+        require(imported.turn_transitions.front().via_source_ids == std::vector<std::string>{"v"}, "via CSV parses its road list");
+        const auto build = zeus::map::MapBuilder().build(imported);
+        require(build.map.turn_sequences.size() == 1 && build.map.turn_sequences.front().edges.size() == 4,
+                "split via way resolves to its full ordered directed sequence");
+        zeus::map::MapSerializer::save(build.map, binary.string());
+        const auto loaded = zeus::map::MapSerializer::load(binary.string());
+        require(loaded.metadata.format_version == 3 && loaded.turn_sequences.size() == 1 &&
+                    loaded.turn_sequences.front().edges == build.map.turn_sequences.front().edges &&
+                    loaded.turn_sequences.front().only == (std::string(kind) == "only_via"),
+                "v3 round trip preserves via-way roads and mandatory flag");
+        zeus::map::MapRuntime runtime(loaded);
+        std::uint32_t context = 0;
+        for (auto edge : loaded.turn_sequences.front().edges) {
+            context = runtime.advanceTurnState(context, edge);
+        }
+        require((context == zeus::map::kInvalidEdge) == (std::string(kind) == "no_via"), "loaded sequence automaton enforces its rule");
+    }
+    std::filesystem::remove_all(directory);
+}
+
 void runTurnPenaltyMergeWithSidecarTest() {
     zeus::map::ImportedRoads lower = penaltyFixtureRoads();
     lower.turn_transitions.push_back(
@@ -678,6 +714,7 @@ int main() {
         runEndToEndTest();
         runDefaultTurnPenaltyTest();
         runTurnPenaltyMergeWithSidecarTest();
+        runViaWayImportTest();
         runGradeSeparatedCrossingTest();
         runCollapsedPieceDoesNotLeaveOrphanTest();
         runMixedGeometryGeoJsonTest();

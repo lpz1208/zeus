@@ -104,6 +104,80 @@ async function prepareMap() {
   }))
 }
 
+async function prepareViaMap() {
+  const directory = join(dir, 'maps', 'map_via')
+  await mkdir(directory, { recursive: true })
+  const a = [114, 30], b = [114.001, 30], c = [114.003, 30]
+  const d = [114.004, 30], e = [114.005, 30], f = [114.003, 30.001]
+  const source = join(dir, 'via-roads.geojson'), turns = join(dir, 'via-turns.csv')
+  await writeFile(source, JSON.stringify({ type: 'FeatureCollection',
+    features: [[a,b], [b,c], [c,d], [d,e], [c,f], [f,d]].map((coordinates, id) => ({
+      type: 'Feature', properties: { id: String(id), oneway: 'yes', speed: 36 },
+      geometry: { type: 'LineString', coordinates },
+    })) }))
+  await writeFile(turns, '0,114.001,30,2,no_via,1\n')
+  execFileSync(join(root, 'build/zeus-map'), ['import', source, '--output', join(directory, 'map.zmap'),
+    '--id-field', 'id', '--oneway-field', 'oneway', '--speed-field', 'speed',
+    '--turn-restrictions', turns], { stdio: 'pipe', timeout: 30000 })
+  await writeFile(join(directory, 'record.json'), JSON.stringify({ id: 'map_via',
+    name: 'Via-way history E2E', createdAt: new Date().toISOString(),
+    summary: { nodes: 6, directedEdges: 6 }, issues: [] }))
+}
+
+async function viaWayScenario(template) {
+  const api = '/api/maps/map_via'
+  const points = { fromLon: 114.0005, fromLat: 30, toLon: 114.0045, toLat: 30 }
+  const condition = { ...points, source: template, steps: 5000000 }
+  const full = await request(`${api}/algorithms/run`, condition)
+  verified(full)
+  assert.equal(full.edges, 5, 'incoming road must force the detour after via-way')
+  const fresh = await request(`${api}/algorithms/run`, { ...condition, fromLon: 114.0015 })
+  verified(fresh)
+  assert.equal(fresh.edges, 3, 'starting inside via-way must not inherit an absent incoming road')
+  const forbidden = edgeIDs(fresh)[1]
+  assert.ok(!edgeIDs(full).includes(forbidden))
+  for (const algorithm of ['dijkstra', 'astar', 'bidijkstra', 'biastar', 'kshortest', 'lpa', 'dstar', 'alt', 'ch', 'tddijkstra']) {
+    const route = await request(`${api}/route`, { ...points, algorithm, kPaths: 3 })
+    assert.equal(route.ok, true)
+    assert.deepEqual(edgeIDs(route), edgeIDs(full))
+    assert.equal(route.effectiveAlgorithm, algorithm === 'tddijkstra' ? algorithm : 'dijkstra')
+    if (!['dijkstra', 'tddijkstra'].includes(algorithm)) assert.equal(route.fallbackReason, 'via_way_history')
+  }
+  const created = await request(`${api}/agent/sessions`, {
+    vehicles: [{ ...points, algorithm: 'ch', agent: true }], durationSeconds: 120,
+    stepSeconds: 1, sampleIntervalSeconds: 5, rerouteIntervalSeconds: 0,
+    exitHeadwayFfSeconds: 1.4, exitHeadwayJamSeconds: 2, rerouteCostRatio: 1.25,
+  })
+  let path = `${api}/agent/sessions/${created.sessionId}`
+  await request(`${path}/step`, { ticks: 8 })
+  const before = await request(path)
+  assert.equal(before.agents[0].edgeId, edgeIDs(fresh)[0], 'vehicle should be inside via-way')
+  const saved = await request(`${path}/snapshots`, {})
+  await request(path, undefined, 'DELETE')
+  await stopServer()
+  await startServer()
+  const restored = await request(`${api}/agent/snapshots/${saved.snapshotId}/restore`, {})
+  path = `${api}/agent/sessions/${restored.state.sessionId}`
+  assert.deepEqual((await request(path)).agents, before.agents)
+  const planned = await request(`${path}/plan`, { algorithm: 'ch', vehicleId: 0 })
+  assert.equal(planned.fallbackReason, 'via_way_history')
+  assert.ok(!planned.edges.includes(forbidden), 'restored native query lost entry history')
+  const records = []
+  const outcome = await runAlgorithmNavigation({
+    runId: 'via-way', source: template, vehicleId: 0, once: false, maxDecisions: 20,
+    active: () => true, request: (suffix, body) => request(path + suffix, body),
+    onObservation: async () => {}, onPlan: value => {
+      if (value.result?.phase === 'verified') assert.ok(!edgeIDs(value.result).includes(forbidden))
+    }, onRecord: value => records.push(value), onPhase: () => {},
+    yieldBetween: async () => {}, checkpoint: async () => {},
+  })
+  assert.equal(outcome, 'complete')
+  assert.ok(records.some(record => record.status === 'applied'))
+  assert.equal((await request(path)).agents[0].state, 'arrived')
+  await request(path, undefined, 'DELETE')
+  console.log('via-way: import -> 10 algorithms -> custom states -> moving origin -> restart -> exact commit -> arrival')
+}
+
 const edgeIDs = result => result.geojson.features.map(feature => feature.properties.EDGE_INDEX)
 function verified(result) {
   assert.equal(result.ok, true, result.error)
@@ -288,9 +362,11 @@ async function timeDependentScenario(condition, closed, baseline) {
 
 async function main() {
   await prepareMap()
+  await prepareViaMap()
   await startServer()
   const { template } = await request('/api/algorithms/capabilities')
   assert.equal((await request('/api/algorithms/check', { source: template })).ok, true)
+  await viaWayScenario(template)
   const condition = { fromLon: origin[0], fromLat: origin[1], toLon: destination[0], toLat: destination[1], source: template, steps: 5000000 }
   const initial = await request(`${mapAPI}/algorithms/run`, condition)
   verified(initial)

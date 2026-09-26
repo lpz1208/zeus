@@ -330,6 +330,7 @@ int executeRoute(
            << "algorithm=" << zeus::routing::algorithmName(result.algorithm) << '\n'
            << "effective_algorithm="
            << zeus::routing::algorithmName(result.effective_algorithm) << '\n';
+    output << "fallback_reason=" << result.stats.fallback_reason << '\n';
     print_match("origin", result.origin);
     print_match("dest", result.destination);
     output << "edges=" << result.path.edges.size() << '\n'
@@ -346,8 +347,7 @@ int executeRoute(
                << "ch_core_states=" << result.stats.ch_core_states << '\n'
                << "ch_bytes=" << result.stats.ch_bytes << '\n'
                << "ch_preprocess_ms=" << result.stats.ch_preprocess_ms << '\n'
-               << "ch_reused=" << result.stats.ch_reused << '\n'
-               << "fallback_reason=" << result.stats.fallback_reason << '\n';
+               << "ch_reused=" << result.stats.ch_reused << '\n';
     }
     if (request.algorithm == zeus::routing::Algorithm::kAlt) {
         output << "landmark_count=" << result.stats.landmark_count << '\n'
@@ -504,7 +504,8 @@ int run(int argc, char** argv) {
             return 2;
         }
         zeus::map::MapSerializer::save(build.map, output);
-        std::cout << "turn_transitions=" << build.map.turn_transitions.size() << '\n';
+        std::cout << "turn_transitions=" << build.map.turn_transitions.size() << '\n'
+                  << "turn_sequences=" << build.map.turn_sequences.size() << '\n';
         if (const auto issues_output = options.find("issues-output");
             issues_output != options.end()) {
             zeus::map::GeoJsonExporter::saveIssues(
@@ -519,7 +520,8 @@ int run(int argc, char** argv) {
     if (command == "validate") {
         const zeus::map::ValidationReport report = zeus::map::MapValidator().validate(map);
         printReport(report, true);
-        std::cout << "turn_transitions=" << map.turn_transitions.size() << '\n';
+        std::cout << "turn_transitions=" << map.turn_transitions.size() << '\n'
+                  << "turn_sequences=" << map.turn_sequences.size() << '\n';
         return report.hasFatalErrors() ? 2 : 0;
     }
     if (command == "geojson") {

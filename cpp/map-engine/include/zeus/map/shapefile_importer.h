@@ -49,6 +49,7 @@ struct SourceTurnTransition {
     std::string to_source_id;
     SourceTurnKind kind = SourceTurnKind::kNo;
     float penalty_s = 0.0F;
+    std::vector<std::string> via_source_ids;
 };
 
 struct ImportedRoads {

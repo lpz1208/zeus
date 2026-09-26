@@ -439,6 +439,51 @@ void buildTurnTransitions(BuildResult& result, const ImportedRoads& imported) {
                 }
             }
         }
+        if (!source.via_source_ids.empty()) {
+            std::vector<TurnSequence> sequences;
+            std::size_t work = 0;
+            bool budget = false;
+            std::vector<EdgeIndex> path;
+            std::vector<NodeIndex> visited;
+            const auto walk = [&](auto&& self, NodeIndex node, std::size_t stage, bool traversed) -> void {
+                if (++work > 20000 || path.size() >= 256) { budget = true; return; }
+                if (stage == source.via_source_ids.size()) {
+                    for (auto edge : outgoing_by_node[node]) {
+                        if (sourceMatches(result.map.edges[edge].source_id, source.to_source_id)) {
+                            if (sequences.size() >= 64) { budget = true; return; }
+                            auto complete = path; complete.push_back(edge);
+                            sequences.push_back({std::move(complete), source.kind == SourceTurnKind::kOnly});
+                        }
+                    }
+                    return;
+                }
+                if (traversed) self(self, node, stage + 1, false);
+                if (budget) return;
+                for (auto edge : outgoing_by_node[node]) {
+                    const auto& road = result.map.edges[edge];
+                    if (!sourceMatches(road.source_id, source.via_source_ids[stage]) ||
+                        std::find(visited.begin(), visited.end(), road.to) != visited.end()) continue;
+                    path.push_back(edge); visited.push_back(road.to);
+                    self(self, road.to, stage, true);
+                    visited.pop_back(); path.pop_back();
+                    if (budget) return;
+                }
+            };
+            for (auto from : from_edges) {
+                path = {from}; visited = {via};
+                walk(walk, via, 0, false);
+                if (budget) break;
+            }
+            if (budget || sequences.empty()) {
+                result.issues.push_back({budget ? "VIA_WAY_RESTRICTION_BUDGET" : "TURN_RESTRICTION_UNRESOLVED",
+                    budget ? IssueSeverity::kFatal : IssueSeverity::kWarning,
+                    budget ? "Via-way expansion exceeded its path/work budget" : "Via-way rule could not resolve its ordered road chain",
+                    source.from_source_id + "->" + source.to_source_id, source.via_point, true});
+            } else {
+                result.map.turn_sequences.insert(result.map.turn_sequences.end(), sequences.begin(), sequences.end());
+            }
+            continue;
+        }
         if (via == kInvalidNode || from_edges.empty() || to_edges.empty()) {
             result.issues.push_back({
                 "TURN_RESTRICTION_UNRESOLVED",

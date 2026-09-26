@@ -13,7 +13,7 @@ namespace zeus::map {
 namespace {
 
 constexpr std::array<char, 8> kMagic{'Z', 'M', 'A', 'P', '0', '0', '0', '1'};
-constexpr std::uint32_t kCurrentFormatVersion = 2;
+constexpr std::uint32_t kCurrentFormatVersion = 3;
 
 template <typename T>
 void writeValue(std::ostream& output, const T& value) {
@@ -86,6 +86,7 @@ void MapSerializer::save(const MapData& map, const std::string& path) {
     writeValue(output, checkedCount(map.edges.size(), "edges"));
     writeValue(output, checkedCount(map.geometry_points.size(), "geometry points"));
     writeValue(output, checkedCount(map.turn_transitions.size(), "turn transitions"));
+    writeValue(output, checkedCount(map.turn_sequences.size(), "turn sequences"));
 
     for (const Node& node : map.nodes) {
         writeValue(output, node.id);
@@ -117,6 +118,12 @@ void MapSerializer::save(const MapData& map, const std::string& path) {
         writeValue(output, transition.penalty_s);
         writeValue(output, static_cast<std::uint8_t>(transition.prohibited ? 1 : 0));
     }
+    for (const auto& rule : map.turn_sequences) {
+        writeValue(output, static_cast<std::uint8_t>(rule.only));
+        writeValue(output, checkedCount(rule.edges.size(), "turn sequence roads"));
+        for (auto edge : rule.edges) writeValue(output, edge);
+    }
+
 }
 
 MapData MapSerializer::load(const std::string& path) {
@@ -133,7 +140,7 @@ MapData MapSerializer::load(const std::string& path) {
 
     MapData map;
     const std::uint32_t file_format_version = readValue<std::uint32_t>(input);
-    if (file_format_version != 1 && file_format_version != kCurrentFormatVersion) {
+    if (file_format_version < 1 || file_format_version > kCurrentFormatVersion) {
         throw std::runtime_error(
             "unsupported Zeus runtime map version: " + std::to_string(file_format_version));
     }
@@ -152,6 +159,8 @@ MapData MapSerializer::load(const std::string& path) {
     map.edges.reserve(edge_count);
     map.geometry_points.reserve(geometry_count);
     map.turn_transitions.reserve(turn_transition_count);
+    const auto sequence_count = file_format_version >= 3 ? readValue<std::uint32_t>(input) : 0;
+    if (sequence_count > 100000) throw std::runtime_error("too many turn sequences");
 
     for (std::uint32_t i = 0; i < node_count; ++i) {
         Node node;
@@ -191,6 +200,15 @@ MapData MapSerializer::load(const std::string& path) {
         transition.penalty_s = readValue<float>(input);
         transition.prohibited = readValue<std::uint8_t>(input) != 0;
         map.turn_transitions.push_back(transition);
+    }
+    for (std::uint32_t i = 0; i < sequence_count; ++i) {
+        TurnSequence rule;
+        const auto only = readValue<std::uint8_t>(input);
+        const auto length = readValue<std::uint32_t>(input);
+        if (only > 1 || length < 3 || length > 256) throw std::runtime_error("invalid turn sequence record");
+        rule.only = only != 0;
+        for (std::uint32_t j = 0; j < length; ++j) rule.edges.push_back(readValue<EdgeIndex>(input));
+        map.turn_sequences.push_back(std::move(rule));
     }
     return map;
 }

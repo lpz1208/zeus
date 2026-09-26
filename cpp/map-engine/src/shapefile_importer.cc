@@ -300,7 +300,19 @@ std::vector<SourceTurnTransition> loadTurnTransitions(
         transition.via_point = {std::stod(fields[1]), std::stod(fields[2])};
         transition.to_source_id = fields[3];
         const std::string kind = lowercase(fields[4]);
-        if (kind == "no") {
+        if (kind == "no_via" || kind == "only_via") {
+            if (fields.size() != 6) throw std::runtime_error("via-way rule requires semicolon-separated via source IDs");
+            transition.kind = kind == "no_via" ? SourceTurnKind::kNo : SourceTurnKind::kOnly;
+            std::stringstream via(fields[5]);
+            std::string id;
+            while (std::getline(via, id, ';')) {
+                id = trim(id);
+                if (id.empty()) throw std::runtime_error("empty via-way source ID");
+                transition.via_source_ids.push_back(id);
+            }
+            if (transition.via_source_ids.empty() || transition.via_source_ids.size() > 16)
+                throw std::runtime_error("via-way rule requires 1..16 via ways");
+        } else if (kind == "no") {
             transition.kind = SourceTurnKind::kNo;
         } else if (kind == "only") {
             transition.kind = SourceTurnKind::kOnly;

@@ -43,7 +43,7 @@ make algorithm-e2e
 - `cpp/simulation-core`：C++ 确定性中观车辆推进、路线池、入口容量、出口流率（默认 1.4/2.0 s 且到达免闸）、队列序放行、per-edge KPI、回溢、转向信号相位、动态权重重规划、agent 车辆决策事件与路线注入、车辆/道路/路口控制、采样和轨迹导出；提供 tick 边界控制的 `SimulationSession`（reset/step/stepUntilEvent/observe/snapshot/commit/keep/resume/run-to-end/pause/close）。
 - `tools/zeus-map`：地图检查、导入、验证、GeoJSON 导出、位置查询、路径规划、仿真和常驻 session-worker CLI。
 - `proto/agent/v1`：Agent 环境目标协议（Observation/Action/DecisionTrace、三种决策模式）；当前由 session-worker 帧协议承载同一语义。
-- `apps/control-server`：Go 地图与仿真控制 API、按地图常驻的 C++ 路由 Worker、仿真进程并发门禁、Agent 决策屏障协调器和静态 Web 托管；`cmd/zeus-osm-turns` 从 OSM PBF 提取机动车 via-node 转向限制。
+- `apps/control-server`：Go 地图与仿真控制 API、按地图常驻的 C++ 路由 Worker、仿真进程并发门禁、Agent 决策屏障协调器和静态 Web 托管；`cmd/zeus-osm-turns` 从 OSM PBF 提取机动车 via-node/via-way 转向限制。
 - `apps/web`：React + MapLibre 地图工作台、路线规划、控制时间线和车辆回放。
 - `docs`：整体架构、Agent Environment、地图引擎、路由内核和 Web 工作台设计。
 
@@ -160,7 +160,7 @@ Agent 图状态和环境快照分开持久化：LangGraph SQLite 保存决策节
 
 ## OSM 转向限制
 
-Zeus 不依赖 SUMO。对于已有的 OSM PBF，可先生成可审计、可 diff 的转向 sidecar，再随道路数据编译进 `.zmap` v2：
+Zeus 不依赖 SUMO。对于已有的 OSM PBF，可先生成可审计、可 diff 的转向 sidecar，再随道路数据编译进 `.zmap` v3：
 
 ```bash
 ./build/zeus-osm-turns \
@@ -174,7 +174,7 @@ Zeus 不依赖 SUMO。对于已有的 OSM PBF，可先生成可审计、可 diff
   --output city.zmap
 ```
 
-提取器支持机动车 `no_*`、`only_*` 和 `restriction:motorcar`，会跳过 `except=motorcar`。当前明确不展开 via-way、conditional 与复杂车型例外，并在命令输出中按原因计数。
+提取器支持机动车 `no_*`、`only_*` 和 `restriction:motorcar`，会跳过 `except=motorcar`。已支持拓扑唯一的 via-way 道路链，搜索和车辆重规划保留进入历史；conditional 与复杂车型例外仍不展开，跳过原因会计数。格式、回退和边界见 [via-way 实现说明](docs/via-way-routing.md)。
 
 ### 自定义代码与随机事件评测
 

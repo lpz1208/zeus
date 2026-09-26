@@ -80,6 +80,8 @@ struct RoutePosition {
 
 class SpeedSchedule;
 struct RouteRequest {
+    // Already-consumed current edge context, only valid with an exact origin.
+    std::optional<std::uint32_t> origin_turn_state;
     zeus::map::Point2d origin;
     zeus::map::Point2d destination;
     Algorithm algorithm = Algorithm::kDijkstra;

@@ -1,4 +1,5 @@
 #include "zeus/routing/algorithm_lab.h"
+#include "zeus/routing/sequence_search.h"
 #include <cmath>
 #include <iomanip>
 #include <stdexcept>
@@ -42,13 +43,16 @@ double AlgorithmLab::seconds(zeus::map::EdgeIndex edge, double length) const {
 }
 std::vector<LabTransition> AlgorithmLab::neighbors(int state) const {
     std::vector<LabTransition> next;
+    const SequenceGraph graph(runtime_);
     if (state == -2) return next;
     if (state == -1) {
         for (const auto& start : starts_) {
             if (!enabled(start.edge) &&
                 (!request_.origin_position || request_.origin_position->edge != start.edge)) continue;
             const auto length = runtime_.edge(start.edge).length_m - start.offset_s;
-            next.push_back({int(start.edge), start.edge, seconds(start.edge, length), length});
+            const auto context = graph.initial(request_, start.edge);
+            if (context == zeus::map::kInvalidEdge) continue;
+            next.push_back({int(graph.encode(start.edge, context)), start.edge, seconds(start.edge, length), length});
             for (const auto& goal : goals_) {
                 if (goal.edge == start.edge && goal.offset_s >= start.offset_s) {
                     const auto direct = goal.offset_s - start.offset_s;
@@ -57,25 +61,29 @@ std::vector<LabTransition> AlgorithmLab::neighbors(int state) const {
             }
         }
     } else {
-        if (state < 0 || std::size_t(state) >= runtime_.data().edges.size()) {
+        if (state < 0 || std::size_t(state) >= graph.size()) {
             throw std::invalid_argument("unknown routing state");
         }
+        const auto current = graph.edge(state), context = graph.context(state);
+        if (context == 0 && runtime_.advanceTurnState(0, current) != 0) return next;
         // A vehicle may finish its exact current edge after it closes. Every
         // transition into another edge still checks enabled(), so this cannot
         // be used to re-enter the closed edge later in the path.
-        if (!enabled(state) &&
-            (!request_.origin_position || request_.origin_position->edge != static_cast<zeus::map::EdgeIndex>(state))) return next;
-        const auto node = runtime_.edge(state).to;
+        if (!enabled(current) &&
+            (!request_.origin_position || request_.origin_position->edge != current)) return next;
+        const auto node = runtime_.edge(current).to;
         for (auto edge : runtime_.outgoingEdges(node)) {
-            const auto turn = runtime_.turnPenaltySeconds(state, edge);
+            const auto turn = runtime_.turnPenaltySeconds(current, edge);
             if (!enabled(edge) || !std::isfinite(turn)) continue;
             const auto length = runtime_.edge(edge).length_m;
-            next.push_back({int(edge), edge, turn + seconds(edge, length), length});
+            const auto successor = runtime_.advanceTurnState(context, edge);
+            if (successor != zeus::map::kInvalidEdge)
+                next.push_back({int(graph.encode(edge, successor)), edge, turn + seconds(edge, length), length});
         }
         for (const auto& goal : goals_) {
             if (runtime_.edge(goal.edge).from != node || !enabled(goal.edge)) continue;
-            const auto turn = runtime_.turnPenaltySeconds(state, goal.edge);
-            if (std::isfinite(turn)) {
+            const auto turn = runtime_.turnPenaltySeconds(current, goal.edge);
+            if (std::isfinite(turn) && runtime_.advanceTurnState(context, goal.edge) != zeus::map::kInvalidEdge) {
                 next.push_back({-2, goal.edge, turn + seconds(goal.edge, goal.offset_s), goal.offset_s});
             }
         }
@@ -128,11 +136,15 @@ RouteResult AlgorithmLab::validatePath(const RoutePath& path) const {
         throw std::invalid_argument("invalid exact route path");
     }
     std::vector<int> states{-1};
+    const SequenceGraph graph(runtime_);
+    std::uint32_t context = 0;
     for (std::size_t i = 0; i < path.edges.size(); ++i) {
         if (path.edges[i] >= runtime_.data().edges.size()) {
             throw std::invalid_argument("unknown exact route edge");
         }
-        if (i + 1 < path.edges.size()) states.push_back(static_cast<int>(path.edges[i]));
+        context = i ? runtime_.advanceTurnState(context, path.edges[i]) : graph.initial(request_, path.edges[i]);
+        if (context == zeus::map::kInvalidEdge) throw std::invalid_argument("exact route violates via-way restriction");
+        if (i + 1 < path.edges.size()) states.push_back(static_cast<int>(graph.encode(path.edges[i], context)));
     }
     states.push_back(-2);
     auto result = validate(states);
@@ -144,8 +156,9 @@ RouteResult AlgorithmLab::validatePath(const RoutePath& path) const {
     return result;
 }
 void AlgorithmLab::writeContext(std::ostream& out, std::string_view observation) const {
-    const auto count = runtime_.data().edges.size();
-    if (count > 500000) throw std::invalid_argument("algorithm lab supports at most 500000 directed edges");
+    const SequenceGraph graph(runtime_);
+    const auto count = graph.size();
+    if (count > 500000) throw std::invalid_argument("algorithm lab supports at most 500000 routing states");
     out << std::setprecision(17) << "{\"version\":\"zeus-routing-v1\",\"adjacency\":{";
     std::size_t transitions = 0;
     for (int state = -1; state < int(count); ++state) {
@@ -164,11 +177,11 @@ void AlgorithmLab::writeContext(std::ostream& out, std::string_view observation)
     out << "},\"nodes\":[";
     for (std::size_t i = 0; i < count; ++i) {
         if (i) out << ',';
-        out << runtime_.edge(i).to;
+        out << runtime_.edge(graph.edge(i)).to;
     }
     out << "],\"estimates\":[";
     double max_speed = kMinSpeedMps;
-    for (std::size_t i = 0; i < count; ++i) {
+    for (std::size_t i = 0; i < runtime_.data().edges.size(); ++i) {
         if (!enabled(i)) continue;
         const double factor = request_.overlay == nullptr ? 1.0 : request_.overlay->edgeCostFactor(i);
         max_speed = std::max(max_speed,
@@ -178,7 +191,7 @@ void AlgorithmLab::writeContext(std::ostream& out, std::string_view observation)
     for (const auto& goal : goals_) destinations.push_back(runtime_.worldPose({goal.edge, goal.offset_s}).point);
     for (std::size_t i = 0; i < count; ++i) {
         if (i) out << ',';
-        const auto& point = runtime_.data().nodes[runtime_.edge(i).to].point;
+        const auto& point = runtime_.data().nodes[runtime_.edge(graph.edge(i)).to].point;
         double lower_bound = std::numeric_limits<double>::infinity();
         for (const auto& goal : destinations) lower_bound = std::min(lower_bound, zeus::map::distance(point, goal) / max_speed);
         out << lower_bound;

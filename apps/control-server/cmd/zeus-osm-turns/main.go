@@ -19,6 +19,7 @@ type restriction struct {
 	relationID int64
 	fromWay    int64
 	viaNode    int64
+	viaWays    []int64
 	toWay      int64
 	kind       string
 }
@@ -95,7 +96,7 @@ func parseRestriction(relation *osmpbf.Relation) (restriction, bool, string) {
 
 	result := restriction{relationID: relation.ID, kind: kind}
 	fromCount, viaCount, toCount := 0, 0, 0
-	viaWay := false
+
 	for _, member := range relation.Members {
 		switch member.Role {
 		case "from":
@@ -113,14 +114,14 @@ func parseRestriction(relation *osmpbf.Relation) (restriction, bool, string) {
 				result.viaNode = member.ID
 				viaCount++
 			} else if member.Type == osmpbf.WayType {
-				viaWay = true
+				result.viaWays = append(result.viaWays, member.ID)
 			}
 		}
 	}
-	if viaWay {
-		return restriction{}, false, "via_way"
+	if len(result.viaWays) > 16 || (len(result.viaWays) > 0 && viaCount > 0) {
+		return restriction{}, false, "invalid_members"
 	}
-	if fromCount != 1 || viaCount != 1 || toCount != 1 {
+	if fromCount != 1 || toCount != 1 || (viaCount != 1 && len(result.viaWays) == 0) {
 		return restriction{}, false, "invalid_members"
 	}
 	return result, true, ""
@@ -171,6 +172,94 @@ func readRestrictions(path string) ([]restriction, map[string]int, error) {
 	return result, skipped, nil
 }
 
+func readWays(path string, wanted map[int64]struct{}) (map[int64][]int64, error) {
+	file, input, err := decoder(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	result := make(map[int64][]int64, len(wanted))
+	for len(result) < len(wanted) {
+		value, err := input.Decode()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		way, ok := value.(*osmpbf.Way)
+		if ok {
+			if _, needed := wanted[way.ID]; needed {
+				result[way.ID] = way.NodeIDs
+			}
+		}
+	}
+	return result, nil
+}
+
+// Resolve the unique connected via-way order, independent of relation member
+// order. Ambiguous junctions/chains are reported instead of guessed.
+func resolveViaWays(rule *restriction, ways map[int64][]int64) bool {
+	common := func(a, b int64) int64 {
+		nodes := make(map[int64]bool, len(ways[a]))
+		for _, id := range ways[a] {
+			nodes[id] = true
+		}
+		var found int64
+		for _, id := range ways[b] {
+			if nodes[id] {
+				if found != 0 && found != id {
+					return 0
+				}
+				found = id
+			}
+		}
+		return found
+	}
+	candidates := append([]int64(nil), rule.viaWays...)
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+	var chain, chosen []int64
+	var firstNode, chosenNode int64
+	found, work := 0, 0
+	var walk func(int64, int64, uint32)
+	walk = func(current, entry int64, used uint32) {
+		work++
+		if found > 1 || work > 10000 {
+			return
+		}
+		if len(chain) == len(candidates) {
+			exit := common(current, rule.toWay)
+			if exit != 0 && exit != entry {
+				found++
+				chosen = append([]int64(nil), chain...)
+				chosenNode = firstNode
+			}
+			return
+		}
+		for i, next := range candidates {
+			if used&(1<<i) != 0 {
+				continue
+			}
+			node := common(current, next)
+			if node == 0 || node == entry {
+				continue
+			}
+			if len(chain) == 0 {
+				firstNode = node
+			}
+			chain = append(chain, next)
+			walk(next, node, used|(1<<i))
+			chain = chain[:len(chain)-1]
+		}
+	}
+	walk(rule.fromWay, 0, 0)
+	if found != 1 || work > 10000 {
+		return false
+	}
+	rule.viaWays, rule.viaNode = chosen, chosenNode
+	return true
+}
+
 func readViaNodes(path string, wanted map[int64]struct{}) (map[int64]point, error) {
 	file, input, err := decoder(path)
 	if err != nil {
@@ -205,7 +294,7 @@ func writeCSV(path string, restrictions []restriction, nodes map[int64]point, ar
 	defer file.Close()
 	output := bufio.NewWriter(file)
 	if _, err := fmt.Fprintln(output,
-		"# from_source_id,via_x,via_y,to_source_id,type[,penalty_s]"); err != nil {
+		"# from_source_id,via_x,via_y,to_source_id,type[,penalty_s or via_way_ids separated by ;]"); err != nil {
 		return 0, 0, err
 	}
 	written, missing := 0, 0
@@ -218,8 +307,17 @@ func writeCSV(path string, restrictions []restriction, nodes map[int64]point, ar
 		if !area.contains(via) {
 			continue
 		}
-		if _, err := fmt.Fprintf(output, "%d,%.7f,%.7f,%d,%s\n",
-			rule.fromWay, via.lon, via.lat, rule.toWay, rule.kind); err != nil {
+		kind, suffix := rule.kind, ""
+		if len(rule.viaWays) > 0 {
+			ids := make([]string, len(rule.viaWays))
+			for i, id := range rule.viaWays {
+				ids[i] = strconv.FormatInt(id, 10)
+			}
+			kind += "_via"
+			suffix = "," + strings.Join(ids, ";")
+		}
+		if _, err := fmt.Fprintf(output, "%d,%.7f,%.7f,%d,%s%s\n",
+			rule.fromWay, via.lon, via.lat, rule.toWay, kind, suffix); err != nil {
 			return 0, 0, err
 		}
 		written++
@@ -248,6 +346,32 @@ func run(args []string) error {
 	restrictions, skipped, err := readRestrictions(*input)
 	if err != nil {
 		return fmt.Errorf("read restriction relations: %w", err)
+	}
+	wantedWays := map[int64]struct{}{}
+	for _, rule := range restrictions {
+		if len(rule.viaWays) == 0 {
+			continue
+		}
+		wantedWays[rule.fromWay] = struct{}{}
+		wantedWays[rule.toWay] = struct{}{}
+		for _, id := range rule.viaWays {
+			wantedWays[id] = struct{}{}
+		}
+	}
+	if len(wantedWays) > 0 {
+		ways, err := readWays(*input, wantedWays)
+		if err != nil {
+			return fmt.Errorf("read via ways: %w", err)
+		}
+		resolved := restrictions[:0]
+		for _, rule := range restrictions {
+			if len(rule.viaWays) > 0 && !resolveViaWays(&rule, ways) {
+				skipped["unresolved_via_way"]++
+				continue
+			}
+			resolved = append(resolved, rule)
+		}
+		restrictions = resolved
 	}
 	wanted := make(map[int64]struct{}, len(restrictions))
 	for _, restriction := range restrictions {

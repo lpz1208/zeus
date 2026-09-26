@@ -13,7 +13,7 @@ import {
 } from 'lucide-react'
 import { TracePanel } from '../components/TracePanel'
 import type { AgentSessionApi } from './useAgentSession'
-import { algorithmLabels, formatCHStatus, formatTime } from './agentGeo'
+import { algorithmLabels, formatCHStatus, formatTime, routingFallbackLabel } from './agentGeo'
 import { AgentCodePanel } from './AgentCodePanel'
 
 /** Right column: 观察 / 工具 / 轨迹 three-tab inspector. */
@@ -116,7 +116,7 @@ export function AgentInspector({ agent }: { agent: AgentSessionApi }) {
                       onClick={() => agent.selectCandidate(candidate.candidateId)}
                     >
                       <span className="agent-candidate__check">{agent.selectedCandidate === candidate.candidateId ? <Check size={11} /> : null}</span>
-                      <span><strong>{label}</strong><small>{(candidate.algorithm === 'lpa' || candidate.algorithm === 'dstar') ? `${candidate.incrementalReused ? '复用搜索' : '首次搜索'} · 更新 ${candidate.updatedEdges ?? 0} 条道路 · 扩展 ${candidate.expandedNodes ?? 0} 个状态` : candidate.algorithm === 'alt' ? `${candidate.landmarkCount ?? 0} 个地标 · ${candidate.landmarkReused ? '复用预处理' : `预处理 ${(candidate.landmarkPreprocessMs ?? 0).toFixed(1)} ms`} · 扩展 ${candidate.expandedNodes ?? 0} 个状态` : candidate.algorithm === 'ch' ? formatCHStatus(candidate) : candidate.candidateId}</small></span>
+                      <span><strong>{label}</strong><small>{candidate.fallbackReason ? routingFallbackLabel(candidate.fallbackReason) : (candidate.algorithm === 'lpa' || candidate.algorithm === 'dstar') ? `${candidate.incrementalReused ? '复用搜索' : '首次搜索'} · 更新 ${candidate.updatedEdges ?? 0} 条道路 · 扩展 ${candidate.expandedNodes ?? 0} 个状态` : candidate.algorithm === 'alt' ? `${candidate.landmarkCount ?? 0} 个地标 · ${candidate.landmarkReused ? '复用预处理' : `预处理 ${(candidate.landmarkPreprocessMs ?? 0).toFixed(1)} ms`} · 扩展 ${candidate.expandedNodes ?? 0} 个状态` : candidate.algorithm === 'ch' ? formatCHStatus(candidate) : candidate.candidateId}</small></span>
                       {candidate.ok
                         ? <><b>{formatTime(candidate.timeS ?? 0)}</b><em>{((candidate.lengthM ?? 0) / 1000).toFixed(2)} km</em></>
                         : <em>{candidate.reason}</em>}

@@ -212,6 +212,7 @@ struct EdgeTickState {
 // Per-agent slice of the snapshot: enough for a NavigationObservation-style
 // view without exposing internal loop state.
 struct AgentVehicleState {
+    std::uint32_t turn_state = 0;
     std::uint32_t vehicle_id = 0;
     VehicleState state = VehicleState::kWaiting;
     zeus::map::EdgeIndex edge = zeus::map::kInvalidEdge;  // current edge when driving

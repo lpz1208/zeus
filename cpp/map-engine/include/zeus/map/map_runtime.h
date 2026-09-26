@@ -22,6 +22,12 @@ public:
     [[nodiscard]] const DirectedEdge& edge(EdgeIndex edge) const;
     [[nodiscard]] std::span<const EdgeIndex> outgoingEdges(NodeIndex node) const;
     [[nodiscard]] bool hasTurnTransitions() const;
+    [[nodiscard]] bool hasTurnSequences() const;
+    [[nodiscard]] std::uint32_t turnStateCount() const;
+    [[nodiscard]] EdgeIndex turnStateEdge(std::uint32_t state) const;
+    // State is the longest matching restriction prefix after the current road.
+    // Root=0, invalid means a forbidden sequence or only_* deviation.
+    [[nodiscard]] std::uint32_t advanceTurnState(std::uint32_t state, EdgeIndex next) const;
     // Returns +infinity for a prohibited transition, otherwise its extra
     // generalized travel-time cost in seconds.
     [[nodiscard]] double turnPenaltySeconds(EdgeIndex from_edge, EdgeIndex to_edge) const;

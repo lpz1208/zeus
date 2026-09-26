@@ -7,7 +7,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { formatCHStatus } from '../../agent/agentGeo'
+import { formatCHStatus, routingFallbackLabel } from '../../agent/agentGeo'
 import type { MapLibraryApi } from '../../hooks/useMapLibrary'
 import { TracePanel } from '../../components/TracePanel'
 import type { RouteSimApi } from '../useRouteSimulation'
@@ -98,7 +98,7 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
               <article><span>距离</span><strong>{(routeResult.lengthM / 1000).toFixed(2)}<small>km</small></strong></article>
               <article><span>预计时长</span><strong>{formatDuration(routeResult.timeS)}</strong></article>
               <article><span>扩展节点</span><strong>{formatNumber(routeResult.expandedNodes)}</strong></article>
-              {routeResult.algorithm === 'alt' && <article><span>地标预处理</span><strong>{routeResult.landmarkCount ?? 0}<small> 个 · {routeResult.landmarkReused ? '已复用' : `${(routeResult.landmarkPreprocessMs ?? 0).toFixed(1)} ms`}</small></strong></article>}
+              {routeResult.algorithm === 'alt' && !routeResult.fallbackReason && <article><span>地标预处理</span><strong>{routeResult.landmarkCount ?? 0}<small> 个 · {routeResult.landmarkReused ? '已复用' : `${(routeResult.landmarkPreprocessMs ?? 0).toFixed(1)} ms`}</small></strong></article>}
               <article><span>计算耗时</span><strong>{routeResult.computeMs.toFixed(1)}<small>ms</small></strong></article>
               <article><span>途经边</span><strong>{formatNumber(routeResult.edges)}</strong></article>
               <article>
@@ -110,7 +110,7 @@ export function RouteStage({ library, routeSim }: RouteStageProps) {
                 </strong>
               </article>
             </div>
-            {routeResult.algorithm === 'ch' && <p className="wb-forecast-note">{formatCHStatus(routeResult)}</p>}
+            {routeResult.fallbackReason ? <p className="wb-forecast-note">{routingFallbackLabel(routeResult.fallbackReason)}</p> : routeResult.algorithm === 'ch' && <p className="wb-forecast-note">{formatCHStatus(routeResult)}</p>}
             <div className="wb-snaps">
               <div className="wb-snap">
                 <span>起点吸附</span>

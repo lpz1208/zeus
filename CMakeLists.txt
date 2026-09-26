@@ -47,6 +47,7 @@ add_library(zeus_routing_core
     cpp/routing-core/src/algorithm_lab.cc
     cpp/routing-core/src/landmarks.cc
     cpp/routing-core/src/contraction_hierarchy.cc
+    cpp/routing-core/src/sequence_search.cc
     cpp/routing-core/src/time_dependent.cc
     cpp/routing-core/src/incremental_search.cc
     cpp/routing-core/src/kshortest.cc

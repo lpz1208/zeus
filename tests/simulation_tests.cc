@@ -1070,6 +1070,47 @@ void runAgentExactPathTest() {
             "same-route application excludes the consumed prefix and keeps precise offset");
 }
 
+void runViaWayAgentHistoryTest() {
+    Fixture fixture;
+    const auto a = fixture.addNode(0, 0), b = fixture.addNode(100, 0);
+    const auto c = fixture.addNode(300, 0), d = fixture.addNode(400, 0);
+    const auto e = fixture.addNode(500, 0), f = fixture.addNode(300, 100);
+    const auto from = fixture.addEdge(a, b, 10), via = fixture.addEdge(b, c, 10);
+    const auto to = fixture.addEdge(c, d, 10), goal = fixture.addEdge(d, e, 10);
+    const auto detour_a = fixture.addEdge(c, f, 10), detour_b = fixture.addEdge(f, d, 10);
+    fixture.data.turn_sequences.push_back({{from, via, to}, false});
+    SimSetup setup(fixture.data);
+    auto agent = demand(50, 0.5, 450, 0.5);
+    agent.agent_controlled = true;
+    agent.algorithm = zeus::routing::Algorithm::kCH;
+    using Commit = zeus::simulation::SimulationSession::CommitResult;
+    // Independent sessions replay the same boundary and exact-path application.
+    for (int replay = 0; replay < 2; ++replay) {
+        zeus::simulation::SimulationSession session(*setup.engine, quickConfig(100), std::vector{agent});
+        static_cast<void>(session.reset());
+        const auto state = session.step(8);
+        const auto observed = session.snapshot().agents.front();
+        const auto history = setup.runtime->advanceTurnState(setup.runtime->advanceTurnState(0, from), via);
+        require(observed.edge == via && observed.turn_state == history && history != 0,
+                "vehicle retains entry history while driving on via-way");
+        const zeus::routing::RoutePath illegal{{via, to, goal}, observed.offset_s, 50};
+        require(session.commitPath(0, illegal, state.state_version) == Commit::kRejectedInvalidPath,
+                "mid-via commit cannot forget the forbidden incoming road");
+        const zeus::routing::RoutePath legal{{via, detour_a, detour_b, goal}, observed.offset_s, 50};
+        require(session.commitPath(0, legal, state.state_version) == Commit::kApplied,
+                "mid-via legal exact path is accepted");
+        const auto applied = session.step(1);
+        const auto next = session.snapshot().agents.front();
+        require(next.edge == via && next.turn_state == history && next.offset_s > observed.offset_s,
+                "applying a replacement route retains history and advances normally");
+        auto invalid = illegal; invalid.start_offset_m = next.offset_s;
+        require(session.commitPath(0, invalid, applied.state_version) == Commit::kRejectedInvalidPath,
+                "route replacement cannot erase a pending via-way restriction");
+        static_cast<void>(session.runToEnd());
+        require(session.result().stats.arrived == 1, "via-way agent completes the legal detour");
+    }
+}
+
 void runRouteOverlapTest() {
     Fixture fixture;
     const auto a = fixture.addNode(0, 0);
@@ -1778,6 +1819,7 @@ int main() {
         runUntilEventPeriodicTest();
         runAgentCommitRouteTest();
         runAgentExactPathTest();
+        runViaWayAgentHistoryTest();
         runRouteOverlapTest();
         runRouteReversalTest();
         runSessionReplayForkTest();

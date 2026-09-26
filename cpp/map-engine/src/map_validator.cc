@@ -230,6 +230,21 @@ ValidationReport MapValidator::validate(
         }
     }
 
+    std::size_t sequence_edges = 0;
+    for (const auto& rule : map.turn_sequences) {
+        bool valid = rule.edges.size() >= 3 && rule.edges.size() <= 256;
+        sequence_edges += rule.edges.size();
+        for (std::size_t i = 0; i < rule.edges.size(); ++i) {
+            valid = valid && rule.edges[i] < map.edges.size();
+            if (i && rule.edges[i] < map.edges.size() && rule.edges[i - 1] < map.edges.size())
+                valid = valid && map.edges[rule.edges[i - 1]].to == map.edges[rule.edges[i]].from;
+        }
+        if (!valid) report.issues.push_back({"INVALID_TURN_SEQUENCE", IssueSeverity::kFatal,
+            "Turn sequence contains invalid or disconnected roads", "", {}, false});
+    }
+    if (sequence_edges > 99999) report.issues.push_back({"TURN_SEQUENCE_BUDGET", IssueSeverity::kFatal,
+        "Turn sequence prefixes exceed compilation budget", "", {}, false});
+
     std::unordered_map<std::size_t, std::size_t> component_sizes;
     for (std::size_t node = 0; node < map.nodes.size(); ++node) {
         const std::size_t degree = incoming[node] + outgoing[node];

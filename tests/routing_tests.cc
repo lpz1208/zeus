@@ -1,4 +1,6 @@
 #include <cmath>
+#include <map>
+#include <set>
 #include <filesystem>
 #include <future>
 #include <iostream>
@@ -986,6 +988,147 @@ void runTimeDependentOracleTest() {
     }
 }
 
+void runViaWayEnumerationTest() {
+    using Edge = zeus::map::EdgeIndex;
+    std::mt19937 random(78127);
+    for (int trial = 0; trial < 120; ++trial) {
+        Fixture fixture;
+        for (int i = 0; i < 8; ++i) fixture.addNode(i * 100, (i % 2) * 30);
+        std::vector<std::vector<Edge>> outgoing(8);
+        const auto add = [&](int a, int b) {
+            outgoing[a].push_back(fixture.addEdge(a, b, 5 + random() % 20));
+        };
+        for (int i = 0; i < 7; ++i) add(i, i + 1);
+        for (int a = 1; a < 6; ++a)
+            for (int b = a + 1; b <= 6; ++b) if (random() % 3 == 0) add(a, b);
+        std::vector<std::vector<Edge>> paths;
+        std::vector<Edge> path{0};
+        const auto enumerate = [&](auto&& self, unsigned node) -> void {
+            if (node == 7) { paths.push_back(path); return; }
+            for (auto edge : outgoing[node]) {
+                path.push_back(edge); self(self, fixture.data.edges[edge].to); path.pop_back();
+            }
+        };
+        enumerate(enumerate, 1);
+        for (int i = 0; i < 4; ++i) {
+            const auto& chosen = paths[random() % paths.size()];
+            const auto begin = random() % (chosen.size() - 2);
+            const auto length = 3 + random() % (chosen.size() - begin - 2);
+            fixture.data.turn_sequences.push_back({{chosen.begin() + begin, chosen.begin() + begin + length}, bool(random() % 2)});
+        }
+        std::vector<std::uint8_t> enabled(fixture.data.edges.size(), 1);
+        std::vector<double> factors(enabled.size(), 1);
+        for (std::size_t edge = 0; edge < enabled.size(); ++edge) {
+            factors[edge] = 1 + (random() % 5) * .2;
+            if (edge != 0 && edge != 6 && random() % 8 == 0) enabled[edge] = 0;
+        }
+        const zeus::routing::RoutingOverlay overlay{enabled, factors};
+        // Independent oracle: inspect complete path slices, without runtime
+        // prefix IDs, failure links, or the compressed routing graph.
+        std::map<std::vector<Edge>, std::set<Edge>> mandatory;
+        for (const auto& rule : fixture.data.turn_sequences) if (rule.only)
+            for (std::size_t size = 1; size < rule.edges.size(); ++size)
+                mandatory[{rule.edges.begin(), rule.edges.begin() + size}].insert(rule.edges[size]);
+        double expected = std::numeric_limits<double>::infinity();
+        for (const auto& candidate : paths) {
+            bool legal = true;
+            for (std::size_t i = 0; i < candidate.size(); ++i) {
+                if (!enabled[candidate[i]]) legal = false;
+                for (const auto& rule : fixture.data.turn_sequences) {
+                    if (!rule.only && rule.edges.size() <= i + 1 &&
+                        std::equal(rule.edges.begin(), rule.edges.end(), candidate.begin() + i + 1 - rule.edges.size())) legal = false;
+                }
+                for (const auto& [prefix, allowed] : mandatory) {
+                    if (prefix.size() <= i && std::equal(prefix.begin(), prefix.end(), candidate.begin() + i - prefix.size()) &&
+                        !allowed.contains(candidate[i])) legal = false;
+                }
+            }
+            if (!legal) continue;
+            double cost = 0;
+            for (auto edge : candidate) {
+                const auto& road = fixture.data.edges[edge];
+                cost += road.length_m / road.speed_limit_mps * factors[edge] * (edge == 0 ? .4 : edge == 6 ? .6 : 1);
+            }
+            expected = std::min(expected, cost);
+        }
+        PlanSetup setup(fixture.data);
+        zeus::routing::RouteRequest request;
+        request.origin_position = zeus::routing::RoutePosition{0, fixture.data.edges[0].length_m * .6};
+        request.destination_position = zeus::routing::RoutePosition{6, fixture.data.edges[6].length_m * .6};
+        request.overlay = &overlay;
+        for (const auto& capability : zeus::routing::algorithmCapabilities()) {
+            request.algorithm = capability.algorithm;
+            const auto route = setup.planner->plan(request);
+            require(route.ok == std::isfinite(expected), "via-way reachability agrees with exhaustive path slices");
+            if (route.ok) {
+                require(near(route.stats.time_s, expected, 1e-7), "via-way cost agrees with independent exhaustive oracle");
+                const auto validated = zeus::routing::AlgorithmLab(*setup.runtime, request).validatePath(route.path);
+                require(near(validated.stats.time_s, expected, 1e-7), "custom graph validates the same via-way optimum");
+            }
+        }
+    }
+}
+
+void runViaWayRoutingTest() {
+    using namespace zeus::routing;
+    Fixture fixture;
+    for (const auto point : std::vector<zeus::map::Point2d>{{-200,0},{-100,0},{0,0},{100,0},{200,0},{300,0},{0,100},{100,100}})
+        fixture.addNode(point.x, point.y);
+    const auto start = fixture.addEdge(0, 1, 10);
+    const auto from = fixture.addEdge(1, 2, 10);
+    const auto via = fixture.addEdge(2, 3, 10);
+    const auto to = fixture.addEdge(3, 4, 10);
+    const auto goal = fixture.addEdge(4, 5, 10);
+    const auto bypass1 = fixture.addEdge(1, 6, 10);
+    const auto bypass2 = fixture.addEdge(6, 2, 10);
+    const auto exit1 = fixture.addEdge(3, 7, 2);
+    const auto exit2 = fixture.addEdge(7, 4, 2);
+    fixture.data.turn_sequences.push_back({{from, via, to}, false});
+    PlanSetup setup(fixture.data);
+    auto request = makeRequest({-150,0}, {250,0});
+    request.origin_position = RoutePosition{start, 50};
+    request.destination_position = RoutePosition{goal, 50};
+    const std::vector<zeus::map::EdgeIndex> expected{start, bypass1, bypass2, via, to, goal};
+    for (const auto& capability : algorithmCapabilities()) {
+        request.algorithm = capability.algorithm;
+        request.k_paths = 3;
+        const auto route = setup.planner->plan(request);
+        require(route.ok && route.path.edges == expected, "via-way search separates histories arriving on the same edge");
+        require(route.effective_algorithm == (request.algorithm == Algorithm::kTimeDependent ? Algorithm::kTimeDependent : Algorithm::kDijkstra),
+                "via-way compatibility search exposes its actual algorithm");
+        auto validation = request; validation.algorithm = Algorithm::kDijkstra;
+        require(AlgorithmLab(*setup.runtime, validation).validatePath(route.path).ok, "native path validator agrees with via-way search");
+    }
+    request.algorithm = Algorithm::kCH;
+    request.origin_position = RoutePosition{via, 50};
+    const auto fresh = setup.planner->plan(request);
+    require(fresh.ok && fresh.path.edges == std::vector<zeus::map::EdgeIndex>{via,to,goal}, "starting on via way has no invented prior history");
+    request.origin_turn_state = setup.runtime->advanceTurnState(setup.runtime->advanceTurnState(0, from), via);
+    const auto live = setup.planner->plan(request);
+    require(live.ok && live.path.edges == std::vector<zeus::map::EdgeIndex>{via,exit1,exit2,goal}, "moving origin preserves its incoming restriction history");
+    bool rejected = false;
+    try { (void)AlgorithmLab(*setup.runtime, request).validatePath(fresh.path); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "exact path commit cannot erase a live via-way restriction");
+    const std::vector<SpeedChange> changes{{to, 0, .05}, {to, 100, 1}};
+    const SpeedSchedule schedule(fixture.data.edges.size(), changes);
+    request.algorithm = Algorithm::kTimeDependent;
+    request.speed_schedule = &schedule;
+    require(setup.planner->plan(request).path.edges == live.path.edges, "time-dependent search retains turn history");
+
+    // Mandatory prefixes permit alternatives with the same prefix, but stop
+    // early deviations. Overlapping forbidden suffixes remain active.
+    fixture.data.turn_sequences = {{{from, via, to}, true}, {{from, via, exit1}, true}, {{via, to, goal}, false}};
+    PlanSetup mandatory(fixture.data);
+    const auto a = mandatory.runtime->advanceTurnState(0, from);
+    require(mandatory.runtime->advanceTurnState(a, bypass1) == zeus::map::kInvalidEdge, "only via-way rejects early deviation");
+    const auto b = mandatory.runtime->advanceTurnState(a, via);
+    const auto c = mandatory.runtime->advanceTurnState(b, to);
+    require(c != zeus::map::kInvalidEdge && mandatory.runtime->advanceTurnState(b, exit1) != zeus::map::kInvalidEdge,
+            "shared only prefixes keep the union of permitted next roads");
+    require(mandatory.runtime->advanceTurnState(c, goal) == zeus::map::kInvalidEdge, "overlapping no restriction survives longer only prefix");
+}
+
 void runCHIndexTest() {
     using namespace zeus::routing;
     const double infinity = std::numeric_limits<double>::infinity();
@@ -1521,6 +1664,8 @@ int main() {
         runTimeDependentTest();
         runTimeDependentOracleTest();
         runCHStaticDifferentialTest();
+        runViaWayRoutingTest();
+        runViaWayEnumerationTest();
         runCHIndexTest();
         runCHReuseTest();
         runAltLandmarkTest();

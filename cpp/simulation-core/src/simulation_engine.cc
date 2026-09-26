@@ -43,6 +43,7 @@ zeus::routing::RouteResult SimulationEngine::validateAgentRoute(
         agent.destination_edge, agent.route_end_offset_m};
     if (agent.state == VehicleState::kDriving) {
         request.origin_position = zeus::routing::RoutePosition{agent.edge, agent.offset_s};
+        request.origin_turn_state = agent.turn_state;
     }
     return validateRoute(request, path);
 }
@@ -68,6 +69,7 @@ struct RouteKey {
 };
 
 struct DynamicRouteKey {
+    std::uint32_t turn_state = 0;
     std::uint32_t old_route_id = 0;
     bool exact_origin = false;
     zeus::map::EdgeIndex origin_edge = zeus::map::kInvalidEdge;
@@ -81,10 +83,10 @@ struct DynamicRouteKey {
     double departure_s = 0;
 
     bool operator<(const DynamicRouteKey& other) const {
-        return std::tie(old_route_id, exact_origin, origin_edge, origin_offset_bits,
+        return std::tie(old_route_id, turn_state, exact_origin, origin_edge, origin_offset_bits,
                         origin_x_bits, origin_y_bits, destination_edge,
                         destination_offset_bits, algorithm, departure_s) <
-               std::tie(other.old_route_id, other.exact_origin, other.origin_edge,
+               std::tie(other.old_route_id, other.turn_state, other.exact_origin, other.origin_edge,
                         other.origin_offset_bits, other.origin_x_bits,
                         other.origin_y_bits, other.destination_edge,
                         other.destination_offset_bits, other.algorithm, other.departure_s);
@@ -652,6 +654,7 @@ SimulationResult SimulationEngine::run(
             key.exact_origin = store.states_[i] == VehicleState::kDriving;
             if (key.exact_origin) {
                 key.origin_edge = old_route.edges[store.route_indices_[i]];
+                key.turn_state = store.turn_states_[i];
                 key.origin_offset_bits = std::bit_cast<std::uint64_t>(store.offsets_[i]);
             } else {
                 key.origin_x_bits = std::bit_cast<std::uint64_t>(demand.origin.x);
@@ -681,6 +684,7 @@ SimulationResult SimulationEngine::run(
                     if (key.exact_origin) {
                         request.origin_position = zeus::routing::RoutePosition{
                             key.origin_edge, store.offsets_[i]};
+                        request.origin_turn_state = store.turn_states_[i];
                     }
                     const zeus::routing::RouteResult planned = planRoute(request);
                     ++result.stats.route_plans;
@@ -783,6 +787,7 @@ SimulationResult SimulationEngine::run(
         if (store.states_[i] == VehicleState::kDriving) {
             request.origin_position = zeus::routing::RoutePosition{
                 old_route.edges[store.route_indices_[i]], store.offsets_[i]};
+            request.origin_turn_state = store.turn_states_[i];
         }
         zeus::routing::RouteResult planned;
         if (injection.path) {
@@ -867,6 +872,7 @@ SimulationResult SimulationEngine::run(
                 invalidated_agents.end();
             if (store.states_[i] == VehicleState::kDriving) {
                 state.edge = route.edges[store.route_indices_[i]];
+                state.turn_state = store.turn_states_[i];
                 state.offset_s = store.offsets_[i];
                 state.remaining_edges.assign(
                     route.edges.begin() + static_cast<std::ptrdiff_t>(store.route_indices_[i]),
@@ -1067,6 +1073,7 @@ SimulationResult SimulationEngine::run(
             ++driving_count;
             store.route_indices_[i] = 0;
             store.offsets_[i] = route.start_offset_m;
+            store.turn_states_[i] = runtime_.advanceTurnState(0, first);
             store.actual_departs_[i] = now;
             result.vehicles[i].actual_depart_s = now;
             recordSample(i, now, first, route.start_offset_m);
@@ -1155,6 +1162,8 @@ SimulationResult SimulationEngine::run(
                         break;
                     }
                     const zeus::map::EdgeIndex next = route.edges[route_index + 1];
+                    const auto next_turn_state = runtime_.advanceTurnState(store.turn_states_[i], next);
+                    if (next_turn_state == zeus::map::kInvalidEdge) break;
                     const SignalGate signal_gate =
                         signalGate(edge.to, edge_index, next, event_time);
                     if (signal_gate != SignalGate::kOpen) {
@@ -1182,6 +1191,7 @@ SimulationResult SimulationEngine::run(
                     last_exit_s[edge_index] = event_time;
                     recordSignalPass(edge.to, edge_index, next, event_time);
                     store.route_indices_[i] = route_index + 1;
+                    store.turn_states_[i] = next_turn_state;
                     store.offsets_[i] = 0.0;
                     recordSample(i, event_time, next, 0.0);
                     moved = true;
@@ -1225,6 +1235,8 @@ SimulationResult SimulationEngine::run(
                         break;
                     }
                     const zeus::map::EdgeIndex next = route.edges[route_index + 1];
+                    const auto next_turn_state = runtime_.advanceTurnState(store.turn_states_[i], next);
+                    if (next_turn_state == zeus::map::kInvalidEdge) break;
                     const SignalGate signal_gate =
                         signalGate(edge.to, edge_index, next, event_time);
                     if (signal_gate != SignalGate::kOpen) {
@@ -1252,6 +1264,7 @@ SimulationResult SimulationEngine::run(
                     last_exit_s[edge_index] = event_time;
                     recordSignalPass(edge.to, edge_index, next, event_time);
                     store.route_indices_[i] = route_index + 1;
+                    store.turn_states_[i] = next_turn_state;
                     store.offsets_[i] = 0.0;
                     recordSample(i, event_time, next, 0.0);
                 }

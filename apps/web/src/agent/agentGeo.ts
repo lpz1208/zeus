@@ -19,12 +19,18 @@ export const algorithmLabels: Record<RouteAlgorithm | 'custom', string> = {
   ch: 'CH（收缩层级）',
 }
 
+export function routingFallbackLabel(reason: string): string {
+  if (reason === 'via_way_history') return '跨路段转向限制 · 改用 Dijkstra'
+  if (reason === 'ch_dynamic_weights') return '路况已变化 · 改用双向 Dijkstra'
+  if (reason === 'ch_base_graph_budget') return '预处理超出预算 · 改用双向 Dijkstra'
+  return '已使用兼容搜索'
+}
+
 export function formatCHStatus(result: {
   fallbackReason?: string; chReused?: boolean; chPreprocessMs?: number;
   chShortcuts?: number; chCoreStates?: number;
 }): string {
-  if (result.fallbackReason === 'ch_dynamic_weights') return '路况已变化 · 改用双向 Dijkstra'
-  if (result.fallbackReason) return '预处理超出预算 · 改用双向 Dijkstra'
+  if (result.fallbackReason) return routingFallbackLabel(result.fallbackReason)
   return `${result.chReused ? '复用预处理' : `预处理 ${(result.chPreprocessMs ?? 0).toFixed(1)} ms`} · ${result.chShortcuts ?? 0} 条捷径${result.chCoreStates ? ` · ${result.chCoreStates} 个核心状态` : ''}`
 }
 

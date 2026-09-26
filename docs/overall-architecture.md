@@ -1073,7 +1073,7 @@ Agent Environment 额外覆盖工具 Schema、算法能力匹配、过期 state_
 6. C++ 依赖管理使用 Conan 还是 vcpkg。
 7. MVP 是否需要用户登录和多租户权限。
 8. 自定义算法已允许本地运行 Python 子集；公开部署的系统隔离与鉴权方案待确定。
-9. Yen K 最短路、LPA* 与 D* Lite 已实现；FIFO 分时速度路由已接入（[模型边界](time-dependent-routing.md)），ALT 与静态 CH 已接入（[CH 模型边界](ch-routing.md)），后续推进 via-way 与 conditional/access。
+9. Yen K 最短路、LPA* 与 D* Lite 已实现；FIFO 分时速度路由已接入（[模型边界](time-dependent-routing.md)），ALT 与静态 CH 已接入（[CH 模型边界](ch-routing.md)），via-way 已接入历史状态路由（[模型边界](via-way-routing.md)），后续推进 conditional/access。
 10. 区域 Agent 的初始划分采用固定网格、行政区还是动态路网社区。
 11. 本科毕设实验规模采用“万级车辆 + 百级规则/轻量 Agent + 1–5 个 LLM Agent”的具体上限。
 
